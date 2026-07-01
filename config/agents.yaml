@@ -1,0 +1,161 @@
+# Agent 注册表 — MVP 默认启用，扩展 Agent 按需激活
+
+agents:
+  # ── MVP 最小集（默认 active） ──
+  orchestrator:
+    name: Orchestrator
+    layer: orchestration
+    tier: mvp
+    default_active: true
+    description: 任务调度、依赖解析、冲突仲裁、状态机推进
+
+  chapter_planner:
+    name: Chapter Planner
+    layer: story
+    tier: mvp
+    default_active: true
+    description: 输出单章详细章纲
+    depends_on: []
+
+  writer:
+    name: Writer
+    layer: production
+    tier: mvp
+    default_active: true
+    description: 按章纲撰写正文初稿
+    depends_on: [chapter_planner]
+
+  consistency_auditor:
+    name: Consistency Auditor
+    layer: qa
+    tier: mvp
+    default_active: true
+    description: 检查人物、时间线、设定一致性
+    depends_on: [writer]
+
+  summarizer:
+    name: Summarizer
+    layer: memory
+    tier: mvp
+    default_active: true
+    description: 生成章节摘要与新事实清单
+    depends_on: [consistency_auditor]
+
+  # ── 扩展 Agent（按需激活） ──
+  world_architect:
+    name: World Architect
+    layer: world
+    tier: extended
+    default_active: false
+    description: 搭建世界观 Bible
+    activation:
+      - condition: no_bible
+        reason: 项目尚无世界观 Bible
+      - condition: bible_stale
+        reason: 设定变更超过 3 次未同步 Bible
+
+  lore_librarian:
+    name: Lore Librarian
+    layer: world
+    tier: extended
+    default_active: false
+    description: 维护结构化知识库
+    activation:
+      - condition: entity_count_gt
+        threshold: 20
+        reason: 实体数量超过 20，需要结构化知识库
+      - condition: chapter_count_gt
+        threshold: 5
+        reason: 已发布超过 5 章，需要 RAG 检索
+
+  master_planner:
+    name: Master Planner
+    layer: story
+    tier: extended
+    default_active: false
+    description: 制定全书总纲
+    activation:
+      - condition: no_master_outline
+        reason: 尚无全书总纲
+      - condition: chapter_count_gt
+        threshold: 30
+        reason: 超过 30 章需复盘总纲偏离度
+
+  arc_planner:
+    name: Arc Planner
+    layer: story
+    tier: extended
+    default_active: false
+    description: 规划单卷/故事弧
+    activation:
+      - condition: no_arc_outline
+        reason: 当前卷尚无卷纲
+      - condition: chapters_in_arc_gt
+        threshold: 8
+        reason: 本卷已有 8+ 章但未规划卷纲
+
+  dialogue_specialist:
+    name: Dialogue Specialist
+    layer: production
+    tier: extended
+    default_active: false
+    description: 专改对话声线与潜台词
+    activation:
+      - condition: dialogue_ratio_gt
+        threshold: 0.4
+        reason: 本章对话占比超过 40%
+      - condition: character_count_gt
+        threshold: 4
+        reason: 同场对话人物超过 4 人
+
+  scene_specialist:
+    name: Scene Specialist
+    layer: production
+    tier: extended
+    default_active: false
+    description: 专改场景与动作描写
+    activation:
+      - condition: has_scene_tags
+        tags: [battle, chase, action, climax]
+        reason: 章纲标记为战斗/追逐/高潮场景
+
+  foreshadow_tracker:
+    name: Foreshadow Tracker
+    layer: qa
+    tier: extended
+    default_active: false
+    description: 追踪伏笔埋收
+    activation:
+      - condition: active_foreshadows_gt
+        threshold: 5
+        reason: 活跃伏笔超过 5 条
+      - condition: chapter_count_gt
+        threshold: 10
+        reason: 超过 10 章需系统化伏笔管理
+
+  pacing_reviewer:
+    name: Pacing Reviewer
+    layer: qa
+    tier: extended
+    default_active: false
+    description: 检查节奏与信息密度
+    activation:
+      - condition: word_count_gt
+        threshold: 5000
+        reason: 本章超过 5000 字需节奏审查
+      - condition: audit_fail_rate_gt
+        threshold: 0.2
+        reason: 近 5 章质检 FAIL 率超过 20%
+
+  literary_editor:
+    name: Literary Editor
+    layer: qa
+    tier: extended
+    default_active: false
+    description: 润色表达、去 AI 腔
+    activation:
+      - condition: always_after_auditor
+        reason: MVP 阶段 Consistency Auditor 通过后默认润色
+      - condition: chapter_count_gt
+        threshold: 3
+        reason: 已发布超过 3 章，启用文学编辑

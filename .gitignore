@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.env
+*.egg
+
+# 小说项目运行时产出（可由 demo 重新生成）
+projects/*/state.json
+projects/*/chapters/
+projects/*/artifacts/
