@@ -1,0 +1,119 @@
+# Human gate options — match by option id first; aliases only for typed replies.
+# Each option either:
+#   - tool + args (string values may use {{project}} {{chapter}} {{volume}} {{chapters}} {{instructions}})
+#   - resolve: skip_volume (no tool call)
+version: 1
+
+gates:
+  audit:
+    options:
+      - id: "1"
+        label: 按审校局部修订
+        tool: steer_run
+        args:
+          project: "{{project}}"
+          chapter: "{{chapter}}"
+          choice: revise
+        aliases: [按审校局部修订, 局部修订]
+      - id: "2"
+        label: 接受问题
+        tool: steer_run
+        args:
+          project: "{{project}}"
+          chapter: "{{chapter}}"
+          choice: accept
+        aliases: [接受问题, 接受]
+
+  audit_queue:
+    options:
+      - id: "1"
+        label: 按审校局部修订
+        tool: steer_run
+        args:
+          project: "{{project}}"
+          chapter: "{{chapter}}"
+          choice: revise
+        aliases: [按审校局部修订, 局部修订]
+      - id: "2"
+        label: 跳过，审下一章
+        tool: audit_chapters
+        args:
+          project: "{{project}}"
+          action: next
+        aliases: [跳过，审下一章, 跳过, 审下一章]
+      - id: "3"
+        label: 结束审阅队列
+        tool: audit_chapters
+        args:
+          project: "{{project}}"
+          action: cancel
+        aliases: [结束审阅队列, 结束队列, 结束审阅]
+
+  volume_sync:
+    options:
+      - id: "1"
+        label: 同步设定库
+        tool: sync_volume
+        args:
+          project: "{{project}}"
+          volume: "{{volume}}"
+        aliases: [同步设定库, 同步]
+      - id: "2"
+        label: 跳过
+        resolve: skip_volume
+        aliases: [跳过, 不同步, 稍后]
+
+  # Inspiration / outline confirmation before first chapter.
+  # IDs must NOT collide with audit / volume_sync bare ids.
+  setup_confirm:
+    options:
+      - id: sc_approve
+        label: 确认定稿
+        tool: confirm_setup
+        args:
+          project: "{{project}}"
+          action: approve
+        aliases: [确认定稿, 确认, 确定, 定稿, approve]
+      - id: sc_revise
+        label: 修改再生成
+        tool: confirm_setup
+        args:
+          project: "{{project}}"
+          action: revise
+        aliases: [修改再生成, 修改, 重做, revise]
+
+  # After chapter write/revise: server filters by publish result.
+  # published → cn_continue only; content-rule blocked → cn_revise only.
+  # IDs must NOT collide with audit / volume_sync bare ids.
+  chapter_next:
+    options:
+      - id: cn_continue
+        label: 继续创作
+        tool: continue_writing
+        args:
+          project: "{{project}}"
+        aliases: [继续创作, 继续写, 下一章, 续写]
+      - id: cn_revise
+        label: 修正本章
+        tool: revise_chapter
+        args:
+          project: "{{project}}"
+          chapter: "{{chapter}}"
+          instructions: "按上一轮反馈修正本章：保持情节与设定一致，修补明显问题。"
+        aliases: [修正本章, 修正, 修改本章, 修订]
+
+  # IDs must NOT collide with audit/audit_queue ("1"/"2"/"3") — bare id match is global per gate.
+  volume_audit:
+    options:
+      - id: va_deep
+        label: 按建议深审
+        tool: audit_chapters
+        args:
+          project: "{{project}}"
+          action: start
+          chapters: "{{chapters}}"
+        aliases: [按建议深审, 深审建议章, 逐章审建议章]
+      - id: va_dismiss
+        label: 结束复盘
+        resolve: skip_volume
+        aliases: [结束复盘, 结束卷复盘]

@@ -1,0 +1,56 @@
+{
+  "entities": [
+    {
+      "ability_or_trait": "一个不存在的科室，通过自动规则系统标记触及机密人员，可派遣清洁工等外围人员引导目标，通过专线（6441前缀）提供指令，并拥有倒计时、验证等机制。职能疑似稽察局前身或平行机构。",
+      "aliases": [],
+      "canonical_name": "秘书处",
+      "category": "组织",
+      "source": "volume_sync"
+    },
+    {
+      "ability_or_trait": "郑国梁的自称代号，指代被秘书处标记并长期潜伏在档案系统内的人，可能拥有误导/引导后代标记者的能力。",
+      "aliases": [
+        "被捕获的样本"
+      ],
+      "canonical_name": "GU-001",
+      "category": "代号",
+      "source": "volume_sync"
+    },
+    {
+      "ability_or_trait": "秘闻索引由多个碎片组成，每个碎片对应一个编号（如LOCK-084、BLOOD-002等），碎片本身可以是实物（信封、塑料片）或线索，林深需在特定时限内按步骤完成路径，否则路径关闭。",
+      "aliases": [
+        "碎片"
+      ],
+      "canonical_name": "秘闻索引碎片",
+      "category": "概念",
+      "source": "volume_sync"
+    },
+    {
+      "ability_or_trait": "顾维钧病历记载的异常：住院期间血型从B型转为AB型，伴有皮下出血点，诊断怀疑血液自身分泌或改变。该现象与“粘稠的声音”感知相关，可能关联秘闻。",
+      "aliases": [
+        "血型转化"
+      ],
+      "canonical_name": "血液自分泌现象",
+      "category": "异常现象",
+      "source": "volume_sync"
+    },
+    {
+      "ability_or_trait": "顾维钧描述能‘听到粘稠的声音’并感知远处他人心跳，与锁龙井井下粘稠搅动声对应，暗示同源异常。林深在锁龙井也听到类似声音。",
+      "aliases": [
+        "粘稠的搅动声"
+      ],
+      "canonical_name": "粘稠的声音",
+      "category": "感知异常",
+      "source": "volume_sync"
+    },
+    {
+      "ability_or_trait": "秘书处可通过手机直接覆盖桌面显示倒计时，无法通过常规方式关闭，倒计时归零后触发验证结果（成功或失败），失败则路径关闭。",
+      "aliases": [
+        "手机覆盖倒计时"
+      ],
+      "canonical_name": "倒计时机制",
+      "category": "系统机制",
+      "source": "volume_sync"
+    }
+  ]
+}

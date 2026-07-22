@@ -1,0 +1,18 @@
+# Studio feature flags (Codex-style toggles — prefer config over code branches).
+version: 1
+
+features:
+  # Match config/intents.yaml before the LLM tool loop.
+  studio.deterministic_intents: true
+  # Clear prior chat when continue_writing actually starts (plot gate Allow; keep current turn).
+  studio.clear_history_on_new_chapter: true
+  # After steer_run revise, auto re-audit (queue continue or audit_chapter).
+  studio.auto_reaudit_after_steer: true
+  # Reject weak client ui_turns snapshots that wipe a richer server timeline.
+  studio.reject_weak_ui_turns: true
+  # After design_arc_outline leaves setup awaiting_confirm, auto-offer RequestUserInput;
+  # also hard-block continue_writing when setup_phase != ready.
+  studio.enforce_setup_gate: true
+  # Persist volume_phase, rebuild sync gate from disk, and hard-block continue_writing /
+  # design_plot outside drafting_volume (and ignore design_plot force during handoff).
+  studio.enforce_volume_phase: true

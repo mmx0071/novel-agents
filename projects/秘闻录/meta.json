@@ -1,0 +1,12 @@
+{
+  "brief": "表面和平的现代世界下，一系列被官方掩盖的秘闻档案接连浮出水面——UFO目击记录、月球背面的不周山遗址、自称外星人的科学家、拥有前世记忆的儿童、来自未来的预言者、以及深埋地下的锁龙井……主角在追查一条线索时，发现所有秘闻竟然指向同一个真相。而真相背后，还有更古老的「东西」在等着他。",
+  "genre": "悬疑解谜",
+  "has_arc_outline": true,
+  "has_bible": true,
+  "has_master_outline": true,
+  "has_nomenclature": true,
+  "name": "秘闻录",
+  "setup_phase": "ready",
+  "target_chapters": 100,
+  "volume_sync_skipped": false
+}

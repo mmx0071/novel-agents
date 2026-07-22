@@ -1,0 +1,62 @@
+# Studio routing / rewrite policies (Codex-style: data-driven, thin matcher in Rust).
+# Prefer editing this file over adding `contains("…")` branches in crates/.
+version: 1
+
+# Bare「继续」while next_chapter already has a draft → clarify, don't tool-call / wipe chat.
+bare_continue:
+  phrases:
+    - 继续
+    - 接着写
+    - 往下写
+    - 接着
+    - 继续吧
+  # Treat next_chapter draft as "substantial" at this length (chars).
+  draft_min_chars: 400
+
+# User clearly starts a new chapter write → safe to clear prior Studio chat.
+# Also true when parse_chapter_number(user_text) succeeds (handled in Rust).
+clear_history_on_write:
+  exact:
+    - cn_continue
+    - 继续创作
+  any_keywords:
+    - 写下一章
+    - 下一章
+    - 续写
+  # 「写第…章」requires both tokens
+  all_keyword_groups:
+    - [写第, 章]
+
+# revise_chapter / steer: force full Writer rewrite (not local patch).
+full_rewrite:
+  any_keywords:
+    - 字数
+    - 太短
+    - 太少
+    - 加长
+    - 加长到
+    - 扩写
+    - 扩充
+    - 重写
+    - 重写全
+    - 全文重写
+    - 写长
+    - 写满
+    - 加到
+    - 三千
+    - "3000"
+    - "4000"
+    - "5000"
+    - expand
+    - rewrite
+    - too short
+    - longer
+
+# Manual sync without an open volume gate (explicit phrasing only).
+volume_sync_manual:
+  any_keywords:
+    - 同步设定
+  all_keyword_groups:
+    - [同步, 卷]
+  none_keywords:
+    - 审校

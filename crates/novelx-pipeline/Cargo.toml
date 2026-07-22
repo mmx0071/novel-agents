@@ -1,0 +1,21 @@
+[package]
+name = "novelx-pipeline"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+novelx-draft-patch = { workspace = true }
+novelx-harness = { workspace = true }
+novelx-llm = { workspace = true }
+novelx-protocol = { workspace = true }
+novelx-skills = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }

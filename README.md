@@ -1,54 +1,80 @@
-# novel-agents
+# novel-agents (NovelX)
 
-超长篇小说的多 Agent 协同创作系统 Demo。
+超长篇小说多 Agent 协同创作系统（Rust）。对齐 OpenAI Codex CLI 的 Thread / Turn / Item 与 Skills 渐进披露。
 
 ## 特性
 
-- **MVP 最小集**：Orchestrator + Chapter Planner + Writer + Consistency Auditor + Summarizer
-- **扩展 Agent 池**：9 个按需激活的 Agent（世界观、总纲、对话、场景、伏笔等）
-- **自动激活**：根据项目状态（章节数、实体数、对话占比、场景标签等）判断是否需要新 Agent
-- **Cursor Skill**：`.cursor/skills/create-novel/SKILL.md` 指导 AI 使用本系统
+- **Codex 式 Agent Loop**：Thread → Turn → Item（Skill / Tool / DraftPatch）
+- **Skills 渐进披露**：启动只注入 name+description；`$skill` 激活后才加载全文
+- **局部补丁优先**：修订默认段级 grep 替换，失败才全文回退
+- **MVP Agent 流水线**：章纲 → Writer → 审校 → 摘要（扩展 Agent 按需）
+- **NovelX Web**：Turn 时间线、Skill 弹出、ToolCall / Patch 卡片
 
-## 安装
+## 依赖
 
-```bash
-pip install -e .
-```
+- Rust 1.75+（推荐最新 stable）
+- Node.js 18+（前端开发）
+- DeepSeek API Key（可选；无 Key 时占位模式）
 
-## 快速 Demo
-
-```bash
-python scripts/demo.py
-```
-
-或手动：
+## 安装与运行
 
 ```bash
-novel init my-novel --genre 玄幻 --chapters 100 --setup
-novel run my-novel 1
-novel status my-novel
-novel agents
+# 编译 CLI
+cargo build -p novelx-cli --release
+# 或开发模式
+cargo run -p novelx-cli -- --help
+
+# 创建项目
+cargo run -p novelx-cli -- init my-novel --genre 玄幻 --chapters 100
+
+# 跑一章（新章全文）
+cargo run -p novelx-cli -- run my-novel 1
+
+# 局部优先修订
+cargo run -p novelx-cli -- run my-novel 1 --revise --instructions "改第2段，加强冲突"
+
+# 状态
+cargo run -p novelx-cli -- status my-novel
 ```
 
-## CLI 命令
+### Web（NovelX）
 
-| 命令 | 说明 |
-|------|------|
-| `novel init <name>` | 创建小说项目 |
-| `novel run <name> <chapter>` | 运行单章流水线 |
-| `novel status <name>` | 查看项目与 Agent 状态 |
-| `novel activate <name>` | 检查并激活所需 Agent |
-| `novel agents` | 列出全部 Agent 及激活条件 |
+```bash
+# 终端 1：Rust API（默认 127.0.0.1:8765）
+cargo run -p novelx-cli -- web
+
+# 终端 2：前端
+cd web && npm install && npm run dev
+# → http://127.0.0.1:5173
+```
+
+生产可先 `cd web && npm run build`，再只启 `novel web`（静态资源由 axum 托管）。
+
+## LLM 配置
+
+1. 复制 `.env.example` → `.env`，填入 `DEEPSEEK_API_KEY`
+2. 任务/模型映射：`config/llm.yaml`
+3. Agent Skills：`config/skills/**/SKILL.md`（YAML frontmatter：`name` / `description`）
 
 ## 架构
 
 ```
-Orchestrator
-  ├─ AgentRegistry（读取 agents.yaml，评估激活条件）
-  ├─ Pipeline（按序执行已激活 Agent）
-  └─ ProjectState（state.json 持久化）
+crates/
+  novelx-protocol/     # EventMsg / TurnItem / Op
+  novelx-skills/       # 渐进披露 loader
+  novelx-draft-patch/  # 局部段落补丁
+  novelx-harness/      # gates / 硬规则 / 优先级
+  novelx-llm/          # OpenAI-compatible 客户端
+  novelx-pipeline/     # 章流水线（local-first revise）
+  novelx-tools/        # continue / revise / audit …
+  novelx-core/         # ThreadManager + run_turn
+  novelx-app-server/   # axum HTTP + WS
+  novelx-cli/          # novel 二进制
+config/                # agents.yaml / llm.yaml / skills
+projects/<name>/       # 小说数据（state.json、chapters、entities…）
+web/                   # NovelX React 前端
 ```
 
-## 接入 LLM
+## Cursor Skill
 
-当前为占位实现，便于理解流水线。接入真实模型时修改 `src/novel_agents/agents/` 下各 Agent 的 `run()` 方法。
+`.cursor/skills/create-novel/SKILL.md` 说明如何用本系统写长篇。

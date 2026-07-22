@@ -1,0 +1,3 @@
+# 章正文篇幅目标（写入 Writer / 修订 prompt；非硬性门控）
+word_min: 3000
+word_max: 5000

@@ -1,14 +1,22 @@
-__pycache__/
-*.py[cod]
-*.egg-info/
-dist/
-build/
+.env
+.cache/
+
+# Rust
+/target/
+
+# Web
+web/node_modules/
+web/dist/
+
+# Legacy local envs (if any remain)
 .venv/
 venv/
-.env
-*.egg
+__pycache__/
+*.egg-info/
+
 
 # 小说项目运行时产出（可由 demo 重新生成）
 projects/*/state.json
 projects/*/chapters/
 projects/*/artifacts/
+.DS_Store

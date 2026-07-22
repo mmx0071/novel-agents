@@ -1,0 +1,40 @@
+# 取名规则 — 规避 DeepSeek 等模型高频语料名，强制名能反映能力/本质
+
+forbidden_names:
+  # 高频人名
+  - 林远
+  - 林远舟
+  - 陈默
+  - 苏瑶
+  - 苏雨
+  - 老K
+  - 艾拉
+  - 艾琳
+  - 叶修
+  - 萧炎
+  - 韩立
+  - 顾城
+  - 沈默
+  - 陆离
+  - 白夜
+  - 黑鹰
+  # 高频地名/组织
+  - 天元宗
+  - 青云门
+  - 赫利俄斯
+  - 层叠城
+
+naming_principles:
+  - 名须从能力、材质、现象或禁忌中派生，禁止无关联的随机古风名
+  - 人名 2-3 字，物品/地点可 2-5 字
+  - 同一项目内不得重复字根（如两个主角都用「渊」）
+  - 禁用 forbidden_names 列表中的名字及变体
+  - 每个名词必须附带 naming_rationale 说明「名→能力」映射
+
+categories:
+  - character
+  - item
+  - location
+  - faction
+  - ability
+  - concept

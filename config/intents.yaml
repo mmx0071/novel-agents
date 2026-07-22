@@ -1,0 +1,137 @@
+# Studio deterministic intents (Codex-style: data-driven, thin matcher in Rust).
+# Higher priority wins. Unmatched text falls through to the LLM tool loop.
+version: 1
+
+intents:
+  # 「审这一卷 / 卷末复盘」→ 摘要层卷复盘（非逐章正文）
+  - id: audit_volume
+    tool: audit_volume
+    priority: 110
+    require_project: true
+    extract: none
+    any_keywords:
+      - 审这一卷
+      - 审本卷
+      - 卷末复盘
+      - 复盘本卷
+      - 复盘这一卷
+      - audit_volume
+    all_keyword_groups:
+      - [审, 这一卷]
+      - [审, 本卷]
+      - [复盘, 卷]
+    none_keywords:
+      - 同步设定
+      - sync_volume
+
+  # 「审阅1-8章 / 第1章到第8章审校」→ audit_chapters queue
+  - id: audit_range
+    tool: audit_chapters
+    priority: 100
+    require_project: true
+    extract: chapter_range
+    any_keywords:
+      - 审
+      - audit
+      - 卷纲
+    none_keywords:
+      - 这一卷
+      - 本卷
+      - 卷末复盘
+      - 复盘
+
+  # 「继续审阅 / 继续审校队列」→ audit_chapters continue（续跑卡住的队列）
+  - id: audit_queue_continue
+    tool: audit_chapters
+    priority: 105
+    require_project: true
+    extract: none
+    any_keywords:
+      - 继续审阅
+      - 继续审校
+      - 继续队列
+      - 续跑审阅
+    all_keyword_groups:
+      - [继续, 审阅]
+      - [继续, 审校]
+    none_keywords:
+      - 这一卷
+      - 本卷
+      - 卷末复盘
+      - 写第
+
+  # 「审校第9章 / 检阅第九章」→ audit_chapter
+  - id: audit_one
+    tool: audit_chapter
+    priority: 80
+    require_project: true
+    extract: chapter
+    any_keywords:
+      - 审校
+      - 审阅
+      - 检阅
+      - audit
+    none_keywords:
+      - 修正
+      - 修订
+      - 扩写
+      - 重写
+      - 加长
+      - 这一卷
+      - 本卷
+      - 卷末复盘
+      - 复盘
+      - 继续
+
+  # 「写第10章 / 续写 / 写下一章」→ continue_writing
+  # 衔接章由剧情卡 needs_bridge（Agent）决定，0 或 1 章，用户无需声明
+  # 复合任务（去重/卷纲/design_plot…再写第N章）勿命中：应交 LLM 分步执行
+  - id: write_chapter
+    tool: continue_writing
+    priority: 70
+    require_project: true
+    extract: chapter_optional
+    clear_history: on_start
+    any_keywords:
+      - 续写
+      - 写下一章
+      - 写下一
+    # 写第…章（需同时命中）
+    all_keyword_groups:
+      - [写第, 章]
+    none_keywords:
+      - design_plot
+      - design_arc
+      - design_entity
+      - delete_entity
+      - sync_volume
+      - 设定库
+      - 去重
+      - 卷纲
+      - 剧情卡
+      - 终态卡
+      - 卷间交接
+
+  # 「修正/扩写第五章」→ revise_chapter
+  - id: revise_chapter
+    tool: revise_chapter
+    priority: 60
+    require_project: true
+    extract: chapter
+    any_keywords:
+      - 修正
+      - 修订
+      - 扩写
+      - 重写
+      - 加长
+      - 改写
+      - 润色
+      - 写长
+      - 太短
+      - 太少
+      - rewrite
+      - revise
+      - expand
+    default_instructions: >-
+      扩写/重写本章至约 3000–5000 字，按章纲补足情节与细节，保持与前后章衔接。
+    instructions_min_chars: 24

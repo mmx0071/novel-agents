@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/novelx-protocol",
+    "crates/novelx-skills",
+    "crates/novelx-draft-patch",
+    "crates/novelx-harness",
+    "crates/novelx-llm",
+    "crates/novelx-pipeline",
+    "crates/novelx-tools",
+    "crates/novelx-core",
+    "crates/novelx-app-server",
+    "crates/novelx-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["novel-agents"]
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["ws", "macros"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+novelx-protocol = { path = "crates/novelx-protocol" }
+novelx-skills = { path = "crates/novelx-skills" }
+novelx-draft-patch = { path = "crates/novelx-draft-patch" }
+novelx-harness = { path = "crates/novelx-harness" }
+novelx-llm = { path = "crates/novelx-llm" }
+novelx-pipeline = { path = "crates/novelx-pipeline" }
+novelx-tools = { path = "crates/novelx-tools" }
+novelx-core = { path = "crates/novelx-core" }
+novelx-app-server = { path = "crates/novelx-app-server" }
