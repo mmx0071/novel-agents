@@ -15,8 +15,8 @@ __pycache__/
 *.egg-info/
 
 
-# 小说项目运行时产出（可由 demo 重新生成）
-projects/*/state.json
-projects/*/chapters/
-projects/*/artifacts/
+# 用户小说数据（本地创作内容，不进版本库）
+projects/*
+!projects/.gitkeep
+
 .DS_Store
