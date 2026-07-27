@@ -20,6 +20,10 @@ pub struct RevisionTarget {
 
 impl RevisionTarget {
     pub fn para_label(&self) -> String {
+        if self.source == "timeline_batch" {
+            let n = self.batch_para_indices().len().max(1);
+            return format!("时间锚点×{n}");
+        }
         let a = self.start + 1;
         let b = self.end + 1;
         if a == b {
@@ -27,6 +31,24 @@ impl RevisionTarget {
         } else {
             format!("第{a}–{b}段")
         }
+    }
+
+    /// Discrete 0-based paragraph indices for `timeline_batch` (from `quote`).
+    pub fn batch_para_indices(&self) -> Vec<usize> {
+        if self.source != "timeline_batch" {
+            return (self.start..=self.end).collect();
+        }
+        let mut idxs: Vec<usize> = self
+            .quote
+            .split(|c: char| c == ',' || c == '，' || c.is_whitespace())
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        if idxs.is_empty() {
+            return (self.start..=self.end).collect();
+        }
+        idxs.sort_unstable();
+        idxs.dedup();
+        idxs
     }
 }
 
@@ -299,6 +321,47 @@ pub fn targets_from_user_instructions(draft: &str, instructions: &str) -> Vec<Re
     targets
 }
 
+/// Build a local-revise instruction from pacing JSON (detail/action/quote/suggestion).
+pub fn pacing_suggestion_instruction(sug: &serde_json::Value) -> String {
+    let detail = sug
+        .get("detail")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let suggestion = sug
+        .get("suggestion")
+        .or_else(|| sug.get("message"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let action = sug
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let quote = sug
+        .get("quote")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let body = if !detail.is_empty() {
+        detail
+    } else if !suggestion.is_empty() {
+        suggestion
+    } else {
+        "调整节奏"
+    };
+    let mut parts = Vec::new();
+    if !action.is_empty() && !body.contains(action) {
+        parts.push(format!("动作：{action}"));
+    }
+    if !quote.is_empty() && !body.contains(quote) {
+        parts.push(format!("锚点：「{quote}」"));
+    }
+    parts.push(body.to_string());
+    parts.join("；")
+}
+
 pub fn collect_revision_targets(
     draft: &str,
     user_instructions: Option<&str>,
@@ -336,12 +399,8 @@ pub fn collect_revision_targets(
     }
 
     for sug in pacing_suggestions {
-        let instruction = sug
-            .get("suggestion")
-            .or_else(|| sug.get("message"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("调整节奏")
-            .to_string();
+        let instruction = pacing_suggestion_instruction(sug);
+        let quote = sug.get("quote").and_then(|v| v.as_str()).unwrap_or("");
         let location = sug
             .get("location")
             .or_else(|| sug.get("paragraph"))
@@ -351,18 +410,69 @@ pub fn collect_revision_targets(
                 _ => String::new(),
             })
             .unwrap_or_default();
-        if let Some((start, end)) = resolve_span(&paragraphs, &location, "") {
+        if let Some((start, end)) = resolve_span(&paragraphs, &location, quote) {
             targets.push(RevisionTarget {
                 instruction,
                 start,
                 end,
-                quote: String::new(),
+                quote: quote.to_string(),
                 source: "pacing".into(),
             });
         }
     }
 
-    merge_overlapping(targets)
+    expand_timeline_issue_targets(draft, audit_issues, &mut targets);
+    coalesce_timeline_batch(merge_overlapping(targets))
+}
+
+fn looks_like_time_anchor(para: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"\d{1,2}:\d{2}(?::\d{2})?").expect("time re"));
+    re.is_match(para)
+        || para.contains("倒计时")
+        || para.contains("子夜")
+        || para.contains("午夜")
+        || para.contains("十分钟")
+        || para.contains("小时")
+}
+
+/// TIMELINE issues often cite one quote while the contradiction spans many clocks.
+/// Expand to every time-anchor paragraph so local revise does not "fix one, break another".
+fn expand_timeline_issue_targets(
+    draft: &str,
+    audit_issues: &[serde_json::Value],
+    targets: &mut Vec<RevisionTarget>,
+) {
+    let timeline = audit_issues.iter().any(|i| {
+        let ty = i.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let msg = i.get("message").and_then(|v| v.as_str()).unwrap_or("");
+        ty.eq_ignore_ascii_case("TIMELINE")
+            || msg.contains("时间互斥")
+            || msg.contains("倒计时") && msg.contains("冲突")
+            || msg.contains("钟点")
+    });
+    if !timeline {
+        return;
+    }
+    let paragraphs = segment_paragraphs(draft);
+    let instr = "统一本章倒计时/钟点/子夜表述，消除互斥：只保留一条单调当前读数（倒计时只减不增或明确冻结）；\
+禁止数值无故回跳；回忆初始值须标明「最初」；删去多余递减串，数字出现尽量少。"
+        .to_string();
+    for (i, p) in paragraphs.iter().enumerate() {
+        if !looks_like_time_anchor(p) {
+            continue;
+        }
+        if targets.iter().any(|t| i >= t.start && i <= t.end) {
+            continue;
+        }
+        targets.push(RevisionTarget {
+            instruction: instr.clone(),
+            start: i,
+            end: i,
+            quote: String::new(),
+            source: "timeline_expand".into(),
+        });
+    }
 }
 
 fn merge_overlapping(mut targets: Vec<RevisionTarget>) -> Vec<RevisionTarget> {
@@ -385,6 +495,61 @@ fn merge_overlapping(mut targets: Vec<RevisionTarget>) -> Vec<RevisionTarget> {
     }
     out.truncate(8);
     out
+}
+
+fn looks_like_timeline_target(t: &RevisionTarget) -> bool {
+    if t.source == "timeline_expand" || t.source == "timeline_batch" {
+        return true;
+    }
+    let instr = t.instruction.as_str();
+    instr.contains("时间互斥")
+        || instr.contains("倒计时")
+        || instr.contains("钟点")
+        || instr.contains("子夜")
+}
+
+/// Fold every timeline-related span into **one** batch target (single LLM round-trip).
+fn coalesce_timeline_batch(targets: Vec<RevisionTarget>) -> Vec<RevisionTarget> {
+    let mut idxs: Vec<usize> = Vec::new();
+    let mut instr = String::new();
+    let mut rest = Vec::new();
+    for t in targets {
+        if looks_like_timeline_target(&t) {
+            for i in t.start..=t.end {
+                if !idxs.contains(&i) {
+                    idxs.push(i);
+                }
+            }
+            if instr.is_empty() && !t.instruction.is_empty() {
+                instr = t.instruction;
+            }
+        } else {
+            rest.push(t);
+        }
+    }
+    if idxs.is_empty() {
+        return rest;
+    }
+    idxs.sort_unstable();
+    if instr.is_empty() {
+        instr = "统一本章倒计时/钟点/子夜表述，消除互斥：只保留一条单调当前读数（倒计时只减不增或明确冻结）；\
+禁止数值无故回跳；回忆初始值须标明「最初」；删去多余递减串，数字出现尽量少。"
+            .into();
+    }
+    rest.push(RevisionTarget {
+        instruction: instr,
+        start: idxs[0],
+        end: *idxs.last().unwrap_or(&idxs[0]),
+        quote: idxs
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        source: "timeline_batch".into(),
+    });
+    rest.sort_by_key(|t| t.start);
+    rest.truncate(8);
+    rest
 }
 
 pub fn slice_span(paragraphs: &[String], start: usize, end: usize) -> String {
@@ -552,5 +717,44 @@ mod tests {
         assert!(result.used_local_patch);
         assert!(!result.needs_full_fallback);
         assert!(result.draft.contains("A改了"));
+    }
+
+    #[test]
+    fn pacing_detail_and_quote_drive_instruction() {
+        let draft = "第一段环境很长。\n\n第二段动作。";
+        let suggestions = vec![serde_json::json!({
+            "priority": "P1",
+            "location": "第1段",
+            "quote": "环境很长",
+            "action": "删减",
+            "detail": "删去环境两句，保留进门动作",
+        })];
+        let targets = collect_revision_targets(draft, None, &[], &suggestions);
+        assert_eq!(targets.len(), 1);
+        assert!(targets[0].instruction.contains("删去环境"));
+        assert!(targets[0].instruction.contains("删减"));
+        assert_eq!(targets[0].start, 0);
+    }
+
+    #[test]
+    fn timeline_issue_batches_all_time_anchors() {
+        let draft = "倒计时：23:26:58。\n\n普通段落。\n\n手机显示 22:17:03。\n\n又到子夜。";
+        let issues = vec![serde_json::json!({
+            "type": "TIMELINE",
+            "priority": "P0",
+            "message": "时间互斥",
+            "location": "第3段",
+            "quote": "22:17:03"
+        })];
+        let targets = collect_revision_targets(draft, None, &issues, &[]);
+        assert_eq!(targets.len(), 1, "expected one timeline batch, got {targets:?}");
+        assert_eq!(targets[0].source, "timeline_batch");
+        let idxs = targets[0].batch_para_indices();
+        assert!(
+            idxs.contains(&0) && idxs.contains(&2) && idxs.contains(&3),
+            "{idxs:?}"
+        );
+        assert!(!idxs.contains(&1), "non-anchor para must stay out: {idxs:?}");
+        assert_eq!(targets[0].para_label(), "时间锚点×3");
     }
 }

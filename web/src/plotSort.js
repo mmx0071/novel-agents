@@ -1,3 +1,66 @@
+/**
+ * Group arcs + plots by volume for the reader nav.
+ * Returns [{ volume, title, arc, plots }] sorted by volume.
+ */
+export function buildVolumePlotGroups(arcOutlines, plots) {
+  const arcs = [...(arcOutlines || [])].filter((a) => a?.volume >= 1)
+  const sortedPlots = sortPlotsByProgress(plots || [])
+  const plotsByVol = new Map()
+  for (const p of sortedPlots) {
+    const vol = Number(p.volume_index || p.arc_index || 1) || 1
+    if (!plotsByVol.has(vol)) plotsByVol.set(vol, [])
+    plotsByVol.get(vol).push(p)
+  }
+  const volumes = new Set([
+    ...arcs.map((a) => Number(a.volume)),
+    ...plotsByVol.keys(),
+  ])
+  return [...volumes]
+    .filter((v) => v >= 1)
+    .sort((a, b) => a - b)
+    .map((vol) => {
+      const arc = arcs.find((a) => Number(a.volume) === vol) || null
+      const title = arc?.title || `第${vol}卷`
+      return {
+        volume: vol,
+        title,
+        shortLabel: `第${vol}卷`,
+        arc: arc || { volume: vol, title, markdown: '（尚无本卷卷纲正文）' },
+        plots: plotsByVol.get(vol) || [],
+      }
+    })
+}
+
+/** @deprecated use buildVolumePlotGroups — flat tree for legacy callers */
+export function buildVolumePlotTree(arcOutlines, plots) {
+  const out = []
+  for (const g of buildVolumePlotGroups(arcOutlines, plots)) {
+    out.push({
+      kind: 'arc',
+      key: `v${g.volume}`,
+      label: g.title,
+      complete: true,
+      level: 0,
+      volume: g.volume,
+      raw: g.arc,
+    })
+    for (const p of g.plots) {
+      const key = p?.slug || p?.id || p?.title || ''
+      if (!key) continue
+      out.push({
+        kind: 'plot',
+        key,
+        label: p.title || '未命名剧情',
+        complete: !!p.complete,
+        level: 1,
+        volume: g.volume,
+        raw: p,
+      })
+    }
+  }
+  return out
+}
+
 /** Plot status → tie-break rank (lower = earlier when chain ties). */
 const PLOT_PROGRESS_RANK = {
   completed: 0,

@@ -158,7 +158,7 @@ pub fn apply_summary_json(project_dir: &Path, chapter: u32, summary_raw: &str) -
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_string();
-    let key_facts: Vec<String> = v
+    let mut key_facts: Vec<String> = v
         .get("new_facts")
         .and_then(|x| x.as_array())
         .map(|a| {
@@ -167,6 +167,37 @@ pub fn apply_summary_json(project_dir: &Path, chapter: u32, summary_raw: &str) -
                 .collect()
         })
         .unwrap_or_default();
+    // Prefer structured body_state so next chapters get a locked injury/ability board.
+    if let Some(bs) = v.get("body_state") {
+        if let Some(arr) = bs.get("injuries").and_then(|x| x.as_array()) {
+            for item in arr {
+                if let Some(s) = item.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    let line = if s.starts_with("伤势：") {
+                        s.to_string()
+                    } else {
+                        format!("伤势：{s}")
+                    };
+                    if !key_facts.iter().any(|f| f.contains(s)) {
+                        key_facts.push(line);
+                    }
+                }
+            }
+        }
+        if let Some(arr) = bs.get("ability_loci").and_then(|x| x.as_array()) {
+            for item in arr {
+                if let Some(s) = item.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    let line = if s.contains("能力位置") {
+                        s.to_string()
+                    } else {
+                        format!("能力位置：{s}")
+                    };
+                    if !key_facts.iter().any(|f| f.contains(s)) {
+                        key_facts.push(line);
+                    }
+                }
+            }
+        }
+    }
     let plot_progress = v
         .get("plot_progress")
         .and_then(|x| x.as_str())

@@ -14,9 +14,40 @@ pub struct ChapterOutline {
     pub emotion_curve: String,
     pub key_events: Vec<String>,
     pub characters: Vec<String>,
+    /// Active item cards this chapter (canonical names). Missing → [].
+    #[serde(default)]
+    pub items: Vec<String>,
+    /// Active location cards this chapter (canonical names). Missing → [].
+    #[serde(default)]
+    pub locations: Vec<String>,
     pub scene_tags: Vec<String>,
     pub cliffhanger: String,
     pub lore_queries: Vec<String>,
+}
+
+/// Names declared in the chapter outline for CanonContext card loading.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OutlineEntityRoster {
+    pub characters: Vec<String>,
+    pub items: Vec<String>,
+    pub locations: Vec<String>,
+}
+
+impl ChapterOutline {
+    pub fn entity_roster(&self) -> OutlineEntityRoster {
+        OutlineEntityRoster {
+            characters: self.characters.clone(),
+            items: self.items.clone(),
+            locations: self.locations.clone(),
+        }
+    }
+}
+
+/// Best-effort roster from outline JSON / text (empty if unparseable).
+pub fn outline_entity_roster(outline: &str) -> OutlineEntityRoster {
+    parse_chapter_outline_text(outline)
+        .map(|o| o.entity_roster())
+        .unwrap_or_default()
 }
 
 const REQUIRED_STRINGS: &[&str] = &[
@@ -42,15 +73,21 @@ pub fn parse_chapter_outline_text(text: &str) -> Result<ChapterOutline, SchemaEr
     let raw = strip_json_fence(trimmed);
     // Models sometimes wrap JSON in prose — take the outermost object if present.
     let extracted = extract_json_object(&raw).unwrap_or_else(|| raw.clone());
+    let softened = soften_json_quotes(&extracted);
+    let repaired = repair_model_json(&softened);
     let candidates = [
         extracted.clone(),
-        soften_json_quotes(&extracted),
-        raw.clone(),
+        softened.clone(),
+        repaired.clone(),
+        repair_model_json(&soften_json_quotes(&raw)),
         soften_json_quotes(&raw),
+        raw.clone(),
     ];
     let mut last_err = String::new();
+    let mut seen = std::collections::HashSet::new();
     for c in &candidates {
-        if c.trim().is_empty() {
+        let key = c.trim();
+        if key.is_empty() || !seen.insert(key.to_string()) {
             continue;
         }
         match serde_json::from_str::<Value>(c) {
@@ -104,6 +141,83 @@ fn soften_json_quotes(s: &str) -> String {
         .replace(['\u{2018}', '\u{2019}'], "'")
 }
 
+/// Best-effort repair for common LLM JSON mistakes:
+/// trailing commas; bare newlines in strings; unescaped `"` inside string values.
+fn repair_model_json(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 16);
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0usize;
+    let mut in_str = false;
+    let mut escape = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_str {
+            if escape {
+                out.push(c);
+                escape = false;
+                i += 1;
+                continue;
+            }
+            if c == '\\' {
+                out.push(c);
+                escape = true;
+                i += 1;
+                continue;
+            }
+            if c == '\n' || c == '\r' {
+                // Illegal raw newline inside JSON string → escape.
+                if c == '\r' && chars.get(i + 1) == Some(&'\n') {
+                    i += 1;
+                }
+                out.push_str("\\n");
+                i += 1;
+                continue;
+            }
+            if c == '"' {
+                // Closing quote if next non-ws is structural; else escape.
+                let mut j = i + 1;
+                while j < chars.len() && chars[j].is_whitespace() {
+                    j += 1;
+                }
+                let next = chars.get(j).copied();
+                let closes = matches!(next, Some(',' | '}' | ']' | ':') | None);
+                if closes {
+                    out.push('"');
+                    in_str = false;
+                } else {
+                    out.push_str("\\\"");
+                }
+                i += 1;
+                continue;
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        // Outside strings.
+        if c == '"' {
+            in_str = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        // Trailing comma before } or ].
+        if c == ',' {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if matches!(chars.get(j).copied(), Some('}' | ']')) {
+                i += 1;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 pub fn validate_chapter_outline(v: &Value) -> Result<ChapterOutline, SchemaError> {
     let obj = v.as_object().ok_or_else(|| {
         SchemaError::new("chapter_outline", "root", "章纲必须是 JSON 对象")
@@ -121,6 +235,9 @@ pub fn validate_chapter_outline(v: &Value) -> Result<ChapterOutline, SchemaError
 
     let key_events = require_string_array(obj, "key_events", &mut missing)?;
     let characters = require_string_array(obj, "characters", &mut missing)?;
+    // items / locations: preferred for card loading; omit → [] (legacy outlines).
+    let items = optional_string_array(obj, "items", &mut missing)?;
+    let locations = optional_string_array(obj, "locations", &mut missing)?;
     let scene_tags = require_string_array(obj, "scene_tags", &mut missing)?;
     let lore_queries = require_string_array(obj, "lore_queries", &mut missing)?;
 
@@ -149,6 +266,8 @@ pub fn validate_chapter_outline(v: &Value) -> Result<ChapterOutline, SchemaError
         emotion_curve: str_field(obj, "emotion_curve"),
         key_events,
         characters,
+        items,
+        locations,
         scene_tags,
         cliffhanger: str_field(obj, "cliffhanger"),
         lore_queries,
@@ -183,6 +302,24 @@ pub fn display_chapter_outline(o: &ChapterOutline) -> String {
         lines.push("- （无）".into());
     } else {
         for c in &o.characters {
+            lines.push(format!("- {c}"));
+        }
+    }
+    lines.push(String::new());
+    lines.push("## 本章物品".into());
+    if o.items.is_empty() {
+        lines.push("- （无）".into());
+    } else {
+        for c in &o.items {
+            lines.push(format!("- {c}"));
+        }
+    }
+    lines.push(String::new());
+    lines.push("## 本章地点".into());
+    if o.locations.is_empty() {
+        lines.push("- （无）".into());
+    } else {
+        for c in &o.locations {
             lines.push(format!("- {c}"));
         }
     }
@@ -229,22 +366,44 @@ fn require_string_array(
             missing.push(key.to_string());
             Ok(vec![])
         }
-        Some(Value::Array(arr)) => {
-            let mut out = Vec::new();
-            for (i, item) in arr.iter().enumerate() {
-                match item.as_str() {
-                    Some(s) if !s.trim().is_empty() => out.push(s.trim().to_string()),
-                    Some(_) => missing.push(format!("{key}[{i}]（空）")),
-                    None => missing.push(format!("{key}[{i}]（须为字符串）")),
-                }
-            }
-            Ok(out)
-        }
+        Some(Value::Array(arr)) => parse_string_array_items(key, arr, missing),
         Some(_) => {
             missing.push(format!("{key}（须为字符串数组）"));
             Ok(vec![])
         }
     }
+}
+
+/// Like [`require_string_array`], but missing / null → empty (legacy-friendly).
+fn optional_string_array(
+    obj: &serde_json::Map<String, Value>,
+    key: &str,
+    missing: &mut Vec<String>,
+) -> Result<Vec<String>, SchemaError> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(vec![]),
+        Some(Value::Array(arr)) => parse_string_array_items(key, arr, missing),
+        Some(_) => {
+            missing.push(format!("{key}（须为字符串数组）"));
+            Ok(vec![])
+        }
+    }
+}
+
+fn parse_string_array_items(
+    key: &str,
+    arr: &[Value],
+    missing: &mut Vec<String>,
+) -> Result<Vec<String>, SchemaError> {
+    let mut out = Vec::new();
+    for (i, item) in arr.iter().enumerate() {
+        match item.as_str() {
+            Some(s) if !s.trim().is_empty() => out.push(s.trim().to_string()),
+            Some(_) => missing.push(format!("{key}[{i}]（空）")),
+            None => missing.push(format!("{key}[{i}]（须为字符串）")),
+        }
+    }
+    Ok(out)
 }
 
 pub fn strip_json_fence(text: &str) -> String {
@@ -279,6 +438,8 @@ mod tests {
             "emotion_curve": "紧→松",
             "key_events": ["开场危机", "中段转折"],
             "characters": ["甲"],
+            "items": ["旧钥"],
+            "locations": ["城门"],
             "scene_tags": ["chase"],
             "cliffhanger": "门开了",
             "lore_queries": ["甲伤势"]
@@ -289,7 +450,23 @@ mod tests {
     fn accepts_valid() {
         let o = validate_chapter_outline(&sample()).unwrap();
         assert_eq!(o.title, "试章");
-        assert!(display_chapter_outline(&o).contains("## 关键事件"));
+        assert_eq!(o.items, vec!["旧钥".to_string()]);
+        assert_eq!(o.locations, vec!["城门".to_string()]);
+        let md = display_chapter_outline(&o);
+        assert!(md.contains("## 关键事件"));
+        assert!(md.contains("## 本章物品"));
+        assert!(md.contains("旧钥"));
+    }
+
+    #[test]
+    fn legacy_outline_without_items_locations_ok() {
+        let mut v = sample();
+        let obj = v.as_object_mut().unwrap();
+        obj.remove("items");
+        obj.remove("locations");
+        let o = validate_chapter_outline(&v).unwrap();
+        assert!(o.items.is_empty());
+        assert!(o.locations.is_empty());
     }
 
     #[test]
@@ -326,5 +503,26 @@ mod tests {
     fn rejects_empty() {
         let e = parse_chapter_outline_text("   ").unwrap_err();
         assert!(e.message.contains("空"));
+    }
+
+    #[test]
+    fn repairs_unescaped_quotes_and_trailing_comma() {
+        // Line-shaped like planner output: inner ASCII quotes + trailing comma.
+        let text = r#"{
+  "title": "试章",
+  "pov": "甲",
+  "time_location": "夜·城",
+  "goal": "到达",
+  "conflict": "对方说"别去"并挡住去路",
+  "emotion_curve": "紧→松",
+  "key_events": ["开场危机", "中段转折"],
+  "characters": ["甲"],
+  "scene_tags": ["chase"],
+  "cliffhanger": "门开了",
+  "lore_queries": ["甲伤势"],
+}"#;
+        let o = parse_chapter_outline_text(text).expect("repaired parse");
+        assert!(o.conflict.contains("别去"));
+        assert_eq!(o.title, "试章");
     }
 }

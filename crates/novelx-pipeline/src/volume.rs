@@ -5,7 +5,7 @@ use anyhow::Result;
 use novelx_llm::LlmClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Soft default only when acts lack any structure (not used as hard end).
 const DEFAULT_CHAPTERS_PER_VOLUME: u32 = 20;
@@ -54,12 +54,14 @@ pub fn load_volume_bounds(project_dir: &Path) -> Vec<VolumeBound> {
         }
     }
 
-    // 2) Parse markdown 卷纲 (canonical: arc_outline.md; migrate legacy arc_planner.md)
-    migrate_legacy_arc_planner(project_dir);
-    let path = project_dir.join("artifacts/arc_outline.md");
-    if let Ok(text) = std::fs::read_to_string(&path) {
-        for b in parse_volume_meta_from_markdown(&text) {
-            upsert_bound(&mut bounds, b);
+    // 2) Parse markdown 卷纲（per-volume files under arc_outlines/ + legacy arc_outline.md）
+    // Arc file is authoritative for name + ending_conditions (story_outline acts often drift).
+    migrate_arc_outlines(project_dir);
+    for vi in list_arc_outline_volumes(project_dir) {
+        if let Some(text) = read_arc_outline_text(project_dir, vi) {
+            for b in parse_volume_meta_from_markdown(&text) {
+                force_upsert_arc_bound(&mut bounds, b);
+            }
         }
     }
 
@@ -289,11 +291,25 @@ pub async fn evaluate_volume_end(
         return Ok(None);
     }
 
+    // Hard gate: one local plot card ≠ volume end. Still-open plot work blocks sync gate.
+    if crate::plots::volume_has_open_plot_work(project_dir, volume.volume_index) {
+        tracing::info!(
+            chapter,
+            volume = volume.volume_index,
+            "volume end skipped: open plot cards / unfinished next_plot"
+        );
+        return Ok(None);
+    }
+
     // Primary: explicit ending conditions → LLM judge against chapter evidence
     if !volume.ending_conditions.is_empty() {
         let evidence = gather_end_evidence(project_dir, &volume, chapter);
         let decision = llm_judge_ending(llm, &volume, chapter, &evidence).await?;
         if decision.ended {
+            // Re-check after judge — plots may have been mis-read; never end with open work.
+            if crate::plots::volume_has_open_plot_work(project_dir, volume.volume_index) {
+                return Ok(None);
+            }
             let mut vol = volume;
             vol.end_chapter = chapter;
             return Ok(Some(VolumeEndDecision {
@@ -305,8 +321,11 @@ pub async fn evaluate_volume_end(
         return Ok(None);
     }
 
-    // Legacy fallback: soft fixed end_chapter with no conditions
+    // Legacy fallback: soft fixed end_chapter with no conditions — still respect plot gate.
     if volume.end_chapter > 0 && chapter == volume.end_chapter {
+        if crate::plots::volume_has_open_plot_work(project_dir, volume.volume_index) {
+            return Ok(None);
+        }
         return Ok(Some(VolumeEndDecision {
             volume: volume.clone(),
             matched: vec![format!("软边界：第{}章（无终止条件时的兼容）", chapter)],
@@ -338,9 +357,10 @@ async fn llm_judge_ending(
     let system = r#"你是卷末判定员。根据本章及本卷近期摘要，判断卷纲「终止条件」是否已实质达成。
 只输出 JSON：{"ended":true|false,"matched":["命中的条件原文或编号"],"reason":"一句话理由"}
 规则：
-- 必须多数关键终止条件已在正文/摘要中兑现才 ended=true（不必字字相同，语义达成即可）
-- 仅铺垫、未完成高潮/交付 → ended=false
-- 不要因为章数多少而判定结束"#;
+- 必须**多数（过半）**关键终止条件已在正文/摘要中兑现才 ended=true（不必字字相同，语义达成即可）
+- 仅开局卡/铺垫、未完成高潮/团队分裂/卷末抉择 → ended=false
+- 一张剧情卡收束 ≠ 整卷结束；不要因为「推进很多」或章数少而判定结束
+- 证据不足以覆盖终止条件列表时必须 ended=false"#;
     let user = format!(
         "第{}卷「{}」刚发布第{}章。\n卷目标：{}\n\n# 终止条件\n{}\n\n# 证据（摘要）\n{}\n\n只输出 JSON。",
         volume.volume_index,
@@ -669,6 +689,27 @@ fn upsert_bound(bounds: &mut Vec<VolumeBound>, b: VolumeBound) {
     }
 }
 
+/// Arc outline wins for termination criteria / display name (not `completed` flag).
+fn force_upsert_arc_bound(bounds: &mut Vec<VolumeBound>, b: VolumeBound) {
+    if let Some(existing) = bounds.iter_mut().find(|x| x.volume_index == b.volume_index) {
+        if !b.name.is_empty() {
+            existing.name = b.name.clone();
+        }
+        if !b.ending_conditions.is_empty() {
+            existing.ending_conditions = b.ending_conditions.clone();
+            existing.end_chapter = 0;
+        }
+        if existing.start_chapter == 0 && b.start_chapter > 0 {
+            existing.start_chapter = b.start_chapter;
+        }
+        if existing.goal.is_empty() && !b.goal.is_empty() {
+            existing.goal = b.goal.clone();
+        }
+    } else {
+        bounds.push(b);
+    }
+}
+
 /// Rename legacy `arc_planner.md` → `arc_outline.md` once (no-op if outline exists).
 pub fn migrate_legacy_arc_planner(project_dir: &Path) {
     let art = project_dir.join("artifacts");
@@ -686,6 +727,153 @@ pub fn migrate_legacy_arc_planner(project_dir: &Path) {
     }
 }
 
+/// Per-volume 卷纲 directory: `artifacts/arc_outlines/{NN}.md`.
+pub fn arc_outline_dir(project_dir: &Path) -> PathBuf {
+    project_dir.join("artifacts/arc_outlines")
+}
+
+pub fn arc_outline_path(project_dir: &Path, volume: u32) -> PathBuf {
+    arc_outline_dir(project_dir).join(format!("{:02}.md", volume.max(1)))
+}
+
+/// Migrate legacy single `arc_outline.md` / `arc_planner.md` into per-volume files.
+/// Idempotent: existing `arc_outlines/{NN}.md` are kept; legacy file is copied once then removed.
+pub fn migrate_arc_outlines(project_dir: &Path) {
+    migrate_legacy_arc_planner(project_dir);
+    let legacy = project_dir.join("artifacts/arc_outline.md");
+    if !legacy.is_file() {
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(&legacy) else {
+        return;
+    };
+    if text.trim().chars().count() < 20 {
+        let _ = std::fs::remove_file(&legacy);
+        return;
+    }
+    let vol = parse_volume_meta_from_markdown(&text)
+        .into_iter()
+        .next()
+        .map(|b| b.volume_index)
+        .or_else(|| {
+            text.lines()
+                .find(|l| l.trim_start().starts_with('#'))
+                .and_then(|l| extract_volume_index(l.trim()))
+        })
+        .unwrap_or(1)
+        .max(1);
+    let dest = arc_outline_path(project_dir, vol);
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if !dest.is_file() {
+        let _ = std::fs::write(&dest, &text);
+    }
+    // Drop flat file so UI/tools cannot treat a single overwritten blob as "the" 卷纲.
+    let _ = std::fs::remove_file(&legacy);
+}
+
+pub fn list_arc_outline_volumes(project_dir: &Path) -> Vec<u32> {
+    migrate_arc_outlines(project_dir);
+    let dir = arc_outline_dir(project_dir);
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return out;
+    };
+    for ent in rd.flatten() {
+        let path = ent.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if let Ok(n) = stem.parse::<u32>() {
+            if n >= 1 {
+                out.push(n);
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+pub fn has_any_arc_outline(project_dir: &Path) -> bool {
+    !list_arc_outline_volumes(project_dir).is_empty()
+        || path_nonempty_file(&project_dir.join("artifacts/arc_outline.md"))
+}
+
+fn path_nonempty_file(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|t| t.trim().chars().count() > 20)
+        .unwrap_or(false)
+}
+
+pub fn read_arc_outline_text(project_dir: &Path, volume: u32) -> Option<String> {
+    migrate_arc_outlines(project_dir);
+    let path = arc_outline_path(project_dir, volume);
+    let text = std::fs::read_to_string(&path).ok()?;
+    let trimmed = text.trim();
+    if trimmed.chars().count() < 20 {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+pub fn write_arc_outline_text(project_dir: &Path, volume: u32, text: &str) -> anyhow::Result<()> {
+    migrate_arc_outlines(project_dir);
+    let path = arc_outline_path(project_dir, volume.max(1));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, text)?;
+    // Remove legacy flat file if present (prevents "vol2 overwrote vol1" illusions).
+    let _ = std::fs::remove_file(project_dir.join("artifacts/arc_outline.md"));
+    Ok(())
+}
+
+/// Best-effort volume for plot/context reads: active volume for `next_chapter`, else latest file.
+pub fn resolve_arc_outline_volume(project_dir: &Path, hint: Option<u32>) -> u32 {
+    if let Some(v) = hint.filter(|n| *n >= 1) {
+        return v;
+    }
+    let chapter = crate::load_project_state(project_dir)
+        .ok()
+        .map(|s| s.next_chapter.max(1))
+        .unwrap_or(1);
+    if let Some(b) = active_volume_for_chapter(project_dir, chapter) {
+        return b.volume_index.max(1);
+    }
+    list_arc_outline_volumes(project_dir)
+        .into_iter()
+        .next_back()
+        .unwrap_or(1)
+}
+
+/// Preview rows for the reader: one tab per volume outline.
+pub fn list_arc_outlines_for_preview(project_dir: &Path) -> Vec<serde_json::Value> {
+    migrate_arc_outlines(project_dir);
+    let mut rows = Vec::new();
+    for vi in list_arc_outline_volumes(project_dir) {
+        let Some(text) = read_arc_outline_text(project_dir, vi) else {
+            continue;
+        };
+        let title = text
+            .lines()
+            .find(|l| l.trim_start().starts_with('#'))
+            .map(|l| l.trim().trim_start_matches('#').trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("第{vi}卷"));
+        rows.push(serde_json::json!({
+            "volume": vi,
+            "title": title,
+            "markdown": crate::display_arc_outline(&text),
+        }));
+    }
+    rows
+}
+
 fn max_volume_index(project_dir: &Path) -> Option<u32> {
     let outline_path = project_dir.join("artifacts/story_outline.json");
     let text = std::fs::read_to_string(outline_path).ok()?;
@@ -700,6 +888,40 @@ fn max_volume_index(project_dir: &Path) -> Option<u32> {
 /// Persist bounds / ending conditions onto matching act.
 pub fn sync_act_chapter_bounds(project_dir: &Path, bound: &VolumeBound) -> anyhow::Result<()> {
     sync_act_fields(project_dir, bound, false)
+}
+
+/// Undo a mistaken volume completion so writing can continue on this volume.
+pub fn reopen_volume_act(project_dir: &Path, volume_index: u32) -> anyhow::Result<()> {
+    let path = project_dir.join("artifacts/story_outline.json");
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut root: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    let Some(acts) = root
+        .as_object_mut()
+        .and_then(|o| o.get_mut("acts"))
+        .and_then(|a| a.as_array_mut())
+    else {
+        return Ok(());
+    };
+    for act in acts.iter_mut() {
+        let vi = act
+            .get("volume_index")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0) as u32;
+        if vi != volume_index {
+            continue;
+        }
+        if let Some(obj) = act.as_object_mut() {
+            obj.insert("completed".into(), Value::Bool(false));
+            obj.insert("status".into(), Value::String("in_progress".into()));
+            // Clear hard end so open-ended writing resumes under 卷纲终止条件.
+            obj.insert("end_chapter".into(), Value::from(0u32));
+        }
+        break;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&root)?)?;
+    Ok(())
 }
 
 /// Mark volume completed at `end_chapter` and open next act start.
@@ -828,6 +1050,27 @@ fn sync_act_fields(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrate_flat_arc_outline_to_per_volume_file() {
+        let root = std::env::temp_dir().join(format!(
+            "novelx_arc_migrate_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("artifacts")).unwrap();
+        std::fs::write(
+            root.join("artifacts/arc_outline.md"),
+            "# 第2卷 · 承卷\n\n## 卷定位\n- x\n\n## 开卷状态\n- y\n\n## 冲突升级阶梯\n1. a\n\n## 关键节点\n- n\n\n## 人物弧\n- p\n\n## 伏笔\n- f\n\n## 卷末终止条件\n- c1\n- c2\n\n## 卷末交付\n- d\n",
+        )
+        .unwrap();
+        migrate_arc_outlines(&root);
+        assert!(!root.join("artifacts/arc_outline.md").exists());
+        assert!(arc_outline_path(&root, 2).is_file());
+        assert!(read_arc_outline_text(&root, 2).unwrap().contains("第2卷"));
+        assert!(read_arc_outline_text(&root, 1).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn parses_ending_conditions_section() {

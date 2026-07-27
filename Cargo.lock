@@ -878,6 +878,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "novelx-core",
+ "novelx-harness",
  "novelx-llm",
  "novelx-pipeline",
  "novelx-protocol",

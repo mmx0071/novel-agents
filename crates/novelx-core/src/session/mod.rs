@@ -26,9 +26,13 @@ impl TurnGate {
         self.active.lock().await.as_ref().map(|t| t.turn_id.clone())
     }
 
-    /// Unconditional mark (tests / already-serialized paths). Prefer `try_begin`.
+    /// Mark active only if empty or already this turn — never steal another turn's slot.
     pub async fn begin(&self, turn_id: TurnId) {
-        *self.active.lock().await = Some(ActiveTurn { turn_id });
+        let mut guard = self.active.lock().await;
+        match guard.as_ref() {
+            Some(active) if active.turn_id != turn_id => {}
+            _ => *guard = Some(ActiveTurn { turn_id }),
+        }
     }
 
     /// Atomically start a turn. Returns false if another turn is already active
@@ -44,6 +48,14 @@ impl TurnGate {
 
     pub async fn end(&self) {
         *self.active.lock().await = None;
+    }
+
+    /// Clear the gate only when it still belongs to `turn_id` (safe after interrupt + new turn).
+    pub async fn end_if(&self, turn_id: &str) {
+        let mut guard = self.active.lock().await;
+        if guard.as_ref().map(|t| t.turn_id.as_str()) == Some(turn_id) {
+            *guard = None;
+        }
     }
 
     pub async fn has_active(&self) -> bool {
@@ -63,5 +75,19 @@ mod tests {
         assert_eq!(g.active_id().await.as_deref(), Some("t1"));
         g.end().await;
         assert!(g.try_begin("t3".into()).await);
+    }
+
+    #[tokio::test]
+    async fn end_if_does_not_clear_other_turn() {
+        let g = TurnGate::new();
+        assert!(g.try_begin("old".into()).await);
+        g.end_if("old").await;
+        assert!(g.try_begin("new".into()).await);
+        g.end_if("old").await;
+        assert_eq!(g.active_id().await.as_deref(), Some("new"));
+        g.begin("old".into()).await; // must not steal
+        assert_eq!(g.active_id().await.as_deref(), Some("new"));
+        g.end_if("new").await;
+        assert!(!g.has_active().await);
     }
 }

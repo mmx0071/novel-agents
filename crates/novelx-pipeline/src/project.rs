@@ -147,7 +147,7 @@ pub fn refresh_meta_flags(project_dir: &Path) -> Result<()> {
     );
     obj.insert(
         "has_arc_outline".into(),
-        Value::Bool(path_nonempty(&project_dir.join("artifacts/arc_outline.md"))),
+        Value::Bool(crate::volume::has_any_arc_outline(project_dir)),
     );
     obj.insert(
         "has_nomenclature".into(),

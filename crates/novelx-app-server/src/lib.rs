@@ -9,16 +9,21 @@ use axum::routing::{delete, get, post, put};
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
 use novelx_core::NovelxCore;
+use novelx_harness::{ContentRulesConfig, NamingRules, StudioPolicies};
 use novelx_llm::{load_llm_config, LlmClient};
+use novelx_skills::SkillScope;
 use novelx_pipeline::cards::load_markdown_cards;
 use novelx_pipeline::plots::{load_plot_cards_by_progress, rebuild_plot_index};
 use novelx_pipeline::project::{
     delete_chapter, list_projects, load_project_state, project_dir, read_chapter_draft,
     read_chapter_outline, write_chapter_draft, write_chapter_outline,
 };
-use novelx_pipeline::{resolve_setup_phase, resolve_volume_phase};
+use novelx_pipeline::{
+    format_body_state_board, format_body_state_board_for_character, resolve_setup_phase,
+    resolve_volume_phase,
+};
 use novelx_pipeline::schemas::{
-    display_arc_outline, display_bible, display_chapter_outline, display_draft, display_entity_card,
+    display_bible, display_chapter_outline, display_draft, display_entity_card,
     display_entity_gaps, display_master_outline, display_plot_card_body, parse_chapter_outline_text,
     validate_arc_outline, validate_bible, validate_draft, validate_entity_body_edit,
     validate_master_outline, validate_plot_card_body_edit, EntityKind,
@@ -121,6 +126,19 @@ pub async fn serve(repo_root: PathBuf, addr: SocketAddr) -> Result<()> {
         .route("/api/turn/interrupt", post(turn_interrupt))
         .route("/api/turn/steer", post(turn_steer))
         .route("/api/skills/list", get(skills_list))
+        .route("/api/skills/{name}", get(skill_get).put(skill_put))
+        .route(
+            "/api/config/content_rules",
+            get(content_rules_get).put(content_rules_put),
+        )
+        .route(
+            "/api/config/naming_rules",
+            get(naming_rules_get).put(naming_rules_put),
+        )
+        .route(
+            "/api/config/policies",
+            get(policies_get).put(policies_put),
+        )
         .route("/api/library", get(library))
         .route("/api/library/{name}", get(library_one).delete(library_delete))
         .route("/api/projects/{name}/preview", get(preview))
@@ -334,6 +352,299 @@ async fn skills_list(State(state): State<AppState>) -> impl IntoResponse {
     })
 }
 
+#[derive(Debug, Deserialize)]
+struct YamlPutReq {
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillPutReq {
+    content: String,
+}
+
+/// Resolve a file under `config/` (no `..` / absolute escape).
+fn resolve_config_file(config_root: &std::path::Path, relative: &str) -> Result<PathBuf, String> {
+    let rel = relative.trim().trim_start_matches('/');
+    if rel.is_empty() || rel.contains('\0') {
+        return Err("非法配置路径".into());
+    }
+    if rel.split(['/', '\\']).any(|p| p == ".." || p.is_empty()) {
+        return Err("拒绝路径穿越".into());
+    }
+    let root = config_root
+        .canonicalize()
+        .unwrap_or_else(|_| config_root.to_path_buf());
+    let candidate = root.join(rel);
+    // Allow not-yet-existing files: canonicalize parent + append file name.
+    let parent = candidate.parent().unwrap_or(&root);
+    let parent_canon = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+    if !parent_canon.starts_with(&root) {
+        return Err("拒绝路径穿越".into());
+    }
+    let file_name = candidate
+        .file_name()
+        .ok_or_else(|| "非法配置路径".to_string())?;
+    let resolved = parent_canon.join(file_name);
+    if !resolved.starts_with(&root) {
+        return Err("拒绝路径穿越".into());
+    }
+    Ok(resolved)
+}
+
+fn read_config_text(config_root: &std::path::Path, relative: &str) -> Result<String, String> {
+    let path = resolve_config_file(config_root, relative)?;
+    std::fs::read_to_string(&path).map_err(|e| format!("读取失败：{e}"))
+}
+
+fn write_config_text(config_root: &std::path::Path, relative: &str, content: &str) -> Result<(), String> {
+    let path = resolve_config_file(config_root, relative)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败：{e}"))?;
+    }
+    std::fs::write(&path, content).map_err(|e| format!("写入失败：{e}"))
+}
+
+async fn content_rules_get(State(state): State<AppState>) -> impl IntoResponse {
+    let cfg_root = state.core.config_root();
+    let cfg = ContentRulesConfig::load_from_config_root(cfg_root);
+    let yaml = if cfg.raw_yaml.trim().is_empty() {
+        read_config_text(cfg_root, "content_rules.yaml").unwrap_or_else(|_| cfg.raw_yaml.clone())
+    } else {
+        cfg.raw_yaml.clone()
+    };
+    Json(serde_json::json!({
+        "ok": true,
+        "path": "config/content_rules.yaml",
+        "yaml": yaml,
+        "rules": cfg.catalog(),
+    }))
+}
+
+async fn content_rules_put(
+    State(state): State<AppState>,
+    Json(req): Json<YamlPutReq>,
+) -> impl IntoResponse {
+    match ContentRulesConfig::parse_yaml(&req.content) {
+        Ok(cfg) => match write_config_text(state.core.config_root(), "content_rules.yaml", &req.content)
+        {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "rules": cfg.catalog(),
+                })),
+            )
+                .into_response(),
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok": false, "error": e})),
+            )
+                .into_response(),
+        },
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": e})),
+        )
+            .into_response(),
+    }
+}
+
+async fn naming_rules_get(State(state): State<AppState>) -> impl IntoResponse {
+    let cfg_root = state.core.config_root();
+    let yaml = read_config_text(cfg_root, "naming_rules.yaml").unwrap_or_default();
+    let rules = NamingRules::load_from_config_root(cfg_root);
+    Json(serde_json::json!({
+        "ok": true,
+        "path": "config/naming_rules.yaml",
+        "yaml": yaml,
+        "forbidden_names": rules.forbidden_names,
+        "naming_principles": rules.naming_principles,
+        "categories": rules.categories,
+    }))
+}
+
+async fn naming_rules_put(
+    State(state): State<AppState>,
+    Json(req): Json<YamlPutReq>,
+) -> impl IntoResponse {
+    match NamingRules::parse_yaml(&req.content) {
+        Ok(rules) => {
+            match write_config_text(state.core.config_root(), "naming_rules.yaml", &req.content) {
+                Ok(()) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "ok": true,
+                        "forbidden_names": rules.forbidden_names,
+                        "naming_principles": rules.naming_principles,
+                    })),
+                )
+                    .into_response(),
+                Err(e) => (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"ok": false, "error": e})),
+                )
+                    .into_response(),
+            }
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": e})),
+        )
+            .into_response(),
+    }
+}
+
+async fn policies_get(State(state): State<AppState>) -> impl IntoResponse {
+    let yaml = read_config_text(state.core.config_root(), "policies.yaml").unwrap_or_default();
+    Json(serde_json::json!({
+        "ok": true,
+        "path": "config/policies.yaml",
+        "yaml": yaml,
+    }))
+}
+
+async fn policies_put(
+    State(state): State<AppState>,
+    Json(req): Json<YamlPutReq>,
+) -> impl IntoResponse {
+    match StudioPolicies::parse_yaml(&req.content) {
+        Ok(_) => match write_config_text(state.core.config_root(), "policies.yaml", &req.content) {
+            Ok(()) => {
+                state.core.reload_policies();
+                (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+            }
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok": false, "error": e})),
+            )
+                .into_response(),
+        },
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": e})),
+        )
+            .into_response(),
+    }
+}
+
+fn is_framework_skill_path(config_root: &std::path::Path, path: &std::path::Path) -> bool {
+    let Ok(skills_root) = config_root.join("skills").canonicalize() else {
+        let skills_root = config_root.join("skills");
+        return path.starts_with(&skills_root);
+    };
+    let Ok(canon) = path.canonicalize() else {
+        return path.starts_with(&skills_root);
+    };
+    canon.starts_with(&skills_root)
+}
+
+async fn skill_get(State(state): State<AppState>, Path(name): Path<String>) -> impl IntoResponse {
+    state.core.reload_skills().await;
+    let skills = state.core.list_skills().await;
+    let Some(meta) = skills.iter().find(|s| s.name == name || s.name.replace('_', "-") == name.replace('_', "-"))
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"ok": false, "error": format!("未找到 skill「{name}」")})),
+        )
+            .into_response();
+    };
+    let content = match std::fs::read_to_string(&meta.path) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok": false, "error": format!("读取失败：{e}")})),
+            )
+                .into_response();
+        }
+    };
+    let editable = matches!(meta.scope, SkillScope::System | SkillScope::Agent | SkillScope::Studio)
+        && is_framework_skill_path(state.core.config_root(), &meta.path);
+    Json(serde_json::json!({
+        "ok": true,
+        "name": meta.name,
+        "description": meta.description,
+        "path": meta.path.display().to_string(),
+        "scope": format!("{:?}", meta.scope),
+        "editable": editable,
+        "content": content,
+    }))
+    .into_response()
+}
+
+async fn skill_put(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<SkillPutReq>,
+) -> impl IntoResponse {
+    if name.contains("..") || name.contains('/') || name.contains('\\') {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": "非法 skill 名称"})),
+        )
+            .into_response();
+    }
+    state.core.reload_skills().await;
+    let skills = state.core.list_skills().await;
+    let Some(meta) = skills.iter().find(|s| s.name == name || s.name.replace('_', "-") == name.replace('_', "-"))
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"ok": false, "error": format!("未找到 skill「{name}」")})),
+        )
+            .into_response();
+    };
+    if matches!(meta.scope, SkillScope::Project)
+        || !is_framework_skill_path(state.core.config_root(), &meta.path)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "一期仅允许编辑 config/skills 下的框架 Skill，不能写 projects/ 项目 Skill",
+            })),
+        )
+            .into_response();
+    }
+    // Ensure write target stays under config/skills even if path was swapped.
+    let skills_root = state.core.config_root().join("skills");
+    let Ok(skills_canon) = skills_root.canonicalize() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": "config/skills 不存在"})),
+        )
+            .into_response();
+    };
+    let target = meta.path.clone();
+    let parent = target.parent().unwrap_or(&skills_canon);
+    let parent_canon = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+    if !parent_canon.starts_with(&skills_canon) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"ok": false, "error": "拒绝写入 config/skills 以外的路径"})),
+        )
+            .into_response();
+    }
+    if let Err(e) = std::fs::write(&target, &req.content) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": format!("写入失败：{e}")})),
+        )
+            .into_response();
+    }
+    state.core.reload_skills().await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "name": meta.name,
+            "path": target.display().to_string(),
+        })),
+    )
+        .into_response()
+}
+
 fn build_preview(repo_root: &std::path::Path, name: &str) -> serde_json::Value {
     let dir = repo_root.join("projects").join(name);
     let st = load_project_state(&dir).ok();
@@ -379,21 +690,63 @@ fn build_preview(repo_root: &std::path::Path, name: &str) -> serde_json::Value {
         "items": [],
         "locations": [],
     });
+    // Character name keys for attributing body_state facts per card.
+    let char_cards = load_markdown_cards(&dir.join("entities").join("characters"), "characters");
+    let all_char_keys: Vec<String> = {
+        let mut keys = Vec::new();
+        for c in &char_cards {
+            keys.extend(entity_match_keys(c));
+        }
+        keys.sort();
+        keys.dedup();
+        keys
+    };
+    let default_owner_names = load_default_body_owner_names(&dir);
     for group in ["characters", "items", "locations"] {
         let kind = EntityKind::from_group(group).unwrap_or(EntityKind::Character);
-        let list: Vec<serde_json::Value> = load_markdown_cards(
-            &dir.join("entities").join(group),
-            group,
-        )
-        .into_iter()
-        .map(|mut c| {
-            // Prefer full-file display when available; cards store body in markdown.
-            let path = dir.join("entities").join(group).join(format!("{}.md", c.slug));
-            let full = std::fs::read_to_string(&path).unwrap_or_else(|_| c.markdown.clone());
-            c.markdown = display_entity_card(kind, &full);
-            c.to_preview_json()
-        })
-        .collect();
+        let cards = if group == "characters" {
+            char_cards.clone()
+        } else {
+            load_markdown_cards(&dir.join("entities").join(group), group)
+        };
+        let list: Vec<serde_json::Value> = cards
+            .into_iter()
+            .map(|mut c| {
+                // Prefer full-file display when available; cards store body in markdown.
+                let path = dir.join("entities").join(group).join(format!("{}.md", c.slug));
+                let full = std::fs::read_to_string(&path).unwrap_or_else(|_| c.markdown.clone());
+                c.markdown = display_entity_card(kind, &full);
+                let mut v = c.to_preview_json();
+                if group == "characters" {
+                    let self_keys = entity_match_keys(&c);
+                    let is_default = self_keys.iter().any(|k| {
+                        default_owner_names
+                            .iter()
+                            .any(|d| d == k || k.contains(d) || d.contains(k))
+                    }) || c
+                        .meta
+                        .get("role")
+                        .map(|r| {
+                            matches!(
+                                r.trim().to_ascii_lowercase().as_str(),
+                                "protagonist" | "main" | "lead" | "主角"
+                            )
+                        })
+                        .unwrap_or(false);
+                    let board = format_body_state_board_for_character(
+                        &dir,
+                        next.max(1),
+                        &self_keys,
+                        &all_char_keys,
+                        is_default,
+                    );
+                    if !board.trim().is_empty() {
+                        v["body_state"] = serde_json::Value::String(board);
+                    }
+                }
+                v
+            })
+            .collect();
         entities[group] = serde_json::Value::Array(list);
     }
     let plots: Vec<serde_json::Value> = load_plot_cards_by_progress(&dir)
@@ -415,6 +768,10 @@ fn build_preview(repo_root: &std::path::Path, name: &str) -> serde_json::Value {
                 let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                     continue;
                 };
+                // Per-volume 卷纲 live in artifacts/arc_outlines/ — not as a single flat file.
+                if stem == "arc_outline" || stem == "arc_planner" {
+                    continue;
+                }
                 let ext = path
                     .extension()
                     .and_then(|s| s.to_str())
@@ -423,7 +780,6 @@ fn build_preview(repo_root: &std::path::Path, name: &str) -> serde_json::Value {
                     if let Ok(text) = std::fs::read_to_string(&path) {
                         let display = match stem {
                             "master_outline" | "master_planner" => display_master_outline(&text),
-                            "arc_outline" | "arc_planner" => display_arc_outline(&text),
                             "bible" => display_bible(&text),
                             _ => text,
                         };
@@ -433,6 +789,7 @@ fn build_preview(repo_root: &std::path::Path, name: &str) -> serde_json::Value {
             }
         }
     }
+    let arc_outlines = novelx_pipeline::list_arc_outlines_for_preview(&dir);
 
     let story_outline = std::fs::read_to_string(dir.join("artifacts/story_outline.json"))
         .ok()
@@ -448,6 +805,8 @@ fn build_preview(repo_root: &std::path::Path, name: &str) -> serde_json::Value {
 
     let entity_gaps_list = novelx_pipeline::collect_entity_gaps(&dir);
     let entity_gaps_display = display_entity_gaps(&entity_gaps_list);
+    // Same chapter index the next writer run would lock against.
+    let body_state_board = format_body_state_board(&dir, next.max(1));
     // Progress authority: published_count + on-disk chapters — ignore stale state.extra.chapters.
     let mut state_json = st
         .as_ref()
@@ -461,12 +820,7 @@ fn build_preview(repo_root: &std::path::Path, name: &str) -> serde_json::Value {
 
     let setup_phase = resolve_setup_phase(&dir);
     let volume_phase = resolve_volume_phase(&dir);
-    let has_arc = artifacts
-        .get("arc_outline")
-        .or_else(|| artifacts.get("arc_planner"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().len() > 20)
-        .unwrap_or(false);
+    let has_arc = !arc_outlines.is_empty() || novelx_pipeline::has_any_arc_outline(&dir);
     let has_master = artifacts
         .get("master_outline")
         .or_else(|| artifacts.get("master_planner"))
@@ -487,8 +841,10 @@ fn build_preview(repo_root: &std::path::Path, name: &str) -> serde_json::Value {
         "plots": plots,
         "entities": entities,
         "artifacts": artifacts,
+        "arc_outlines": arc_outlines,
         "entity_gaps": entity_gaps_list,
         "entity_gaps_display": entity_gaps_display,
+        "body_state_board": body_state_board,
         "published_count": published,
         "next_chapter": next,
         "state": state_json,
@@ -497,6 +853,69 @@ fn build_preview(repo_root: &std::path::Path, name: &str) -> serde_json::Value {
         "has_master_outline": has_master,
         "has_arc_outline": has_arc,
     })
+}
+
+/// Names / aliases used to attribute body_state facts to a character card.
+fn entity_match_keys(card: &novelx_pipeline::cards::MarkdownCard) -> Vec<String> {
+    let mut keys = card.match_keys();
+    // 「老七(预言者)」also matches facts that only say「老七」.
+    for base in [card.name.as_str(), card.title.as_str(), card.slug.as_str()] {
+        for sep in ['(', '（', '·', '/'] {
+            if let Some((head, _)) = base.split_once(sep) {
+                let t = head.trim();
+                if t.chars().count() >= 2 {
+                    keys.push(t.to_string());
+                }
+            }
+        }
+    }
+    keys.retain(|k| !k.trim().is_empty());
+    keys.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()));
+    keys.dedup();
+    keys
+}
+
+/// Always-include / protagonist names — receive unscoped body_state facts.
+fn load_default_body_owner_names(project_dir: &std::path::Path) -> Vec<String> {
+    let mut names = Vec::new();
+    let push = |names: &mut Vec<String>, v: &serde_json::Value| {
+        if let Some(s) = v.as_str() {
+            let t = s.trim();
+            if !t.is_empty() {
+                names.push(t.to_string());
+            }
+        } else if let Some(arr) = v.as_array() {
+            for x in arr {
+                if let Some(s) = x.as_str() {
+                    let t = s.trim();
+                    if !t.is_empty() {
+                        names.push(t.to_string());
+                    }
+                }
+            }
+        }
+    };
+    if let Ok(raw) = std::fs::read_to_string(project_dir.join("meta.json")) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(p) = v.get("protagonist") {
+                push(&mut names, p);
+            }
+            if let Some(p) = v.get("protagonists") {
+                push(&mut names, p);
+            }
+        }
+    }
+    if let Ok(st) = load_project_state(project_dir) {
+        if let Some(p) = st.meta.get("protagonist") {
+            push(&mut names, p);
+        }
+        if let Some(p) = st.meta.get("protagonists") {
+            push(&mut names, p);
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
 }
 
 async fn library(State(state): State<AppState>) -> impl IntoResponse {
@@ -627,6 +1046,21 @@ fn save_project_content(dir: &std::path::Path, req: &ContentPutReq) -> anyhow::R
             write_card_preserving_frontmatter(&path, &norm_body)?;
             let _ = rebuild_plot_index(dir);
         }
+        "arcs" => {
+            let key = req.card_key.trim();
+            if key.is_empty() {
+                anyhow::bail!("保存卷纲需要 card_key（如 v1）");
+            }
+            let vol_str = key.strip_prefix('v').unwrap_or(key);
+            let vol: u32 = vol_str
+                .parse()
+                .map_err(|_| anyhow::anyhow!("卷纲 card_key 须为 vN 或卷第数字"))?;
+            if vol < 1 {
+                anyhow::bail!("卷纲卷第须 ≥ 1");
+            }
+            let normalized = validate_arc_outline(content)?;
+            novelx_pipeline::write_arc_outline_text(dir, vol, &normalized)?;
+        }
         t if t.starts_with("ent:") => {
             let group = &t[4..];
             let kind = EntityKind::from_group(group)
@@ -641,6 +1075,17 @@ fn save_project_content(dir: &std::path::Path, req: &ContentPutReq) -> anyhow::R
             let norm_body = validate_entity_body_edit(kind, &existing, content)?;
             write_card_preserving_frontmatter(&path, &norm_body)?;
         }
+        t if t.starts_with("art:arc_v") => {
+            let rest = &t["art:arc_v".len()..];
+            let vol: u32 = rest
+                .parse()
+                .map_err(|_| anyhow::anyhow!("卷纲标签须为 art:arc_vN（N 为卷第）"))?;
+            if vol < 1 {
+                anyhow::bail!("卷纲卷第须 ≥ 1");
+            }
+            let normalized = validate_arc_outline(content)?;
+            novelx_pipeline::write_arc_outline_text(dir, vol, &normalized)?;
+        }
         t if t.starts_with("art:") => {
             let stem = &t[4..];
             if stem.is_empty() || stem.contains('/') || stem.contains("..") {
@@ -648,7 +1093,12 @@ fn save_project_content(dir: &std::path::Path, req: &ContentPutReq) -> anyhow::R
             }
             let normalized = match stem {
                 "master_outline" | "master_planner" => validate_master_outline(content)?,
-                "arc_outline" | "arc_planner" => validate_arc_outline(content)?,
+                "arc_outline" | "arc_planner" => {
+                    let normalized = validate_arc_outline(content)?;
+                    let vol = novelx_pipeline::resolve_arc_outline_volume(dir, None);
+                    novelx_pipeline::write_arc_outline_text(dir, vol, &normalized)?;
+                    return Ok(());
+                }
                 "bible" => validate_bible(content)?,
                 _ => content.clone(),
             };
@@ -856,5 +1306,44 @@ fn event_matches_thread(ev: &EventMsg, thread_id: &str) -> bool {
                 || status.parent_thread_id.as_deref() == Some(thread_id)
         }
         EventMsg::Error { .. } | EventMsg::Warning { .. } => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn resolve_config_file_rejects_traversal() {
+        let dir = std::env::temp_dir().join("novelx-config-sandbox-test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        assert!(resolve_config_file(&dir, "../secret.yaml").is_err());
+        assert!(resolve_config_file(&dir, "a/../../b.yaml").is_err());
+        let ok = resolve_config_file(&dir, "content_rules.yaml").unwrap();
+        assert!(ok.ends_with("content_rules.yaml"));
+        let root = dir.canonicalize().unwrap();
+        assert!(ok.starts_with(&root));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn framework_skill_path_gate() {
+        let dir = std::env::temp_dir().join("novelx-skill-path-test");
+        let _ = fs::remove_dir_all(&dir);
+        let skills = dir.join("skills/agents/writer");
+        fs::create_dir_all(&skills).unwrap();
+        let skill_file = skills.join("SKILL.md");
+        fs::write(&skill_file, "---\nname: writer\n---\nbody").unwrap();
+        let outside = dir.join("../outside.md");
+        assert!(is_framework_skill_path(&dir, &skill_file));
+        // project-style path outside config/skills
+        let projects = dir.parent().unwrap().join("projects-sample/x/SKILL.md");
+        let _ = fs::create_dir_all(projects.parent().unwrap());
+        let _ = fs::write(&projects, "x");
+        assert!(!is_framework_skill_path(&dir, &projects));
+        let _ = outside;
+        let _ = fs::remove_dir_all(&dir);
     }
 }

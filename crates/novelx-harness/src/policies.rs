@@ -66,12 +66,10 @@ impl StudioPolicies {
             return Self::defaults();
         }
         match std::fs::read_to_string(&path) {
-            Ok(raw) => match serde_yaml::from_str::<PoliciesFile>(&raw) {
-                Ok(file) => {
+            Ok(raw) => match Self::parse_yaml(&raw) {
+                Ok(p) => {
                     tracing::info!("studio policies loaded");
-                    Self {
-                        inner: Arc::new(file),
-                    }
+                    p
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "policies.yaml parse failed; using defaults");
@@ -83,6 +81,15 @@ impl StudioPolicies {
                 Self::defaults()
             }
         }
+    }
+
+    /// Validate YAML text for Web PUT.
+    pub fn parse_yaml(text: &str) -> Result<Self, String> {
+        let file: PoliciesFile =
+            serde_yaml::from_str(text).map_err(|e| format!("policies.yaml 解析失败：{e}"))?;
+        Ok(Self {
+            inner: Arc::new(file),
+        })
     }
 
     pub fn defaults() -> Self {
@@ -106,6 +113,22 @@ impl StudioPolicies {
         self.inner
             .bare_continue
             .phrases
+            .iter()
+            .any(|p| p == t)
+    }
+
+    /// 「继续」/「继续创作」等：有未发布草稿时要澄清，无草稿时走续写。
+    pub fn is_continue_write_intent(&self, user_text: &str) -> bool {
+        let t = user_text.trim();
+        if t.is_empty() {
+            return false;
+        }
+        if self.is_bare_continue(t) {
+            return true;
+        }
+        self.inner
+            .clear_history_on_write
+            .exact
             .iter()
             .any(|p| p == t)
     }
@@ -193,6 +216,9 @@ mod tests {
     fn bare_continue_and_clear_history_from_defaults() {
         let p = StudioPolicies::defaults();
         assert!(p.is_bare_continue("继续"));
+        assert!(!p.is_bare_continue("继续创作"));
+        assert!(p.is_continue_write_intent("继续"));
+        assert!(p.is_continue_write_intent("继续创作"));
         assert!(!p.is_bare_continue("写第7章"));
         assert!(!p.user_intends_new_chapter_write("继续", false));
         assert!(p.user_intends_new_chapter_write("写第7章", true));

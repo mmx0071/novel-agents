@@ -211,20 +211,100 @@ pub fn collect_explicit_skill_mentions(text: &str) -> Vec<String> {
     names
 }
 
+/// Agents that receive shared `prose-pitfalls` hard constraints prepended to SKILL body.
+const PROSE_PITFALLS_AGENTS: &[&str] = &[
+    "writer",
+    "consistency-auditor",
+    "literary-editor",
+    "dialogue-specialist",
+    "scene-specialist",
+];
+
+/// Agents that produce locked content shapes — prepend `content-formats`.
+const CONTENT_FORMATS_AGENTS: &[&str] = &[
+    "writer",
+    "chapter-planner",
+    "master-planner",
+    "arc-planner",
+    "plot-designer",
+    "entity-designer",
+    "world-architect",
+    "summarizer",
+];
+
+fn wants_prose_pitfalls(agent: &str) -> bool {
+    let key = agent.replace('_', "-");
+    PROSE_PITFALLS_AGENTS.iter().any(|a| *a == key)
+}
+
+fn wants_content_formats(agent: &str) -> bool {
+    let key = agent.replace('_', "-");
+    CONTENT_FORMATS_AGENTS.iter().any(|a| *a == key)
+}
+
+fn strip_md_frontmatter(content: &str) -> &str {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return content;
+    }
+    let rest = &trimmed[3..];
+    if let Some(end) = rest.find("\n---") {
+        let after = &rest[end + 4..];
+        return after.trim_start_matches('\n');
+    }
+    content
+}
+
+fn load_shared_skill_body(skills: &[SkillMetadata], name: &str) -> Option<String> {
+    let want = name.replace('_', "-");
+    let meta = skills.iter().find(|s| {
+        s.name == name || s.name.replace('_', "-") == want
+    })?;
+    let raw = fs::read_to_string(&meta.path).ok()?;
+    let body = strip_md_frontmatter(&raw).trim();
+    if body.is_empty() {
+        None
+    } else {
+        Some(body.to_string())
+    }
+}
+
 /// Load full skill bodies for activated names.
+/// Format producers get `content-formats`; prose agents also get `prose-pitfalls`.
 pub fn build_skill_injections(
     skills: &[SkillMetadata],
     activate: &[String],
 ) -> Vec<SkillInjection> {
+    let pitfalls = load_shared_skill_body(skills, "prose-pitfalls");
+    let formats = load_shared_skill_body(skills, "content-formats");
     let mut out = Vec::new();
     for name in activate {
-        if let Some(meta) = skills.iter().find(|s| s.name == *name || s.name.replace('_', "-") == *name) {
+        if let Some(meta) = skills.iter().find(|s| s.name == *name || s.name.replace('_', "-") == *name)
+        {
             match fs::read_to_string(&meta.path) {
-                Ok(body) => out.push(SkillInjection {
-                    name: meta.name.clone(),
-                    path: meta.path.clone(),
-                    body,
-                }),
+                Ok(raw) => {
+                    let mut prefixes = Vec::new();
+                    if wants_content_formats(&meta.name) {
+                        if let Some(ref f) = formats {
+                            prefixes.push(f.as_str());
+                        }
+                    }
+                    if wants_prose_pitfalls(&meta.name) {
+                        if let Some(ref p) = pitfalls {
+                            prefixes.push(p.as_str());
+                        }
+                    }
+                    let body = if prefixes.is_empty() {
+                        raw
+                    } else {
+                        format!("{}\n\n---\n\n{raw}", prefixes.join("\n\n---\n\n"))
+                    };
+                    out.push(SkillInjection {
+                        name: meta.name.clone(),
+                        path: meta.path.clone(),
+                        body,
+                    });
+                }
                 Err(_) => continue,
             }
         }
@@ -319,6 +399,81 @@ mod tests {
         let inj = build_skill_injections(&outcome.skills, &mentions);
         assert_eq!(inj.len(), 1);
         assert!(inj[0].body.contains("Full body here"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn injects_prose_pitfalls_for_writer() {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("novelx_skills_pitfalls_{ts}"));
+        let agents = dir.join("agents/writer");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(
+            agents.join("SKILL.md"),
+            "---\nname: writer\ndescription: Write.\n---\n\n# Writer\n\nBody.\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("prose-pitfalls.md"),
+            "---\nname: prose-pitfalls\ndescription: Pitfalls.\n---\n\n# 正文常见雷区（硬约束）\n\n1. **章号元叙述**\n",
+        )
+        .unwrap();
+
+        let outcome = load_skills(&[
+            (SkillScope::Studio, dir.clone()),
+            (SkillScope::Agent, dir.join("agents")),
+        ]);
+        assert!(
+            outcome.skills.iter().any(|s| s.name == "prose-pitfalls"),
+            "skills={:?}",
+            outcome.skills.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        let inj = build_skill_injections(&outcome.skills, &["writer".into()]);
+        assert_eq!(inj.len(), 1);
+        assert!(
+            inj[0].body.contains("正文常见雷区"),
+            "missing pitfalls prepend: {}",
+            inj[0].body.chars().take(200).collect::<String>()
+        );
+        assert!(inj[0].body.contains("# Writer"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn injects_content_formats_for_chapter_planner() {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("novelx_skills_formats_{ts}"));
+        let agents = dir.join("agents/chapter-planner");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(
+            agents.join("SKILL.md"),
+            "---\nname: chapter-planner\ndescription: Plan.\n---\n\n# Planner\n\nBody.\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("content-formats.md"),
+            "---\nname: content-formats\ndescription: Formats.\n---\n\n# 内容格式契约（生成锚定）\n\n双层原则。\n",
+        )
+        .unwrap();
+
+        let outcome = load_skills(&[
+            (SkillScope::Studio, dir.clone()),
+            (SkillScope::Agent, dir.join("agents")),
+        ]);
+        let inj = build_skill_injections(&outcome.skills, &["chapter-planner".into()]);
+        assert_eq!(inj.len(), 1);
+        assert!(
+            inj[0].body.contains("内容格式契约"),
+            "missing formats prepend: {}",
+            inj[0].body.chars().take(200).collect::<String>()
+        );
+        assert!(inj[0].body.contains("# Planner"));
         let _ = fs::remove_dir_all(&dir);
     }
 }

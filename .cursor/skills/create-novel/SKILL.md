@@ -100,8 +100,8 @@ Release 二进制：`cargo build -p novelx-cli --release` → `./target/release/
 | world_architect | 尚无 Bible |
 | master_planner / arc_planner | 尚无总纲/卷纲 |
 | dialogue_specialist / scene_specialist | 对话密集 / 战斗高潮 |
-| foreshadow_tracker / literary_editor | 伏笔/风格 |
-| entity_designer / plot_designer / setting_auditor | Studio 介入，不进章流水线 |
+| foreshadow_tracker / literary_editor | 伏笔/风格（润色：activation 建议 + Studio `activate_agents`，非每章必跑） |
+| entity_designer / plot_designer / setting_auditor | Studio 介入；剧情收束后自动巡检（±轻量同步），不进章流水线 order |
 
 ## 流水线顺序
 
@@ -110,8 +110,8 @@ Release 二进制：`cargo build -p novelx-cli --release` → `./target/release/
 ```
 chapter_planner → lore_librarian → writer
 → nomenclature_curator → dialogue_specialist → scene_specialist
-→ consistency_auditor → foreshadow_tracker → pacing_reviewer
-→ literary_editor → summarizer → plot_acceptor
+→ pacing_reviewer → literary_editor → consistency_auditor
+→ foreshadow_tracker → summarizer → plot_acceptor
 ```
 
 修订路径默认 `prefer_local_patch`（`novelx-draft-patch` + `novelx-pipeline`）。
@@ -121,14 +121,15 @@ chapter_planner → lore_librarian → writer
 ### 新建小说
 
 1. `cargo run -p novelx-cli -- init <name> --genre <题材> --chapters <N>`
-2. 检查 `projects/<name>/`
-3. 向用户汇报状态
+2. `lock_brief` → 总纲/卷纲 → **补齐 Bible（0/1/2/7）** → `confirm_setup`
+3. 剧情卡收束后会自动设定巡检（±轻量同步）；卷末仍走 `sync_volume` 门控
 
 ### 写每一章
 
 1. `status` 查看进度
 2. `run <name> <chapter>` 续写；修订用 `--revise --instructions ...`
 3. 一致性 FAIL 时局部修订，不要跳过审校
+4. Studio：跳章硬拦；落盘突变默认预览，用户确认后再写；局部修订先出 diff（见 `studio.enforce_chapter_order` / `studio.require_mutation_confirm`）
 
 ## LLM 配置
 

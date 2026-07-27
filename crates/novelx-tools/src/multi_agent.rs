@@ -37,7 +37,7 @@ impl ToolHandler for SpawnAgent {
         "spawn_agent"
     }
     fn description(&self) -> &'static str {
-        "Spawn a writing SubAgent thread (chapter_planner/writer/…)。完成后用 wait_agent 收取结果。"
+        "启动子 Agent 线程（章纲规划/正文写作等）。完成后用 wait_agent 收取结果。"
     }
     fn parameters(&self) -> Value {
         json!({

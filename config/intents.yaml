@@ -83,6 +83,47 @@ intents:
       - 复盘
       - 继续
 
+  # 「对照剧情卡到哪了 / 剧情进度 / 第N卷进行到哪了」→ 只查卡，禁止续写
+  - id: plot_status
+    tool: list_plots
+    priority: 85
+    require_project: true
+    extract: volume_optional
+    any_keywords:
+      - 剧情进度
+      - 进行到哪了
+      - 写到哪了
+      - 现在写到哪
+      - 卷进行到
+      - 本卷到哪
+      - 这一卷到哪
+    all_keyword_groups:
+      - [剧情卡, 到哪]
+      - [剧情卡, 进度]
+      - [对照, 剧情]
+      - [剧情卡, 现在]
+      - [主线, 到哪]
+      - [进行中, 剧情]
+      - [剧情, 推进]
+      - [推进, 到哪]
+      - [剧情, 到哪]
+      - [剧情, 进行]
+      - [故事, 到哪]
+      - [第, 卷, 到哪]
+      - [第, 卷, 进行]
+      - [本卷, 进度]
+      - [这一卷, 进度]
+    none_keywords:
+      - 写第
+      - 续写
+      - 写下一章
+      - design_plot
+      - 修改剧情
+      - 更新剧情
+      - 设计剧情
+      - 审这一卷
+      - 复盘
+
   # 「写第10章 / 续写 / 写下一章」→ continue_writing
   # 衔接章由剧情卡 needs_bridge（Agent）决定，0 或 1 章，用户无需声明
   # 复合任务（去重/卷纲/design_plot…再写第N章）勿命中：应交 LLM 分步执行
@@ -111,8 +152,36 @@ intents:
       - 剧情卡
       - 终态卡
       - 卷间交接
+      - 到哪了
+      - 进度
+      - 对照
 
-  # 「修正/扩写第五章」→ revise_chapter
+  # 「改第N章章纲 / 修正章纲 / 重写章纲」→ revise_outline（优先于改正文）
+  - id: revise_outline
+    tool: revise_outline
+    priority: 65
+    require_project: true
+    extract: chapter
+    all_keyword_groups:
+      - [改, 章纲]
+      - [修, 章纲]
+      - [修订, 章纲]
+      - [修正, 章纲]
+      - [更新, 章纲]
+      - [重写, 章纲]
+      - [调整, 章纲]
+      - [revise, outline]
+      - [改, outline]
+    none_keywords:
+      - 总纲
+      - 卷纲
+      - master_outline
+      - arc_outline
+    default_instructions: >-
+      按对话要求修订本章章纲：保留未点名的情节骨架，落实点名修改（目标/冲突/关键事件/出场名单/章末钩子等），并与 CanonContext 一致。
+    instructions_min_chars: 16
+
+  # 「修正/扩写第五章」「按审校局部修订第N章」→ revise_chapter
   - id: revise_chapter
     tool: revise_chapter
     priority: 60
@@ -121,17 +190,27 @@ intents:
     any_keywords:
       - 修正
       - 修订
+      - 局部修订
+      - 按审校
       - 扩写
       - 重写
       - 加长
       - 改写
-      - 润色
       - 写长
       - 太短
       - 太少
       - rewrite
       - revise
       - expand
+    # 「润色/去 AI 腔」不进本意图：交给 Studio → activate_agents(literary_editor)
+    # 「改章纲」走 revise_outline
+    none_keywords:
+      - 润色
+      - 去AI腔
+      - 去 AI 腔
+      - AI腔
+      - 章纲
+      - outline
     default_instructions: >-
       扩写/重写本章至约 3000–5000 字，按章纲补足情节与细节，保持与前后章衔接。
     instructions_min_chars: 24

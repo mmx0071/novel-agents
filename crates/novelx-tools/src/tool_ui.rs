@@ -2,6 +2,34 @@
 
 use serde_json::Value;
 
+/// Pipeline step / tool id → Chinese label for progress lines & tool cards.
+pub fn agent_label_zh(id: &str) -> &str {
+    match id {
+        "chapter_planner" => "章纲规划",
+        "lore_librarian" => "设定检索",
+        "writer" => "正文写作",
+        "continue_writing" => "继续创作",
+        "local_reviser" => "局部修订",
+        "scene_specialist" => "场景专改",
+        "dialogue_specialist" => "对话专改",
+        "consistency_auditor" => "一致性审计",
+        "foreshadow_tracker" => "伏笔追踪",
+        "pacing_reviewer" => "节奏审查",
+        "literary_editor" => "文学润色",
+        "nomenclature_curator" => "名词管理",
+        "summarizer" => "章节摘要",
+        "plot_acceptor" => "剧情验收",
+        "autofix" => "自动修复",
+        "revise_chapter" => "修订章节",
+        "audit_chapter" => "审校章节",
+        "audit_chapters" => "审阅队列",
+        "audit_volume" => "整卷复盘",
+        "steer_run" => "门控续作",
+        "offer_decisions" => "提出决策",
+        other => other,
+    }
+}
+
 /// Tools whose full payload should not be streamed into the chat timeline.
 pub fn is_bulk_context_tool(name: &str) -> bool {
     matches!(
@@ -178,5 +206,19 @@ mod tests {
         .unwrap();
         assert!(s.contains("卷纲"));
         assert!(s.contains("样例小说"));
+    }
+
+    #[test]
+    fn agent_labels_are_chinese() {
+        assert_eq!(agent_label_zh("chapter_planner"), "章纲规划");
+        assert_eq!(agent_label_zh("lore_librarian"), "设定检索");
+        assert_eq!(agent_label_zh("writer"), "正文写作");
+        assert_eq!(agent_label_zh("continue_writing"), "继续创作");
+        assert_eq!(agent_label_zh("scene_specialist"), "场景专改");
+        assert_eq!(agent_label_zh("consistency_auditor"), "一致性审计");
+        assert_eq!(agent_label_zh("foreshadow_tracker"), "伏笔追踪");
+        assert_eq!(agent_label_zh("autofix"), "自动修复");
+        assert_eq!(agent_label_zh("pacing_reviewer"), "节奏审查");
+        assert_eq!(agent_label_zh("literary_editor"), "文学润色");
     }
 }

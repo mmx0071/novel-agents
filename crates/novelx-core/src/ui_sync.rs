@@ -68,7 +68,31 @@ pub fn ui_turns_weaker_than(incoming: &Value, existing: &Value) -> bool {
     {
         return true;
     }
+    // Client snapshot with only bulk-read tool cards must not wipe NovelX prose.
+    let ex_prose = ui_agent_prose_chars(existing);
+    let inc_prose = ui_agent_prose_chars(incoming);
+    if ex_prose >= 80 && inc_prose + 40 < ex_prose {
+        return true;
+    }
     false
+}
+
+fn ui_agent_prose_chars(turns: &Value) -> usize {
+    turns
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .flat_map(|t| t.get("items").and_then(|v| v.as_array()).into_iter().flatten())
+                .filter(|it| it.get("type").and_then(|v| v.as_str()) == Some("agent_message"))
+                .map(|it| {
+                    it.get("text")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.chars().count())
+                        .unwrap_or(0)
+                })
+                .sum()
+        })
+        .unwrap_or(0)
 }
 
 pub fn keep_only_ui_turn(turns: Value, turn_id: &str) -> Value {
@@ -108,6 +132,10 @@ pub fn strip_ui_approvals(turns: Value) -> Value {
     Value::Array(next)
 }
 
+/// Finish a turn with a NovelX summary **without wiping** tool / preview cards.
+///
+/// Previously this replaced the whole turn with a single agent_message, which made
+/// `continue_writing` / audit process cards disappear after mutation confirm.
 pub fn append_completion_ui_turn(
     turns: Value,
     turn_id: &str,
@@ -118,32 +146,173 @@ pub fn append_completion_ui_turn(
         Value::Array(a) => a,
         _ => Vec::new(),
     };
+    let status = if awaiting { "awaiting" } else { "complete" };
+
     for turn in &mut arr {
         let Value::Object(obj) = turn else { continue };
+        let id = obj.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if id == turn_id {
+            continue;
+        }
+        // Seal sibling turns.
         obj.insert("approval".into(), Value::Null);
-        obj.insert("status".into(), json!("complete"));
-        if let Some(Value::Array(items)) = obj.get_mut("items") {
-            for item in items.iter_mut() {
-                let Value::Object(it) = item else { continue };
-                let st = it.get("status").and_then(|v| v.as_str()).unwrap_or("");
-                if st == "in_progress" || st == "inProgress" || st == "InProgress" {
-                    it.insert("status".into(), json!("completed"));
-                }
+        if obj.get("status").and_then(|v| v.as_str()) != Some("aborted") {
+            obj.insert("status".into(), json!("complete"));
+        }
+        finish_in_progress_items(obj);
+    }
+
+    let mut found = false;
+    for turn in &mut arr {
+        let Value::Object(obj) = turn else { continue };
+        if obj.get("id").and_then(|v| v.as_str()) != Some(turn_id) {
+            continue;
+        }
+        found = true;
+        // Keep an already-attached human gate (e.g. chapter_next「修正本章」).
+        if !awaiting {
+            obj.insert("approval".into(), Value::Null);
+        }
+        obj.insert("status".into(), json!(status));
+        finish_in_progress_items(obj);
+        let items = obj
+            .entry("items")
+            .or_insert_with(|| json!([]));
+        let Some(items) = items.as_array_mut() else {
+            break;
+        };
+        let mut updated = false;
+        // Prefer the last agent bubble (intro / live status) for the closing summary.
+        for item in items.iter_mut().rev() {
+            let Value::Object(it) = item else { continue };
+            if it.get("type").and_then(|v| v.as_str()) == Some("agent_message") {
+                it.insert("text".into(), json!(summary));
+                it.insert("status".into(), json!("completed"));
+                updated = true;
+                break;
             }
         }
+        if !updated && !summary.trim().is_empty() {
+            items.push(json!({
+                "id": format!("item_done_{turn_id}"),
+                "type": "agent_message",
+                "text": summary,
+                "status": "completed"
+            }));
+        }
+        break;
     }
-    arr.retain(|t| t.get("id").and_then(|v| v.as_str()) != Some(turn_id));
-    arr.push(json!({
-        "id": turn_id,
-        "status": if awaiting { "awaiting" } else { "complete" },
-        "approval": null,
-        "items": [{
-            "id": format!("item_done_{turn_id}"),
-            "type": "agent_message",
-            "text": summary,
-            "status": "completed"
-        }]
-    }));
+
+    if !found {
+        arr.push(json!({
+            "id": turn_id,
+            "status": status,
+            "approval": null,
+            "items": [{
+                "id": format!("item_done_{turn_id}"),
+                "type": "agent_message",
+                "text": summary,
+                "status": "completed"
+            }]
+        }));
+    }
+    Value::Array(arr)
+}
+
+fn finish_in_progress_items(obj: &mut serde_json::Map<String, Value>) {
+    let Some(Value::Array(items)) = obj.get_mut("items") else {
+        return;
+    };
+    for item in items.iter_mut() {
+        let Value::Object(it) = item else { continue };
+        let st = it.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        if st == "in_progress" || st == "inProgress" || st == "InProgress" {
+            it.insert("status".into(), json!("completed"));
+        }
+    }
+}
+
+/// Persist a tool card into `ui_turns` so HTTP restore keeps the process timeline.
+pub fn upsert_ui_tool_call(
+    turns: Value,
+    turn_id: &str,
+    item_id: &str,
+    name: &str,
+    arguments: &Value,
+    output: Option<&str>,
+    status: &str,
+    duration_ms: Option<u64>,
+) -> Value {
+    let mut arr = match turns {
+        Value::Array(a) => a,
+        _ => Vec::new(),
+    };
+    let mut tool = json!({
+        "id": item_id,
+        "type": "tool_call",
+        "name": name,
+        "arguments": arguments,
+        "output": output.unwrap_or(""),
+        "status": status,
+        "_key": format!("tool_call:{item_id}"),
+    });
+    if let Some(ms) = duration_ms {
+        tool["duration_ms"] = json!(ms);
+    }
+
+    let mut matched = false;
+    for turn in &mut arr {
+        let Value::Object(obj) = turn else { continue };
+        if obj.get("id").and_then(|v| v.as_str()) != Some(turn_id) {
+            continue;
+        }
+        matched = true;
+        let tool_running = matches!(status, "in_progress" | "inProgress" | "InProgress");
+        if tool_running && obj.get("status").and_then(|v| v.as_str()) == Some("complete") {
+            // Keep recording mid-flight tools even if a race marked the turn done.
+            obj.insert("status".into(), json!("running"));
+        }
+        let items = obj
+            .entry("items")
+            .or_insert_with(|| json!([]));
+        let Some(items) = items.as_array_mut() else {
+            continue;
+        };
+        let mut found = false;
+        for item in items.iter_mut() {
+            let Value::Object(it) = item else { continue };
+            if it.get("id").and_then(|v| v.as_str()) == Some(item_id) {
+                it.insert("type".into(), json!("tool_call"));
+                it.insert("name".into(), json!(name));
+                it.insert("arguments".into(), arguments.clone());
+                if let Some(out) = output {
+                    // Prefer longer streamed output (don't shrink on a short final line).
+                    let prev = it.get("output").and_then(|v| v.as_str()).unwrap_or("");
+                    if out.len() >= prev.len() || prev.trim().is_empty() {
+                        it.insert("output".into(), json!(out));
+                    }
+                }
+                it.insert("status".into(), json!(status));
+                if let Some(ms) = duration_ms {
+                    it.insert("duration_ms".into(), json!(ms));
+                }
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            items.push(tool.clone());
+        }
+        break;
+    }
+    if !matched {
+        arr.push(json!({
+            "id": turn_id,
+            "status": "running",
+            "approval": null,
+            "items": [tool],
+        }));
+    }
     Value::Array(arr)
 }
 
@@ -157,13 +326,199 @@ pub fn update_ui_turn_summary(turns: Value, turn_id: &str, summary: &str) -> Val
             continue;
         }
         if let Some(Value::Array(items)) = obj.get_mut("items") {
+            // Only the first agent bubble (status / intro). Later bubbles — e.g. audit
+            // report from emit_audit_report_before_gate — must not be overwritten.
             for item in items.iter_mut() {
                 let Value::Object(it) = item else { continue };
                 if it.get("type").and_then(|v| v.as_str()) == Some("agent_message") {
                     it.insert("text".into(), json!(summary));
                     it.insert("status".into(), json!("completed"));
+                    break;
                 }
             }
+        }
+    }
+    Value::Array(arr)
+}
+
+/// Ensure a NovelX prose bubble exists on `turn_id` (match by item id, else append).
+/// Used so HTTP restore / client turn sync cannot leave only bulk-read tool cards.
+pub fn upsert_ui_agent_message(
+    turns: Value,
+    turn_id: &str,
+    item_id: &str,
+    text: &str,
+) -> Value {
+    let text = text.trim();
+    if text.is_empty() {
+        return turns;
+    }
+    let Value::Array(mut arr) = turns else {
+        return turns;
+    };
+    let mut matched_turn = false;
+    for turn in &mut arr {
+        let Value::Object(obj) = turn else { continue };
+        if obj.get("id").and_then(|v| v.as_str()) != Some(turn_id) {
+            continue;
+        }
+        matched_turn = true;
+        let items = obj
+            .entry("items")
+            .or_insert_with(|| json!([]));
+        let Some(items) = items.as_array_mut() else {
+            continue;
+        };
+        let mut found = false;
+        for item in items.iter_mut() {
+            let Value::Object(it) = item else { continue };
+            if it.get("id").and_then(|v| v.as_str()) == Some(item_id)
+                || (it.get("type").and_then(|v| v.as_str()) == Some("agent_message")
+                    && it
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .is_empty()
+                    && it.get("id").and_then(|v| v.as_str()) == Some(item_id))
+            {
+                it.insert("type".into(), json!("agent_message"));
+                it.insert("text".into(), json!(text));
+                it.insert("status".into(), json!("completed"));
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            // Prefer updating the last empty agent_message; else append after tools.
+            if let Some(item) = items.iter_mut().rev().find(|item| {
+                item.get("type").and_then(|v| v.as_str()) == Some("agent_message")
+                    && item
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .is_empty()
+            }) {
+                if let Value::Object(it) = item {
+                    it.insert("id".into(), json!(item_id));
+                    it.insert("text".into(), json!(text));
+                    it.insert("status".into(), json!("completed"));
+                }
+            } else {
+                items.push(json!({
+                    "id": item_id,
+                    "type": "agent_message",
+                    "text": text,
+                    "status": "completed",
+                }));
+            }
+        }
+    }
+    if !matched_turn {
+        arr.push(json!({
+            "id": turn_id,
+            "status": "complete",
+            "approval": null,
+            "items": [{
+                "id": item_id,
+                "type": "agent_message",
+                "text": text,
+                "status": "completed",
+            }],
+        }));
+    }
+    Value::Array(arr)
+}
+
+/// Attach mutation preview items (diffs / markdown) onto the turn for Web cards.
+pub fn attach_ui_mutation_preview(
+    turns: Value,
+    turn_id: &str,
+    preview: &Value,
+    diffs: Value,
+) -> Value {
+    let mut arr = match turns {
+        Value::Array(a) => a,
+        _ => Vec::new(),
+    };
+    let mut items: Vec<Value> = Vec::new();
+    if let Some(darr) = diffs.as_array() {
+        for d in darr {
+            let start = d.get("start_para").and_then(|v| v.as_u64()).unwrap_or(1);
+            let end = d
+                .get("end_para")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(start);
+            items.push(json!({
+                "type": "draft_patch",
+                "status": "completed",
+                "project": preview.get("project").and_then(|v| v.as_str()).unwrap_or(""),
+                "chapter": preview.get("chapter").and_then(|v| v.as_u64()).unwrap_or(0),
+                "start_para": start,
+                "end_para": end,
+                "before": d.get("before").and_then(|v| v.as_str()).unwrap_or(""),
+                "after": d.get("after").and_then(|v| v.as_str()).unwrap_or(""),
+            }));
+        }
+    }
+    if items.is_empty() {
+        let markdown = preview
+            .get("markdown")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let fields = preview.get("fields").cloned().unwrap_or(Value::Null);
+        if !markdown.is_empty() || !fields.is_null() {
+            items.push(json!({
+                "type": "mutation_preview",
+                "status": "completed",
+                "kind": preview.get("kind").and_then(|v| v.as_str()).unwrap_or(""),
+                "markdown": markdown,
+                "fields": fields,
+            }));
+        }
+    }
+    if items.is_empty() {
+        return Value::Array(arr);
+    }
+    let push_items = |obj: &mut serde_json::Map<String, Value>| {
+        let mut existing = obj
+            .get("items")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        // sync_pending_gate / maybe_offer may both attach — don't duplicate cards.
+        let has_preview = existing.iter().any(|it| {
+            matches!(
+                it.get("type").and_then(|v| v.as_str()),
+                Some("mutation_preview" | "draft_patch")
+            )
+        });
+        if has_preview {
+            return;
+        }
+        existing.extend(items.clone());
+        obj.insert("items".into(), Value::Array(existing));
+    };
+    let mut matched = false;
+    for turn in &mut arr {
+        let Value::Object(obj) = turn else { continue };
+        let id = obj.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if id == turn_id {
+            push_items(obj);
+            matched = true;
+            break;
+        }
+    }
+    if !matched {
+        if let Some(Value::Object(obj)) = arr.last_mut() {
+            push_items(obj);
+        } else {
+            arr.push(json!({
+                "id": turn_id,
+                "status": "awaiting",
+                "items": items,
+            }));
         }
     }
     Value::Array(arr)
@@ -375,4 +730,54 @@ pub fn sanitize_ui_turns_finish_audits(turns: Value) -> Value {
         })
         .collect();
     Value::Array(next)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_completion_preserves_tool_cards() {
+        let turns = json!([{
+            "id": "turn_1",
+            "status": "running",
+            "items": [
+                {"id": "a1", "type": "agent_message", "text": "已确认，正在应用…", "status": "completed"},
+                {
+                    "id": "t1",
+                    "type": "tool_call",
+                    "name": "continue_writing",
+                    "arguments": {"project": "sample-novel"},
+                    "output": "▶ 章纲规划\n✓ 正文写作",
+                    "status": "completed"
+                }
+            ]
+        }]);
+        let next = append_completion_ui_turn(turns, "turn_1", "已确认…\n\n完成，但有警告", false);
+        let items = next[0]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2, "tool card must survive completion");
+        assert_eq!(items[1]["type"], "tool_call");
+        assert_eq!(items[1]["name"], "continue_writing");
+        assert!(items[0]["text"].as_str().unwrap().contains("完成"));
+        assert_eq!(next[0]["status"], "complete");
+    }
+
+    #[test]
+    fn mutation_preview_attach_is_idempotent() {
+        let turns = json!([{
+            "id": "turn_1",
+            "status": "awaiting",
+            "items": []
+        }]);
+        let preview = json!({
+            "kind": "continue_writing",
+            "markdown": "确认后开始写第1章",
+            "fields": null
+        });
+        let once = attach_ui_mutation_preview(turns, "turn_1", &preview, json!([]));
+        let twice = attach_ui_mutation_preview(once, "turn_1", &preview, json!([]));
+        let items = twice[0]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "preview must not duplicate");
+        assert_eq!(items[0]["type"], "mutation_preview");
+    }
 }

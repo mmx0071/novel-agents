@@ -5,35 +5,58 @@
 version: 1
 
 gates:
+  # Legacy typed-reply aliases only — live cards use pending_audit.decision_options.
   audit:
     options:
       - id: "1"
-        label: 按审校局部修订
+        label: 修全部阻断项
         tool: steer_run
         args:
           project: "{{project}}"
           chapter: "{{chapter}}"
           choice: revise
-        aliases: [按审校局部修订, 局部修订]
+        aliases: [修全部阻断项, 按审校局部修订, 局部修订]
       - id: "2"
-        label: 接受问题
+        label: 接受并结束本轮
         tool: steer_run
         args:
           project: "{{project}}"
           chapter: "{{chapter}}"
           choice: accept
-        aliases: [接受问题, 接受]
+        aliases: [接受并结束本轮, 接受问题, 接受]
 
+  # Consistency auditor returned empty / unparseable — not a prose issue.
+  # Do NOT offer「局部修订」(nothing to patch from META noise).
+  audit_infra:
+    options:
+      - id: ai_retry
+        label: 重试审计
+        tool: audit_chapter
+        args:
+          project: "{{project}}"
+          chapter: "{{chapter}}"
+        aliases: [重试审计, 重新审计, 再审一次, 再审计]
+      - id: ai_skip
+        label: 暂不处理
+        tool: steer_run
+        args:
+          project: "{{project}}"
+          chapter: "{{chapter}}"
+          choice: accept
+        aliases: [暂不处理, 跳过, 稍后]
+
+  # Queue lifecycle only — per-issue revise cards come from pending_audit.decision_options.
+  # Kept so typed「跳过/结束队列」与旧「局部修订」别名仍可解析。
   audit_queue:
     options:
       - id: "1"
-        label: 按审校局部修订
+        label: 修全部阻断项
         tool: steer_run
         args:
           project: "{{project}}"
           chapter: "{{chapter}}"
           choice: revise
-        aliases: [按审校局部修订, 局部修订]
+        aliases: [修全部阻断项, 按审校局部修订, 局部修订]
       - id: "2"
         label: 跳过，审下一章
         tool: audit_chapters
@@ -63,6 +86,95 @@ gates:
         resolve: skip_volume
         aliases: [跳过, 不同步, 稍后]
 
+  # continue_writing blocked: planned plot exists but not activated.
+  planned_plot:
+    options:
+      - id: pp_activate_write
+        label: 激活「{{title}}」并写章
+        resolve: activate_plot_write
+        aliases: [激活并写章, 激活剧情卡并写章, 激活剧情卡, 激活]
+      - id: pp_dismiss
+        label: 暂不写作
+        resolve: dismiss_gate
+        aliases: [暂不写作, 取消, 稍后]
+
+  # continue_writing blocked: no active plot — design+activate next card.
+  need_plot:
+    options:
+      - id: np_design
+        label: 设计并激活剧情卡
+        tool: design_plot
+        args:
+          project: "{{project}}"
+          title: "{{title}}"
+          act: "{{volume}}"
+          activate: true
+        aliases: [设计并激活剧情卡, 设计剧情卡, 开剧情卡, design_plot]
+      - id: np_dismiss
+        label: 暂不写作
+        resolve: dismiss_gate
+        aliases: [暂不写作, 取消, 稍后]
+
+  # Skip-ahead chapter write blocked → offer the correct next chapter.
+  chapter_order:
+    options:
+      - id: co_write_next
+        label: 写第{{next_chapter}}章
+        tool: continue_writing
+        args:
+          project: "{{project}}"
+          chapter: "{{next_chapter}}"
+        aliases: [写下一章, 按顺序写, 写当前章]
+
+  # Generic mutation confirm (apply_args come from pending_mutation in core).
+  # Include setup-confirm ids/aliases so a mis-click「确认定稿」still applies the preview.
+  confirm_mutation:
+    options:
+      - id: cm_apply
+        label: 应用修改
+        resolve: apply_mutation
+        aliases: [应用修改, 应用, 确认修改, 确认, 确定, 应用此修改, 确认定稿, sc_approve, approve]
+      - id: cm_discard
+        label: 放弃
+        resolve: discard_mutation
+        aliases: [放弃, 取消, 不要改, sc_revise]
+
+  # After mutation apply: cascade revise dependent drafts/outlines/settings.
+  confirm_impact:
+    options:
+      - id: ci_sync
+        label: 自动同步修正
+        resolve: sync_impact
+        aliases: [自动同步修正, 同步修正, 级联修订, 同步受影响内容, sync_impact]
+      - id: ci_skip
+        label: 暂不同步
+        resolve: skip_impact
+        aliases: [暂不同步, 不同步, 跳过级联, skip_impact]
+
+  # After sync / when write blocked at awaiting_next_arc.
+  volume_handoff_arc:
+    options:
+      - id: vh_arc
+        label: 设计下卷卷纲
+        tool: design_arc_outline
+        args:
+          project: "{{project}}"
+          arc: "{{volume}}"
+        aliases: [设计下卷卷纲, 写卷纲, 细化下卷, design_arc_outline]
+
+  # After arc outline / when write blocked at awaiting_next_plot.
+  volume_handoff_plot:
+    options:
+      - id: vh_plot
+        label: 设计并激活剧情卡
+        tool: design_plot
+        args:
+          project: "{{project}}"
+          title: "{{title}}"
+          act: "{{volume}}"
+          activate: true
+        aliases: [设计并激活剧情卡, 设计剧情卡, 开下卷剧情, design_plot]
+
   # Inspiration / outline confirmation before first chapter.
   # IDs must NOT collide with audit / volume_sync bare ids.
   setup_confirm:
@@ -82,8 +194,90 @@ gates:
           action: revise
         aliases: [修改再生成, 修改, 重做, revise]
 
+  # continue_writing blocked: setup still collecting — guide next concrete step.
+  setup_need_brief:
+    options:
+      - id: sb_status
+        label: 查看项目状态
+        tool: get_project_status
+        args:
+          project: "{{project}}"
+        aliases: [查看项目状态, 看状态, 项目状态]
+      - id: sb_dismiss
+        label: 暂不处理
+        resolve: dismiss_gate
+        aliases: [暂不处理, 取消, 稍后]
+
+  setup_need_master:
+    options:
+      - id: sm_design
+        label: 生成总纲
+        tool: design_master_outline
+        args:
+          project: "{{project}}"
+        aliases: [生成总纲, 写总纲, design_master_outline]
+      - id: sm_dismiss
+        label: 暂不处理
+        resolve: dismiss_gate
+        aliases: [暂不处理, 取消, 稍后]
+
+  setup_need_arc:
+    options:
+      - id: sa_design
+        label: 生成卷纲
+        tool: design_arc_outline
+        args:
+          project: "{{project}}"
+        aliases: [生成卷纲, 写卷纲, design_arc_outline]
+      - id: sa_dismiss
+        label: 暂不处理
+        resolve: dismiss_gate
+        aliases: [暂不处理, 取消, 稍后]
+
+  setup_need_bible:
+    options:
+      - id: sbi_design
+        label: 生成世界观 Bible
+        tool: upsert_setting
+        args:
+          project: "{{project}}"
+          topic: 完整世界观
+          content: "根据 brief、总纲与卷纲生成完整世界观 Bible，须含 # 世界观 与 ## 0./1./2./7. 必填节。"
+        aliases: [生成世界观 Bible, 生成 Bible, 补齐 Bible, upsert_setting]
+      - id: sbi_dismiss
+        label: 暂不处理
+        resolve: dismiss_gate
+        aliases: [暂不处理, 取消, 稍后]
+
+  # continue_writing omitted chapter while next_chapter already has an unpublished draft.
+  draft_exists:
+    options:
+      - id: de_audit
+        label: 审校本章
+        tool: audit_chapter
+        args:
+          project: "{{project}}"
+          chapter: "{{chapter}}"
+        aliases: [审校本章, 审校, 先审校]
+      - id: de_revise
+        label: 修订本章
+        tool: revise_chapter
+        args:
+          project: "{{project}}"
+          chapter: "{{chapter}}"
+          instructions: "在现有正文基础上修订本章：保持情节与设定一致，修补明显问题，便于审校发布。"
+        aliases: [修订本章, 修订, 修改本章]
+      - id: de_next
+        label: 写下一章
+        tool: continue_writing
+        args:
+          project: "{{project}}"
+          chapter: "{{suggest_chapter}}"
+        aliases: [写下一章, 新写下一章, 跳过并写下一章]
+
   # After chapter write/revise: server filters by publish result.
-  # published → cn_continue only; content-rule blocked → cn_revise only.
+  # published → cn_continue only; content-rule blocked → cn_revise only;
+  # published + plot_accept fail → both (继续推进 / 修正收束).
   # IDs must NOT collide with audit / volume_sync bare ids.
   chapter_next:
     options:
@@ -92,14 +286,17 @@ gates:
         tool: continue_writing
         args:
           project: "{{project}}"
-        aliases: [继续创作, 继续写, 下一章, 续写]
+        # Do NOT alias bare「继续」here — it is handled by policies bare_continue
+        # (write next chapter / clarify). Listing it as a gate token makes stale-gate
+        # handling treat「继续」as an expired audit choice.
+        aliases: [继续创作, 继续写, 下一章, 续写, 继续推进, 继续推进本卡]
       - id: cn_revise
         label: 修正本章
         tool: revise_chapter
         args:
           project: "{{project}}"
           chapter: "{{chapter}}"
-          instructions: "按上一轮反馈修正本章：保持情节与设定一致，修补明显问题。"
+          instructions: "消除正文硬规则违规：除标题行外禁止出现「第N章」元叙述，并替换禁名；只改违规句，勿整章重写。"
         aliases: [修正本章, 修正, 修改本章, 修订]
 
   # IDs must NOT collide with audit/audit_queue ("1"/"2"/"3") — bare id match is global per gate.

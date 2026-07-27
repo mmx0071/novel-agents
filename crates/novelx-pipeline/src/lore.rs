@@ -56,7 +56,8 @@ pub fn lore_query(project_dir: &Path, chapter: u32, outline: &str, draft: &str) 
         parts.push(format!("## Lore·未收线\n{}", open.join("\n")));
     }
 
-    // Entity cards whose names appear in outline/draft.
+    // Entity cards: outline roster first, then name hits in outline/draft.
+    let roster = crate::schemas::outline_entity_roster(outline);
     let mut cards = Vec::new();
     for group in ["characters", "items", "locations"] {
         cards.extend(load_markdown_cards(
@@ -64,19 +65,42 @@ pub fn lore_query(project_dir: &Path, chapter: u32, outline: &str, draft: &str) 
             group,
         ));
     }
-    let mut hit_cards = Vec::new();
+    let mut hit_slugs: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for name in roster
+        .characters
+        .iter()
+        .chain(roster.items.iter())
+        .chain(roster.locations.iter())
+    {
+        if let Some(c) = cards
+            .iter()
+            .find(|c| c.match_keys().iter().any(|k| k == name))
+        {
+            if seen.insert(c.slug.clone()) {
+                hit_slugs.push(c.slug.clone());
+            }
+        }
+    }
     for c in &cards {
+        if hit_slugs.len() >= 6 {
+            break;
+        }
         if c.match_keys()
             .iter()
             .any(|k| k.chars().count() >= 2 && hay.contains(k))
+            && seen.insert(c.slug.clone())
         {
-            hit_cards.push(c);
+            hit_slugs.push(c.slug.clone());
         }
     }
-    hit_cards.truncate(4);
-    if !hit_cards.is_empty() {
+    hit_slugs.truncate(6);
+    if !hit_slugs.is_empty() {
         let mut block = String::from("## Lore·相关实体\n");
-        for c in hit_cards {
+        for slug in &hit_slugs {
+            let Some(c) = cards.iter().find(|c| &c.slug == slug) else {
+                continue;
+            };
             block.push_str(&format!(
                 "### {}\n{}\n",
                 c.name,

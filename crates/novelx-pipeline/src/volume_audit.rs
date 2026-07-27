@@ -122,7 +122,9 @@ pub fn gather_volume_audit_pack(project_dir: &Path, volume: &VolumeBound) -> Res
     }
     parts.push(format!("# 各章摘要\n{}", summary_parts.join("\n\n")));
 
-    let arc = std::fs::read_to_string(project_dir.join("artifacts/arc_outline.md"))
+    let arc_vol = volume.volume_index.max(1);
+    let arc = crate::volume::read_arc_outline_text(project_dir, arc_vol)
+        .or_else(|| std::fs::read_to_string(project_dir.join("artifacts/arc_outline.md")).ok())
         .unwrap_or_default();
     if arc.trim().chars().count() > 20 {
         let excerpt: String = arc.chars().take(1800).collect();

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import {
   DRAFT_WORKSPACE_KEY,
   emptyWorkspace,
@@ -9,7 +9,9 @@ import {
   workspaceKey,
 } from './studioCache'
 import NovelXChat from './components/NovelXChat'
-import { sortPlotsByProgress } from './plotSort'
+import MarkdownView from './components/MarkdownView'
+import ConfigPanel from './components/ConfigPanel'
+import { buildVolumePlotGroups, sortPlotsByProgress } from './plotSort'
 
 const API = '/api'
 const initialCache = typeof window !== 'undefined' ? loadStudioCache() : migrateCache(null)
@@ -47,15 +49,21 @@ const ARTIFACT_LABELS = {
   // Prefer `bible` when both exist (see artifactTabs filter).
   world_architect: '世界观',
   bible: '世界观',
-  // master_outline / master_planner → single reader tab「总纲」(not listed here as artifact)
-  arc_outline: '卷纲',
-  arc_planner: '卷纲', // legacy filename
+  // master_outline / master_planner → single reader tab「总纲」
+  // 卷纲：preview.arc_outlines → 单 Tab「卷纲」；其下挂靠同卷剧情卡
 }
 
 const ENTITY_TAB_LABELS = {
   characters: '人物',
   items: '物品',
   locations: '地点',
+}
+
+const ENTITY_STATUS_LABELS = {
+  active: '在场',
+  background: '背景',
+  exited: '退场',
+  consumed: '已消耗',
 }
 
 function entityCardKey(e) {
@@ -66,26 +74,47 @@ function plotCardKey(p) {
   return p?.slug || p?.id || p?.title || ''
 }
 
+function entityStatusLabel(status) {
+  const s = String(status || '').trim()
+  if (!s) return ''
+  return ENTITY_STATUS_LABELS[s] || s
+}
+
+/** Display entity card with lifecycle status/holdings (frontmatter); edit uses markdown only. */
 function formatEntityCard(e, emptyLabel = '设定卡') {
   if (!e) return `（暂无${emptyLabel}）`
   const mark = e.complete ? '' : '（待补全）'
   const gaps = e.gaps?.length ? `\n> 缺口：${e.gaps.join('、')}\n` : ''
-  return `${e.markdown || `# ${e.name}`}${gaps}${mark ? `\n${mark}` : ''}`
+  const status = entityStatusLabel(e.status)
+  const holdings = String(e.holdings || '').trim()
+  const bodyState = String(e.body_state || '').trim()
+  const meta = []
+  if (status) meta.push(`- **状态**：${status}`)
+  if (holdings) meta.push(`- **持有**：${holdings}`)
+  const parts = []
+  if (bodyState) {
+    parts.push(`## 身体与能力状态\n\n${bodyState}`)
+  }
+  if (meta.length) {
+    parts.push(`## 当前状态\n\n${meta.join('\n')}`)
+  }
+  const metaBlock = parts.length ? `${parts.join('\n\n')}\n\n---\n\n` : ''
+  return `${metaBlock}${e.markdown || `# ${e.name}`}${gaps}${mark ? `\n${mark}` : ''}`
 }
 
 function formatPlotCard(p) {
   if (!p) {
     return (
       '（暂无剧情卡）\n\n'
-      + '剧情卡服务于大纲某卷的全部或局部情节，须含：概览、剧情走向、出场人物/物品/设定。\n'
-      + '节奏：剧情收束 → 衔接章 → 下一剧情卡。\n'
-      + '可说「第一幕局部剧情卡：…」'
+      + '剧情卡 = 卷内一段情节（不是整卷卷纲）。须含：概览、剧情走向、出场人物/物品/设定、可核验收束。\n'
+      + '节奏：本段收束 → 衔接章 → 下一张剧情卡；一卷通常多张依次推进。\n'
+      + '可说「第1卷下一段剧情：…」'
     )
   }
   const joinList = (arr) => (arr?.length ? arr.join('、') : '—')
   const mark = p.complete ? '' : '（待补全）'
   const gaps = p.gaps?.length ? `\n> 缺口：${p.gaps.join('、')}` : ''
-  const scope = p.scope === 'volume' ? '整卷' : '卷内局部'
+  const scope = '卷内局部'
   // 优先完整 markdown（与磁盘卡一致）；无则拼结构化预览
   if (p.markdown?.trim()) {
     return `${p.markdown.trim()}${gaps}${mark ? `\n${mark}` : ''}`
@@ -106,6 +135,8 @@ function formatPlotCard(p) {
 }
 
 export default function App() {
+  /** `library` = 书库创作；`config` = 硬规则 / Skills */
+  const [appMode, setAppMode] = useState('library')
   const [library, setLibrary] = useState([])
   const [novelRecord, setNovelRecord] = useState(null)
   const [project, setProject] = useState(initialProject)
@@ -113,6 +144,8 @@ export default function App() {
   const [selectedChapter, setSelectedChapter] = useState(() => initialWorkspace.selectedChapter || 1)
   const [readerTab, setReaderTab] = useState('draft')
   const [readerCardKey, setReaderCardKey] = useState('')
+  /** Selected volume when browsing 卷纲 (two-level nav). */
+  const [readerVolume, setReaderVolume] = useState(0)
   const [readerEditing, setReaderEditing] = useState(false)
   const [readerEditText, setReaderEditText] = useState('')
   const [readerSaving, setReaderSaving] = useState(false)
@@ -123,6 +156,9 @@ export default function App() {
   const currentProjectRef = useRef(initialProject)
   const restoredRef = useRef(false)
   const readerRef = useRef(null)
+  /** Writer 落盘刷新时默认贴底；用户上滑阅读则暂停跟滚。 */
+  const followDraftBottomRef = useRef(true)
+  const lastDraftLenRef = useRef(0)
 
   const refreshLibrary = useCallback(async () => {
     const data = await api('/library')
@@ -193,8 +229,11 @@ export default function App() {
       setReaderTab('master')
     } else if (data.preview?.story_outline && !data.preview?.chapters?.length) {
       setReaderTab('master')
-    } else if (data.preview?.plots?.length && !data.preview?.chapters?.length) {
-      setReaderTab('plots')
+    } else if (
+      (data.preview?.arc_outlines?.length || data.preview?.plots?.length)
+      && !data.preview?.chapters?.length
+    ) {
+      setReaderTab('arcs')
     } else {
       setReaderTab('draft')
     }
@@ -229,12 +268,21 @@ export default function App() {
       setSelectedChapter(chapters[chapters.length - 1].number)
     }
     if (opts.readerTab) {
-      setReaderTab(opts.readerTab)
+      setReaderTab(opts.readerTab === 'plots' ? 'arcs' : opts.readerTab)
     }
+    // Mid-stream draft flushes pass keepSelection — skip library refetch (was
+    // re-rendering the whole studio and amplifying chat Turn flicker).
+    if (opts.keepSelection) return
     const lib = await api(`/library/${name}`)
     if (!lib.error) setNovelRecord(lib.novel)
     refreshLibrary()
   }, [refreshLibrary])
+
+  // Stable identity — inline arrow here remounted NovelXChat's WS effect and
+  // overwrote live turns with lagging ui_turns (「闪回」).
+  const handleChatPreviewRefresh = useCallback((name, opts) => {
+    if (name) refreshPreview(name, opts)
+  }, [refreshPreview])
 
   useEffect(() => { refreshLibrary() }, [refreshLibrary])
 
@@ -264,6 +312,10 @@ export default function App() {
   // bible.md is canonical; world_architect.md is legacy dual-write — show one「世界观」tab.
   // master_outline.md is the only「总纲」surface (story_outline.json is internal acts store).
   // nomenclature overlaps 人物/物品/地点 entity cards — hide from reader.
+  const arcOutlines = (Array.isArray(preview?.arc_outlines) ? preview.arc_outlines : [])
+    .filter((a) => a?.volume >= 1 && String(a?.markdown || '').trim())
+    .slice()
+    .sort((a, b) => a.volume - b.volume)
   const artifactTabs = Object.keys(preview?.artifacts || {}).filter((k) => {
     if (k === 'world_architect' && preview?.artifacts?.bible) return false
     if (
@@ -272,6 +324,8 @@ export default function App() {
       || k === 'story_outline'
       || k === 'relation_graph'
       || k === 'nomenclature'
+      || k === 'arc_outline'
+      || k === 'arc_planner'
     ) {
       return false
     }
@@ -280,33 +334,90 @@ export default function App() {
   const entities = preview?.entities || {}
   const plots = sortPlotsByProgress(preview?.plots || [])
   const entityGaps = preview?.entity_gaps || []
+  const volumeGroups = buildVolumePlotGroups(arcOutlines, plots)
+  const isArcNav = readerTab === 'arcs' || readerTab === 'plots'
+
+  const activeVolumeGroup = (() => {
+    if (!volumeGroups.length) return null
+    const byState = volumeGroups.find((g) => g.volume === readerVolume)
+    if (byState) return byState
+    // Prefer volume of current card key.
+    if (readerCardKey?.startsWith('v')) {
+      const n = Number(readerCardKey.slice(1))
+      const g = volumeGroups.find((x) => x.volume === n)
+      if (g) return g
+    }
+    for (const g of volumeGroups) {
+      if (g.plots.some((p) => plotCardKey(p) === readerCardKey)) return g
+    }
+    return volumeGroups[volumeGroups.length - 1] || volumeGroups[0]
+  })()
 
   const readerCardList = (() => {
-    if (readerTab === 'plots') {
-      return plots.map((p) => ({
-        key: plotCardKey(p),
-        label: p.title || '未命名',
-        complete: !!p.complete,
-        raw: p,
-      }))
+    if (isArcNav) {
+      if (!activeVolumeGroup) return []
+      const vol = activeVolumeGroup.volume
+      const items = [{
+        kind: 'arc',
+        key: `v${vol}`,
+        label: '卷纲',
+        complete: true,
+        volume: vol,
+        raw: activeVolumeGroup.arc,
+      }]
+      for (const p of activeVolumeGroup.plots) {
+        const key = plotCardKey(p)
+        if (!key) continue
+        items.push({
+          kind: 'plot',
+          key,
+          label: p.title || '未命名剧情',
+          complete: !!p.complete,
+          volume: vol,
+          raw: p,
+        })
+      }
+      return items
     }
     if (readerTab.startsWith('ent:')) {
       const group = readerTab.slice(4)
       return (entities[group] || []).map((e) => ({
+        kind: 'entity',
         key: entityCardKey(e),
         label: e.name || '未命名',
         complete: !!e.complete,
+        status: e.status || '',
+        statusLabel: entityStatusLabel(e.status),
         raw: e,
       }))
     }
     return []
   })()
 
-  const selectedReaderCard = readerCardList.find((c) => c.key === readerCardKey)?.raw
-    || readerCardList[0]?.raw
+  const selectedReaderEntry = readerCardList.find((c) => c.key === readerCardKey)
+    || readerCardList[0]
     || null
+  const selectedReaderCard = selectedReaderEntry?.raw || null
 
   const readerCardKeysSig = readerCardList.map((c) => c.key).join('\0')
+  const volumeSig = volumeGroups.map((g) => g.volume).join(',')
+
+  useEffect(() => {
+    if (readerTab === 'plots') setReaderTab('arcs')
+  }, [readerTab])
+
+  // Keep readerVolume in sync with available groups / selection.
+  useEffect(() => {
+    if (!isArcNav) return
+    if (!volumeSig) {
+      if (readerVolume !== 0) setReaderVolume(0)
+      return
+    }
+    const vols = volumeSig.split(',').map(Number).filter((n) => n >= 1)
+    if (!vols.includes(readerVolume)) {
+      setReaderVolume(vols[vols.length - 1] || vols[0] || 0)
+    }
+  }, [isArcNav, volumeSig, readerVolume])
 
   useEffect(() => {
     if (!readerCardKeysSig) {
@@ -317,7 +428,7 @@ export default function App() {
     if (!keys.includes(readerCardKey)) {
       setReaderCardKey(keys[0])
     }
-  }, [readerTab, readerCardKeysSig, readerCardKey])
+  }, [readerTab, readerCardKeysSig, readerCardKey, readerVolume])
 
   const chapterList = (preview?.chapters || []).map((c) => ({
     number: c.number,
@@ -336,6 +447,7 @@ export default function App() {
   const hasReaderMaterial = Boolean(
     chapterList.length
     || artifactTabs.length
+    || arcOutlines.length
     || entities.characters?.length
     || entities.items?.length
     || entities.locations?.length
@@ -361,9 +473,12 @@ export default function App() {
           ? '（软提示·不阻断写章）待补全：\n\n' + entityGaps.map((g) => `- ${g}`).join('\n')
           : '设定卡与世界观暂无明显缺口。')
     }
-    if (readerTab === 'plots') {
-      if (!readerCardList.length) return formatPlotCard(null)
-      return formatPlotCard(selectedReaderCard)
+    if (isArcNav) {
+      if (!volumeGroups.length) return '（尚无卷纲 / 剧情卡）'
+      if (selectedReaderEntry?.kind === 'plot') {
+        return formatPlotCard(selectedReaderCard)
+      }
+      return selectedReaderCard?.markdown || '（尚无卷纲）'
     }
     if (readerTab.startsWith('ent:')) {
       const group = readerTab.slice(4)
@@ -375,12 +490,45 @@ export default function App() {
     return ''
   })()
 
-  useEffect(() => {
+  const onReaderScroll = () => {
     const el = readerRef.current
     if (!el || readerEditing) return
+    const dist = el.scrollHeight - el.scrollTop - el.clientHeight
+    followDraftBottomRef.current = dist < 180
+  }
+
+  // Writer 间歇刷新正文时强制贴底（大段跳变时 nearBottom 会失效）。
+  useLayoutEffect(() => {
+    if (readerEditing) return
+    const el = readerRef.current
+    if (!el) return
+    const len = (readerContent || '').length
+    if (readerTab === 'draft') {
+      const grew = len > lastDraftLenRef.current
+      if (grew && followDraftBottomRef.current) {
+        el.scrollTop = el.scrollHeight
+      }
+      lastDraftLenRef.current = len
+      return
+    }
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 160
     if (nearBottom) el.scrollTop = el.scrollHeight
-  }, [readerContent, readerEditing])
+  }, [readerContent, readerEditing, readerTab])
+
+  // 切章 / 切到正文 tab：重新开启贴底跟随
+  useEffect(() => {
+    if (readerTab !== 'draft') return
+    followDraftBottomRef.current = true
+    lastDraftLenRef.current = 0
+    const el = readerRef.current
+    if (el) {
+      requestAnimationFrame(() => {
+        if (followDraftBottomRef.current && readerRef.current) {
+          readerRef.current.scrollTop = readerRef.current.scrollHeight
+        }
+      })
+    }
+  }, [readerTab, selectedChapter])
 
   const readerTabs = [
     { id: 'draft', label: '正文', show: Boolean(chapterData) },
@@ -396,9 +544,9 @@ export default function App() {
       ),
     },
     {
-      id: 'plots',
-      label: '剧情卡',
-      show: Boolean(plots.length),
+      id: 'arcs',
+      label: '卷纲',
+      show: Boolean(arcOutlines.length || plots.length),
     },
     ...Object.entries(ENTITY_TAB_LABELS).map(([key, label]) => ({
       id: `ent:${key}`,
@@ -419,6 +567,7 @@ export default function App() {
 
   const setupAwaitingConfirm = preview?.setup_phase === 'awaiting_confirm' || chatSetupGateOpen
   const setupOutlineTab = readerTab === 'master'
+    || readerTab === 'arcs'
     || readerTab === 'art:arc_outline'
     || readerTab === 'art:arc_planner'
   const showSetupConfirmBar = Boolean(project && setupAwaitingConfirm && setupOutlineTab)
@@ -439,7 +588,14 @@ export default function App() {
 
   const beginReaderEdit = () => {
     setReaderEditError('')
-    setReaderEditText(readerContent || '')
+    // Entity/plot display may prepend status meta — edit the on-disk body only.
+    let text = readerContent || ''
+    if (readerTab.startsWith('ent:') && selectedReaderCard?.markdown) {
+      text = selectedReaderCard.markdown
+    } else if (isArcNav && selectedReaderEntry?.kind === 'plot' && selectedReaderCard?.markdown) {
+      text = selectedReaderCard.markdown
+    }
+    setReaderEditText(text)
     setReaderEditing(true)
   }
 
@@ -453,13 +609,16 @@ export default function App() {
     if (!project || !readerCanEdit) return
     setReaderSaving(true)
     setReaderEditError('')
-    const activeCardKey = readerCardList.length
-      ? (readerCardKey || readerCardList[0]?.key || '')
-      : ''
+    const activeEntry = readerCardList.length
+      ? (readerCardList.find((c) => c.key === readerCardKey) || readerCardList[0])
+      : null
+    const activeCardKey = activeEntry?.key || ''
+    // Nested plot under 卷纲 still saves via plots API.
+    const saveTab = activeEntry?.kind === 'plot' ? 'plots' : readerTab
     const res = await api(`/projects/${encodeURIComponent(project)}/content`, {
       method: 'PUT',
       body: JSON.stringify({
-        tab: readerTab,
+        tab: saveTab,
         content: readerEditText,
         chapter: selectedChapter || 0,
         card_key: activeCardKey,
@@ -484,8 +643,19 @@ export default function App() {
       if (!window.confirm('正在编辑，切换将丢弃未保存修改，继续？')) return
       cancelReaderEdit()
     }
-    setReaderTab(id)
+    // 剧情卡已挂在卷纲下，旧链接统一落到卷纲树。
+    setReaderTab(id === 'plots' ? 'arcs' : id)
     setReaderCardKey('')
+  }
+
+  const switchReaderVolume = (vol) => {
+    if (vol === readerVolume) return
+    if (readerEditing) {
+      if (!window.confirm('正在编辑，切换卷将丢弃未保存修改，继续？')) return
+      cancelReaderEdit()
+    }
+    setReaderVolume(vol)
+    setReaderCardKey(`v${vol}`)
   }
 
   const switchReaderCard = (key) => {
@@ -561,40 +731,74 @@ export default function App() {
 
       <div className="studio-grid">
         <section className="panel side-panel">
-          <h2 className="side-title">我的</h2>
-          <p className="side-hint">每本小说独立 NovelX 对话，可切换并行创作</p>
-          <ul className="novel-list">
-            {library.length === 0 ? (
-              <li className="empty-list">暂无小说，在 NovelX 说「我想写一本小说」</li>
-            ) : (
-              library.map((n) => (
-                <li key={n.id} className={project === n.id ? 'selected' : ''} onClick={() => loadNovel(n.id)}>
-                  <div className="novel-row">
-                    <div className="novel-info">
-                      <div className="novel-title">{n.display_title || n.id}</div>
-                      <div className="novel-meta">
-                        {n.current_volume
-                          ? `已写 ${n.published_count || 0} 章 · ${n.current_volume}`
-                          : `已写 ${n.published_count || 0} 章`}
-                        {n.genre ? ` · ${n.genre}` : ''}
+          <div className="panel-tabs side-mode-tabs" role="tablist" aria-label="侧栏模式">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={appMode === 'library'}
+              className={appMode === 'library' ? 'active' : ''}
+              onClick={() => setAppMode('library')}
+            >
+              书库
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={appMode === 'config'}
+              className={appMode === 'config' ? 'active' : ''}
+              onClick={() => setAppMode('config')}
+            >
+              配置
+            </button>
+          </div>
+          {appMode === 'library' ? (
+            <>
+              <h2 className="side-title">我的</h2>
+              <p className="side-hint">每本小说独立 NovelX 对话，可切换并行创作</p>
+              <ul className="novel-list">
+                {library.length === 0 ? (
+                  <li className="empty-list">暂无小说，在 NovelX 说「我想写一本小说」</li>
+                ) : (
+                  library.map((n) => (
+                    <li key={n.id} className={project === n.id ? 'selected' : ''} onClick={() => loadNovel(n.id)}>
+                      <div className="novel-row">
+                        <div className="novel-info">
+                          <div className="novel-title">{n.display_title || n.id}</div>
+                          <div className="novel-meta">
+                            {n.current_volume
+                              ? `已写 ${n.published_count || 0} 章 · ${n.current_volume}`
+                              : `已写 ${n.published_count || 0} 章`}
+                            {n.genre ? ` · ${n.genre}` : ''}
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          className="novel-delete"
+                          title="删除小说"
+                          aria-label={`删除 ${n.display_title || n.id}`}
+                          onClick={(e) => deleteNovel(n.id, n.display_title, e)}
+                        >
+                          删除
+                        </button>
                       </div>
-                    </div>
-                    <button
-                      type="button"
-                      className="novel-delete"
-                      title="删除小说"
-                      aria-label={`删除 ${n.display_title || n.id}`}
-                      onClick={(e) => deleteNovel(n.id, n.display_title, e)}
-                    >
-                      删除
-                    </button>
-                  </div>
-                </li>
-              ))
-            )}
-          </ul>
+                    </li>
+                  ))
+                )}
+              </ul>
+            </>
+          ) : (
+            <>
+              <h2 className="side-title">框架配置</h2>
+              <p className="side-hint">硬规则、禁名与 Skills 在右侧编辑；改动写入 config/。</p>
+            </>
+          )}
         </section>
 
+        {appMode === 'config' ? (
+          <div className="work-area work-area-config">
+            <ConfigPanel />
+          </div>
+        ) : (
         <div className="work-area">
           <section className="panel reader-panel">
           <div className="reader-head">
@@ -633,13 +837,59 @@ export default function App() {
           ) : (
             <>
               <div className="reader-meta">
-                {chapterList.length > 0 && selectedChapter > 0 && (
-                  <span className="reader-ch-title">
-                    第{selectedChapter}章
-                    {chapterData?.title ? ` · ${chapterData.title}` : ''}
-                  </span>
-                )}
-                <div className="reader-tabs">
+                <div className="reader-meta-row">
+                  {chapterList.length > 0 && selectedChapter > 0 ? (
+                    <span className="reader-ch-title">
+                      第{selectedChapter}章
+                      {chapterData?.title ? ` · ${chapterData.title}` : ''}
+                    </span>
+                  ) : (
+                    <span className="reader-ch-title reader-ch-title-muted">阅读区</span>
+                  )}
+                  <div className="reader-head-actions">
+                    {readerCanEdit && !readerEditing && (
+                      <button
+                        type="button"
+                        className="btn-ghost btn-inline reader-edit-btn"
+                        onClick={beginReaderEdit}
+                        title="编辑当前阅读内容"
+                      >
+                        编辑
+                      </button>
+                    )}
+                    {chapterList.length > 0 && selectedChapter > 0 && !readerEditing && (
+                      <button
+                        type="button"
+                        className="btn-ghost btn-inline chapter-delete-btn"
+                        onClick={() => deleteChapter(selectedChapter)}
+                        title="删除当前章节"
+                      >
+                        删除本章
+                      </button>
+                    )}
+                    {readerEditing && (
+                      <div className="reader-edit-actions">
+                        <button
+                          type="button"
+                          className="btn-primary btn-inline"
+                          disabled={readerSaving}
+                          onClick={saveReaderEdit}
+                        >
+                          {readerSaving ? '保存中…' : '保存'}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-ghost btn-inline"
+                          disabled={readerSaving}
+                          onClick={cancelReaderEdit}
+                        >
+                          取消
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+                <div className="reader-tabs" role="tablist" aria-label="阅读分类">
                   {readerTabs.map((t) => (
                     <button
                       key={t.id}
@@ -650,48 +900,6 @@ export default function App() {
                       {t.label}
                     </button>
                   ))}
-                </div>
-                <div className="reader-head-actions">
-                  {readerCanEdit && !readerEditing && (
-                    <button
-                      type="button"
-                      className="btn-ghost btn-inline reader-edit-btn"
-                      onClick={beginReaderEdit}
-                      title="编辑当前阅读内容"
-                    >
-                      编辑
-                    </button>
-                  )}
-                  {chapterList.length > 0 && selectedChapter > 0 && !readerEditing && (
-                    <button
-                      type="button"
-                      className="btn-ghost btn-inline chapter-delete-btn"
-                      onClick={() => deleteChapter(selectedChapter)}
-                      title="删除当前章节"
-                    >
-                      删除本章
-                    </button>
-                  )}
-                  {readerEditing && (
-                    <div className="reader-edit-actions">
-                      <button
-                        type="button"
-                        className="btn-primary btn-inline"
-                        disabled={readerSaving}
-                        onClick={saveReaderEdit}
-                      >
-                        {readerSaving ? '保存中…' : '保存'}
-                      </button>
-                      <button
-                        type="button"
-                        className="btn-ghost btn-inline"
-                        disabled={readerSaving}
-                        onClick={cancelReaderEdit}
-                      >
-                        取消
-                      </button>
-                    </div>
-                  )}
                 </div>
               </div>
               {readerEditError ? (
@@ -721,28 +929,99 @@ export default function App() {
                   </div>
                 </div>
               )}
-              {readerCardList.length > 0 && (
-                <div className="reader-card-strip" role="tablist" aria-label="设定卡列表">
+              {isArcNav && volumeGroups.length > 0 && (
+                <nav className="reader-arc-nav" aria-label="卷纲与剧情">
+                  <div className="reader-volume-strip" role="tablist" aria-label="分卷">
+                    {volumeGroups.map((g) => {
+                      const active = (activeVolumeGroup?.volume || readerVolume) === g.volume
+                      return (
+                        <button
+                          key={`vol-${g.volume}`}
+                          type="button"
+                          role="tab"
+                          aria-selected={active}
+                          className={active ? 'active' : ''}
+                          onClick={() => switchReaderVolume(g.volume)}
+                          title={g.title}
+                        >
+                          {g.shortLabel}
+                          {g.plots.length > 0 ? (
+                            <span className="reader-vol-count">{g.plots.length}</span>
+                          ) : null}
+                        </button>
+                      )
+                    })}
+                  </div>
+                  <div className="reader-card-strip reader-card-strip-arc" role="tablist" aria-label="本卷内容">
+                    {readerCardList.map((c) => {
+                      const active = (readerCardKey || readerCardList[0]?.key) === c.key
+                      return (
+                        <button
+                          key={`${c.kind}:${c.key}`}
+                          type="button"
+                          role="tab"
+                          aria-selected={active}
+                          className={[
+                            active ? 'active' : '',
+                            c.kind === 'arc' ? 'arc-head' : 'plot-item',
+                          ].filter(Boolean).join(' ')}
+                          onClick={() => switchReaderCard(c.key)}
+                          title={c.complete ? c.label : `${c.label}（待补全）`}
+                        >
+                          {c.label}
+                          {!c.complete && c.kind === 'plot'
+                            ? <span className="reader-card-gap">·</span>
+                            : null}
+                        </button>
+                      )
+                    })}
+                  </div>
+                  {activeVolumeGroup ? (
+                    <div className="reader-arc-context">
+                      {activeVolumeGroup.title}
+                      {selectedReaderEntry?.kind === 'plot'
+                        ? ` · ${selectedReaderEntry.label}`
+                        : ' · 卷纲'}
+                    </div>
+                  ) : null}
+                </nav>
+              )}
+              {!isArcNav && readerCardList.length > 0 && (
+                <div className="reader-card-strip" role="tablist" aria-label="卡片列表">
                   {readerCardList.map((c) => {
                     const active = (readerCardKey || readerCardList[0]?.key) === c.key
+                    const inactive = c.status === 'exited' || c.status === 'consumed'
+                    const titleParts = [c.label]
+                    if (c.statusLabel) titleParts.push(c.statusLabel)
+                    if (!c.complete) titleParts.push('待补全')
                     return (
                       <button
-                        key={c.key}
+                        key={`${c.kind || 'card'}:${c.key}`}
                         type="button"
                         role="tab"
                         aria-selected={active}
-                        className={active ? 'active' : ''}
+                        className={[
+                          active ? 'active' : '',
+                          inactive ? 'entity-inactive' : '',
+                        ].filter(Boolean).join(' ')}
                         onClick={() => switchReaderCard(c.key)}
-                        title={c.complete ? c.label : `${c.label}（待补全）`}
+                        title={titleParts.join(' · ')}
                       >
                         {c.label}
+                        {c.statusLabel && c.status !== 'active' ? (
+                          <span className="reader-card-status">{c.statusLabel}</span>
+                        ) : null}
                         {!c.complete ? <span className="reader-card-gap">·</span> : null}
                       </button>
                     )
                   })}
                 </div>
               )}
-              <div className={`reader-body${readerEditing ? ' reader-body-editing' : ''}`} ref={readerRef}>
+              <div
+                className={`reader-body${readerEditing ? ' reader-body-editing' : ''}`}
+                ref={readerRef}
+                onScroll={onReaderScroll}
+              >
                 {readerEditing ? (
                   <textarea
                     className="reader-editor"
@@ -752,7 +1031,10 @@ export default function App() {
                     aria-label="编辑阅读内容"
                   />
                 ) : (
-                  <pre>{readerContent || '暂无内容'}</pre>
+                  <MarkdownView
+                    variant="reader"
+                    source={readerContent || '暂无内容'}
+                  />
                 )}
               </div>
             </>
@@ -763,11 +1045,10 @@ export default function App() {
           project={project}
           sendRef={chatSendRef}
           onSetupGateChange={setChatSetupGateOpen}
-          onPreviewRefresh={(name, opts) => {
-            if (name) refreshPreview(name, opts)
-          }}
+          onPreviewRefresh={handleChatPreviewRefresh}
         />
         </div>
+        )}
       </div>
     </div>
   )

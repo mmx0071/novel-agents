@@ -1,4 +1,4 @@
-//! Arc / volume outline: `artifacts/arc_outline.md`.
+//! Arc / volume outline: `artifacts/arc_outlines/{NN}.md` (one file per volume).
 
 use super::error::SchemaError;
 use super::md::{h1_line, has_h2, list_items_under_h2, rewrite_h2_aliases};

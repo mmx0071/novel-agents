@@ -3,7 +3,8 @@
 use super::error::SchemaError;
 use super::md::normalize_blank_lines;
 
-/// Shape floor for published-style drafts (not the writer target of 3000+).
+/// Publish/schema floor for draft body (chars after the title line).
+/// This is a minimum shape gate — not the writer target (see `config/chapter.yaml`, typically 3000–5000).
 pub const MIN_DRAFT_BODY_CHARS: usize = 800;
 
 /// Strict schema check for Web PUT / publish gates.

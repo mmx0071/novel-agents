@@ -33,10 +33,6 @@ struct AgentsFile {
 
 #[derive(Debug, Deserialize)]
 struct AgentEntry {
-    /// Kept for YAML compatibility (`agents.yaml` still declares it).
-    #[serde(default)]
-    #[allow(dead_code)]
-    default_active: bool,
     #[serde(default)]
     activation: Vec<ActivationRule>,
 }
@@ -162,10 +158,20 @@ pub fn collect_signals(
     let has_master = path_nonempty(&project_dir.join("artifacts/master_outline.md"))
         || path_nonempty(&project_dir.join("artifacts/story_outline.md"))
         || path_nonempty(&project_dir.join("artifacts/story_outline.json"));
-    // Canonical 卷纲: arc_outline.md (legacy arc_planner.md counts until migrated).
+    // Canonical 卷纲: artifacts/arc_outlines/{NN}.md (+ legacy flat file).
     let has_arc = path_nonempty(&project_dir.join("artifacts/arc_outline.md"))
         || path_nonempty(&project_dir.join("artifacts/arc_planner.md"))
-        || project_dir.join("artifacts").join("arcs").is_dir();
+        || project_dir.join("artifacts").join("arcs").is_dir()
+        || std::fs::read_dir(project_dir.join("artifacts/arc_outlines"))
+            .map(|rd| {
+                rd.flatten().any(|e| {
+                    e.path().extension().and_then(|s| s.to_str()) == Some("md")
+                        && std::fs::read_to_string(e.path())
+                            .map(|t| t.trim().chars().count() > 20)
+                            .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
     let has_nom = path_nonempty(&project_dir.join("lore/nomenclature.md"))
         || path_nonempty(&project_dir.join("artifacts/nomenclature.md"))
         || path_nonempty(&project_dir.join("lore/nomenclature.json"));

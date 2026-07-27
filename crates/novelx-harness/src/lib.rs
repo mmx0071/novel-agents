@@ -14,13 +14,20 @@ pub use activation::{
     ActivationSuggestion,
 };
 pub use chapter_budget::ChapterBudget;
-pub use content_rules::check_draft;
-pub use gates::{GateDecision, on_consistency_result, on_pacing_result, should_publish};
+pub use content_rules::{
+    check_draft, check_draft_with, rewrite_meta_chapter_refs_in_body,
+    rewrite_meta_chapter_refs_with, ContentRulesConfig,
+};
+pub use gates::{
+    consistency_human_option_labels, on_consistency_result, on_pacing_result, should_publish,
+    GateDecision,
+};
 pub use naming_rules::NamingRules;
 pub use pipeline_config::{HandlerKind, HandlerSpec, PipelineConfig};
 pub use policies::StudioPolicies;
 pub use review_priority::{
-    issue_priority, normalize_consistency_issues, normalize_priority, partition_issues,
+    filter_issues_by_ids, has_timeline_p0, issue_priority, issue_type,
+    normalize_consistency_issues, normalize_priority, partition_issues, with_issue_ids,
     AUTO_FIX_PRIORITIES,
 };
 

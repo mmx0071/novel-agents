@@ -190,8 +190,20 @@ mod tests {
         let lit = p.handler_for("literary_editor").expect("literary handler");
         assert_eq!(lit.kind, HandlerKind::SpecialistRewrite);
         assert!(lit.focus.as_ref().is_some_and(|f| {
-            f.contains("修重复") && f.contains("设定")
+            f.contains("修重复") && f.contains("设定") && f.contains("倒计时")
         }));
+        let order = p.order();
+        let lit_i = order.iter().position(|a| a == "literary_editor");
+        let pace_i = order.iter().position(|a| a == "pacing_reviewer");
+        let cons_i = order.iter().position(|a| a == "consistency_auditor");
+        assert!(
+            lit_i.zip(cons_i).is_some_and(|(l, c)| l < c),
+            "literary_editor must run before consistency_auditor"
+        );
+        assert!(
+            pace_i.zip(cons_i).is_some_and(|(p, c)| p < c),
+            "pacing_reviewer must run before consistency_auditor"
+        );
         assert!(p.handler_for("writer").is_some_and(|h| h.kind == HandlerKind::Writer));
         assert!(p.handler_for("no_such_agent").is_none());
     }

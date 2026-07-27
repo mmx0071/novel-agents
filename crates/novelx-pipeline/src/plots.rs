@@ -908,10 +908,174 @@ pub fn list_plots_summary(
     })
 }
 
+fn status_label_zh(status: &str) -> &'static str {
+    match normalize_status(status).as_str() {
+        "completed" => "已完成",
+        "in_progress" => "进行中",
+        "bridging" => "衔接中",
+        "planned" => "待开始",
+        "abandoned" => "已废弃",
+        _ => "未知",
+    }
+}
+
+/// User-facing Chinese progress report (for「剧情进行到哪了」/ `list_plots`).
+/// `volume_focus`：问「第N卷」时只展开该卷；`None` 则按当前写作进度选卷。
+pub fn format_plot_progress_report(project_dir: &Path) -> String {
+    format_plot_progress_report_for(project_dir, None)
+}
+
+pub fn format_plot_progress_report_for(project_dir: &Path, volume_focus: Option<u32>) -> String {
+    let _ = rebuild_plot_index(project_dir);
+    let index = load_plot_index(project_dir);
+    let state = crate::load_project_state(project_dir).ok();
+    let published = state.as_ref().map(|s| s.published_count).unwrap_or(0);
+    let next_ch = state
+        .as_ref()
+        .map(|s| s.next_chapter.max(1))
+        .unwrap_or(1);
+    let chapter_for_vol = published.max(1);
+    let cur_vol = volume_focus.unwrap_or_else(|| {
+        crate::volume::active_volume_for_chapter(project_dir, chapter_for_vol)
+            .map(|b| b.volume_index)
+            .or_else(|| {
+                index
+                    .volumes
+                    .iter()
+                    .find(|v| {
+                        v.plots
+                            .iter()
+                            .any(|p| matches!(p.status.as_str(), "in_progress" | "bridging"))
+                    })
+                    .map(|v| v.volume_index)
+            })
+            .or_else(|| index.volumes.last().map(|v| v.volume_index))
+            .unwrap_or(1)
+    });
+
+    let mut out = Vec::new();
+    if volume_focus.is_some() {
+        out.push(format!(
+            "第{cur_vol}卷进度：全书已写 {published} 章，下一章为第 {next_ch} 章。"
+        ));
+    } else {
+        out.push(format!(
+            "进度：已写 {published} 章，下一章为第 {next_ch} 章；当前卷约第 {cur_vol} 卷。"
+        ));
+    }
+
+    let mut active: Option<(u32, &PlotIndexEntry)> = None;
+    // Prefer in-progress card inside the focused volume when asking「第N卷」.
+    for vol in &index.volumes {
+        if volume_focus.is_some_and(|v| v != vol.volume_index) {
+            continue;
+        }
+        for p in &vol.plots {
+            if matches!(p.status.as_str(), "in_progress" | "bridging") && is_main_type(&p.plot_type)
+            {
+                active = Some((vol.volume_index, p));
+            }
+        }
+    }
+    if active.is_none() && volume_focus.is_some() {
+        for vol in &index.volumes {
+            for p in &vol.plots {
+                if matches!(p.status.as_str(), "in_progress" | "bridging")
+                    && is_main_type(&p.plot_type)
+                {
+                    active = Some((vol.volume_index, p));
+                }
+            }
+        }
+    }
+
+    if let Some((vi, p)) = active {
+        let cards = load_plot_cards(project_dir);
+        let exit = cards
+            .iter()
+            .find(|c| c.title == p.title || c.slug == p.slug)
+            .map(|c| extract_plot_exit_condition(&c.markdown))
+            .filter(|s| !s.trim().is_empty());
+        if p.status == "bridging" {
+            out.push(format!(
+                "当前阶段：第{vi}卷「{}」衔接章（消化上一落点，勿开全新主线高潮）。",
+                p.title
+            ));
+        } else {
+            out.push(format!("当前主推：第{vi}卷「{}」。", p.title));
+        }
+        if let Some(ex) = exit {
+            out.push(format!("本卡收束条件：{ex}"));
+            out.push("该收束尚未验收完结前，主线停在本卡。".into());
+        }
+        if !p.next_plot.trim().is_empty() {
+            out.push(format!("收束后下一张：{}", p.next_plot.trim()));
+        }
+    } else if let Some(pending) = pending_bridge_plot(&index) {
+        out.push(format!(
+            "当前阶段：上一卡「{}」已完成，仍欠 1 章衔接（needs_bridge）。续写将先写衔接章。",
+            pending.title
+        ));
+    } else {
+        out.push("当前没有进行中的主线剧情卡。若要继续写章，请先 design_plot 并 update_plot(in_progress)。".into());
+    }
+
+    out.push(String::new());
+    out.push(format!("第{cur_vol}卷剧情卡："));
+    if let Some(vol) = index.volumes.iter().find(|v| v.volume_index == cur_vol) {
+        if vol.plots.is_empty() {
+            out.push("（本卷尚无剧情卡）".into());
+        } else {
+            for p in &vol.plots {
+                let mark = match p.status.as_str() {
+                    "in_progress" | "bridging" => "▶",
+                    "completed" => "✓",
+                    "planned" => "·",
+                    _ => "×",
+                };
+                out.push(format!(
+                    "{mark} {}（{}）",
+                    p.title,
+                    status_label_zh(&p.status)
+                ));
+            }
+        }
+    } else {
+        out.push("（未找到当前卷索引）".into());
+    }
+
+    // Other volumes: one-line summary only.
+    let other: Vec<String> = index
+        .volumes
+        .iter()
+        .filter(|v| v.volume_index != cur_vol)
+        .map(|v| {
+            let done = v.plots.iter().filter(|p| p.status == "completed").count();
+            let total = v.plots.len();
+            format!("第{}卷 {done}/{total} 张已完成", v.volume_index)
+        })
+        .collect();
+    if !other.is_empty() {
+        out.push(String::new());
+        out.push(format!("其他卷：{}", other.join("；")));
+    }
+
+    out.push(String::new());
+    out.push("若要续写，直接说「继续创作」。".into());
+
+    out.join("\n")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlotWriteGate {
     Allow { mode: PlotWriteMode, detail: String },
-    Block { message: String },
+    Block {
+        message: String,
+        /// Stable code for UI gates (`planned_inactive`, `need_design_plot`, …).
+        reason: &'static str,
+        /// Planned / active plot title when relevant.
+        plot_title: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -937,6 +1101,32 @@ pub fn pending_bridge_plot<'a>(index: &'a PlotIndex) -> Option<&'a PlotIndexEntr
         })
 }
 
+/// Volume that should accept the next chapter: pending bridge / active plot / open act.
+fn writing_focus_volume(index: &PlotIndex, project_dir: &Path) -> Option<u32> {
+    if let Some(p) = pending_bridge_plot(index) {
+        for v in &index.volumes {
+            if v.plots.iter().any(|x| x.id == p.id || x.title == p.title) {
+                return Some(v.volume_index);
+            }
+        }
+    }
+    for v in &index.volumes {
+        if v.plots
+            .iter()
+            .any(|p| matches!(p.status.as_str(), "in_progress" | "bridging"))
+        {
+            return Some(v.volume_index);
+        }
+    }
+    if let Ok(state) = crate::project::load_project_state(project_dir) {
+        let ch = state.next_chapter.max(1);
+        if let Some(b) = crate::volume::active_volume_for_chapter(project_dir, ch) {
+            return Some(b.volume_index);
+        }
+    }
+    index.volumes.last().map(|v| v.volume_index)
+}
+
 /// Gate continue_writing.
 /// Bridge chapters are decided by the plot card (`needs_bridge`), not the user — 0 or 1 only.
 ///
@@ -953,12 +1143,20 @@ pub fn check_plot_write_gate_with(
 ) -> PlotWriteGate {
     if enforce.setup {
         if let Some(msg) = crate::phases::setup_write_block_reason(project_dir) {
-            return PlotWriteGate::Block { message: msg };
+            return PlotWriteGate::Block {
+                message: msg,
+                reason: "setup",
+                plot_title: None,
+            };
         }
     }
     if enforce.volume {
         if let Some(msg) = crate::phases::volume_write_block_reason(project_dir) {
-            return PlotWriteGate::Block { message: msg };
+            return PlotWriteGate::Block {
+                message: msg,
+                reason: "volume_phase",
+                plot_title: None,
+            };
         }
     }
 
@@ -967,6 +1165,8 @@ pub fn check_plot_write_gate_with(
     if all.is_empty() {
         return PlotWriteGate::Block {
             message: "尚无剧情卡。请先调用 design_plot 创建指引，再写章（剧情卡不预估章数）。".into(),
+            reason: "need_design_plot",
+            plot_title: None,
         };
     }
 
@@ -980,6 +1180,8 @@ pub fn check_plot_write_gate_with(
                     message: format!(
                         "进行中剧情卡「{title}」缺少可检验的「收束条件」。请先补全卡面收束条件后再写章，否则无法验收完结。"
                     ),
+                    reason: "missing_exit",
+                    plot_title: Some(title),
                 };
             }
         }
@@ -993,19 +1195,8 @@ pub fn check_plot_write_gate_with(
         };
     }
 
-    if let Some(p) = all
-        .iter()
-        .find(|p| is_main_type(&p.plot_type) && p.status == "planned")
-    {
-        return PlotWriteGate::Block {
-            message: format!(
-                "已有规划中的剧情卡「{}」，但尚未激活。请先 update_plot(title=\"{}\", status=\"in_progress\", set_active_main=true)，再写章。",
-                p.title, p.title
-            ),
-        };
-    }
-
-    // Agent decided this plot needs exactly one transition chapter.
+    // Bridge owes the current volume — must win over leftover `planned` cards on prior volumes
+    // (e.g. vol2 planned while vol3 already needs a bridge chapter).
     if let Some(p) = pending_bridge_plot(&index) {
         return PlotWriteGate::Allow {
             mode: PlotWriteMode::Bridge,
@@ -1013,6 +1204,25 @@ pub fn check_plot_write_gate_with(
                 "Agent 判定「{}」需要 1 章衔接（消化余波→下一剧情）；本章自动按衔接章创作",
                 p.title
             ),
+        };
+    }
+
+    // Only block on planned cards in the volume that currently needs writing.
+    let focus_vol = writing_focus_volume(&index, project_dir);
+    if let Some(p) = index
+        .volumes
+        .iter()
+        .filter(|v| focus_vol.map(|fv| v.volume_index == fv).unwrap_or(true))
+        .flat_map(|v| v.plots.iter())
+        .find(|p| is_main_type(&p.plot_type) && p.status == "planned")
+    {
+        return PlotWriteGate::Block {
+            message: format!(
+                "已有规划中的剧情卡「{}」，但尚未激活。请先 update_plot(title=\"{}\", status=\"in_progress\", set_active_main=true)，再写章。",
+                p.title, p.title
+            ),
+            reason: "planned_inactive",
+            plot_title: Some(p.title.clone()),
         };
     }
 
@@ -1028,12 +1238,20 @@ pub fn check_plot_write_gate_with(
         })
         .map(|n| format!("上一卡指向下一情节：「{n}」。"))
         .unwrap_or_default();
+    let next_title = prev
+        .and_then(|p| {
+            let n = p.next_plot.trim();
+            (!n.is_empty()).then_some(n.to_string())
+        })
+        .unwrap_or_else(|| format!("{prev_title}·下一段"));
     PlotWriteGate::Block {
         message: format!(
             "「{prev_title}」已结束（无需衔接，或衔接章已写完）。{next_hint}\n\
              卷间交接：①（建议）design_arc_outline 细化下卷 → ② design_plot 开下一张剧情卡 → ③ update_plot(status=in_progress, set_active_main=true) → ④ 再 continue_writing。\n\
              勿在无进行中剧情卡时直接续写。"
         ),
+        reason: "need_design_plot",
+        plot_title: Some(next_title),
     }
 }
 
@@ -1077,23 +1295,25 @@ pub fn active_plot_exit_context(project_dir: &Path) -> Option<(PlotIndexEntry, S
     Some((entry, exit, card.markdown.clone()))
 }
 
-/// Pull 收束条件 / exit_condition from plot card markdown body.
+/// Pull 收束条件 / exit_condition from plot card (YAML frontmatter, then body).
 pub fn extract_plot_exit_condition(markdown: &str) -> String {
-    // Prefer dedicated sections.
-    for heading in ["## 收束条件", "## 进入 / 收束条件", "## 收束", "### 收束条件"] {
-        if let Some(section) = section_after_heading(markdown, heading) {
-            // If combined 进入/收束, keep lines about 收束.
+    // Frontmatter wins — avoids "## 收束" matching inside "## 收束条件".
+    if let Some(fm) = yaml_frontmatter_exit_condition(markdown) {
+        if is_usable_exit_condition(&fm) {
+            return truncate_chars(&fm, 400);
+        }
+    }
+    // Longer / more specific headings first; match only as a full heading line.
+    for heading in ["## 进入 / 收束条件", "## 收束条件", "### 收束条件", "## 收束"] {
+        if let Some(section) = section_after_exact_heading(markdown, heading) {
             let mut lines: Vec<&str> = Vec::new();
             for line in section.lines() {
                 let t = line.trim();
-                if t.is_empty() {
-                    if !lines.is_empty() {
-                        break;
-                    }
-                    continue;
-                }
                 if t.starts_with("## ") {
                     break;
+                }
+                if t.is_empty() {
+                    continue;
                 }
                 if t.contains("进入") && !t.contains("收束") && lines.is_empty() {
                     continue;
@@ -1101,15 +1321,25 @@ pub fn extract_plot_exit_condition(markdown: &str) -> String {
                 if t.starts_with("- **进入**") || t.starts_with("- **进入**：") {
                     continue;
                 }
-                lines.push(t.trim_start_matches("- ").trim_start_matches("**收束**：").trim_start_matches("**收束**:"));
+                let cleaned = t
+                    .trim_start_matches("- ")
+                    .trim_start_matches("**收束**：")
+                    .trim_start_matches("**收束**:")
+                    .trim()
+                    .trim_start_matches('：')
+                    .trim_start_matches(':')
+                    .trim();
+                // Leftover from a prefix match (should not happen with exact heading).
+                if cleaned == "条件" || cleaned.eq_ignore_ascii_case("condition") {
+                    continue;
+                }
+                if cleaned.is_empty() || cleaned.starts_with("**进入**") {
+                    continue;
+                }
+                lines.push(cleaned);
             }
-            let joined = lines
-                .into_iter()
-                .map(|s| s.trim().trim_start_matches('：').trim_start_matches(':').trim())
-                .filter(|s| !s.is_empty() && !s.starts_with("**进入**"))
-                .collect::<Vec<_>>()
-                .join("；");
-            if !joined.is_empty() {
+            let joined = lines.join("；");
+            if is_usable_exit_condition(&joined) {
                 return truncate_chars(&joined, 400);
             }
         }
@@ -1125,7 +1355,7 @@ pub fn extract_plot_exit_condition(markdown: &str) -> String {
             .or_else(|| t.strip_prefix("收束:"))
         {
             let s = rest.trim();
-            if !s.is_empty() {
+            if is_usable_exit_condition(s) {
                 return truncate_chars(s, 400);
             }
         }
@@ -1133,11 +1363,98 @@ pub fn extract_plot_exit_condition(markdown: &str) -> String {
     String::new()
 }
 
-fn section_after_heading<'a>(markdown: &'a str, heading: &str) -> Option<&'a str> {
-    let idx = markdown.find(heading)?;
-    let after = &markdown[idx + heading.len()..];
-    let after = after.strip_prefix('\n').unwrap_or(after);
-    Some(after)
+fn is_usable_exit_condition(s: &str) -> bool {
+    let t = s.trim();
+    t.chars().count() >= 8
+        && t != "条件"
+        && !t.eq_ignore_ascii_case("condition")
+        && t != "exit"
+        && t != "exit_condition"
+}
+
+fn yaml_frontmatter_exit_condition(markdown: &str) -> Option<String> {
+    let t = markdown.trim_start();
+    if !t.starts_with("---") {
+        return None;
+    }
+    let rest = t.strip_prefix("---")?;
+    let end = rest.find("\n---")?;
+    let block = &rest[..end];
+    for line in block.lines() {
+        let line = line.trim();
+        if let Some(v) = line
+            .strip_prefix("exit_condition:")
+            .or_else(|| line.strip_prefix("exit_condition："))
+        {
+            let v = v.trim().trim_matches('"').trim_matches('\'').trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Heading must end the line (or file) so `## 收束` does not eat `## 收束条件`.
+fn section_after_exact_heading<'a>(markdown: &'a str, heading: &str) -> Option<&'a str> {
+    let mut search_from = 0;
+    while let Some(rel) = markdown[search_from..].find(heading) {
+        let idx = search_from + rel;
+        let after_head = idx + heading.len();
+        let rest = &markdown[after_head..];
+        let ok = rest.is_empty()
+            || rest.starts_with('\n')
+            || rest.starts_with("\r\n")
+            || rest.starts_with('\r');
+        if ok {
+            let after = rest
+                .strip_prefix("\r\n")
+                .or_else(|| rest.strip_prefix('\n'))
+                .or_else(|| rest.strip_prefix('\r'))
+                .unwrap_or(rest);
+            return Some(after);
+        }
+        search_from = idx + heading.len();
+    }
+    None
+}
+
+/// Volume still has plot-card work — must not fire volume-end / sync gate.
+pub fn volume_has_open_plot_work(project_dir: &Path, volume_index: u32) -> bool {
+    let index = load_plot_index(project_dir);
+    let Some(vol) = index.volumes.iter().find(|v| v.volume_index == volume_index) else {
+        return false;
+    };
+    if vol.plots.is_empty() {
+        return false;
+    }
+    for p in &vol.plots {
+        if matches!(p.status.as_str(), "in_progress" | "bridging") {
+            return true;
+        }
+    }
+    for p in &vol.plots {
+        let next = p.next_plot.trim();
+        if next.is_empty() {
+            continue;
+        }
+        if !matches!(
+            p.status.as_str(),
+            "completed" | "in_progress" | "bridging"
+        ) {
+            continue;
+        }
+        let next_entry = vol
+            .plots
+            .iter()
+            .find(|x| x.title == next || x.id == next || x.slug == next);
+        match next_entry {
+            None => return true, // next_plot not designed yet
+            Some(n) if n.status != "completed" => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn parse_json_object(raw: &str) -> serde_json::Value {
@@ -1431,34 +1748,87 @@ pub fn complete_bridging_plots_after_publish(
 pub fn materialize_plot_card_markdown(raw: &str, title: &str, act: Option<u64>) -> String {
     let stripped = strip_md_fence(raw.trim());
     // Pure JSON first (avoid recurse-through-nested on the same payload).
-    if let Some(v) = extract_plot_json(&stripped) {
-        return render_plot_json_markdown(&v, title, act);
-    }
-    // Nested card: outer stub + fenced/inner real card (or trailing JSON).
-    if let Some(inner) = extract_nested_plot_payload(&stripped) {
+    let out = if let Some(v) = extract_plot_json(&stripped) {
+        render_plot_json_markdown(&v, title, act)
+    } else if let Some(inner) = extract_nested_plot_payload(&stripped) {
         if inner.trim() != stripped.trim() {
             let nested = materialize_plot_card_markdown(&inner, title, act);
             // If nested JSON was corrupt, materialize may have wrapped raw `{…}`;
             // fall back to the prose stub above the blob.
             if nested.contains("\n{\n") || nested.trim_start().starts_with('{') {
                 if let Some(stub) = strip_trailing_json_blob(&stripped) {
-                    return materialize_plot_card_markdown(&stub, title, act);
+                    materialize_plot_card_markdown(&stub, title, act)
+                } else {
+                    nested
                 }
+            } else {
+                nested
             }
-            return nested;
+        } else if stripped.starts_with("---") {
+            materialize_plot_fm_passthrough(&stripped)
+        } else {
+            materialize_plot_prose_fallback(title, act, &stripped)
+        }
+    } else if stripped.starts_with("---") {
+        materialize_plot_fm_passthrough(&stripped)
+    } else {
+        materialize_plot_prose_fallback(title, act, &stripped)
+    };
+    fill_required_plot_frontmatter(&out, title, act)
+}
+
+fn materialize_plot_fm_passthrough(stripped: &str) -> String {
+    // Drop a trailing corrupt JSON payload left after a valid stub.
+    if let Some(stub) = strip_trailing_json_blob(stripped) {
+        if stub.trim() != stripped.trim() {
+            return stub;
         }
     }
-    if stripped.starts_with("---") {
-        // Drop a trailing corrupt JSON payload left after a valid stub.
-        if let Some(stub) = strip_trailing_json_blob(&stripped) {
-            if stub.trim() != stripped.trim() {
-                return stub;
-            }
-        }
-        return stripped;
+    stripped.to_string()
+}
+
+fn materialize_plot_prose_fallback(title: &str, act: Option<u64>, body: &str) -> String {
+    let vol_line = act
+        .map(|a| format!("volume_index: {a}\n"))
+        .unwrap_or_default();
+    format!(
+        "---\ntitle: {title}\n{vol_line}status: planned\nscope: local\nplot_type: main\nneeds_bridge: false\ncategory: plot\n---\n\n# {title}\n\n{body}\n"
+    )
+}
+
+/// Fill schema-required FM keys when the model omitted them (prose / incomplete FM path).
+fn fill_required_plot_frontmatter(text: &str, title: &str, act: Option<u64>) -> String {
+    let (meta, _) = crate::cards::split_simple_frontmatter(text);
+    let missing = |k: &str| meta.get(k).map(|s| s.trim().is_empty()).unwrap_or(true);
+    let mut fields: Vec<(&str, Option<String>)> = Vec::new();
+    if missing("title") {
+        fields.push(("title", Some(title.to_string())));
     }
-    let act_line = act.map(|a| format!("act: {a}\n")).unwrap_or_default();
-    format!("---\ntitle: {title}\n{act_line}status: planned\ncategory: plot\n---\n\n# {title}\n\n{stripped}\n")
+    if missing("status") {
+        fields.push(("status", Some("planned".into())));
+    }
+    if missing("scope") {
+        fields.push(("scope", Some("local".into())));
+    }
+    if missing("plot_type") {
+        fields.push(("plot_type", Some("main".into())));
+    }
+    if missing("needs_bridge") {
+        fields.push(("needs_bridge", Some("false".into())));
+    }
+    if missing("category") {
+        fields.push(("category", Some("plot".into())));
+    }
+    if missing("volume_index") {
+        if let Some(a) = act {
+            fields.push(("volume_index", Some(a.to_string())));
+        }
+    }
+    if fields.is_empty() {
+        text.to_string()
+    } else {
+        upsert_frontmatter_fields(text, &fields)
+    }
 }
 
 fn strip_md_fence(text: &str) -> String {
@@ -1643,7 +2013,15 @@ fn render_plot_json_markdown(v: &serde_json::Value, fallback_title: &str, act: O
             normalize_status(&s)
         }
     };
-    let scope = json_str(v, "scope");
+    // 剧情卡永远是卷内一段；禁止落盘 scope=volume（与卷纲重复）。
+    let scope = {
+        let s = json_str(v, "scope").to_ascii_lowercase();
+        if s.is_empty() || s == "volume" || s == "整卷" {
+            "local".into()
+        } else {
+            s
+        }
+    };
     let arc = json_str(v, "arc");
     let plot_type = {
         let t = json_str(v, "plot_type");
@@ -1698,9 +2076,7 @@ fn render_plot_json_markdown(v: &serde_json::Value, fallback_title: &str, act: O
     let mut fm = format!(
         "---\ntitle: {title}\ncategory: plot\nvolume_index: {volume_index}\nstatus: {status}\nplot_type: {plot_type}\n"
     );
-    if !scope.is_empty() {
-        fm.push_str(&format!("scope: {scope}\n"));
-    }
+    fm.push_str(&format!("scope: {scope}\n"));
     if !arc.is_empty() {
         fm.push_str(&format!("arc: {arc}\n"));
     }
@@ -1817,6 +2193,7 @@ pub fn ensure_plot_card_lifecycle_frontmatter(
     default_status: &str,
 ) -> anyhow::Result<()> {
     let text = fs::read_to_string(path)?;
+    let text = fill_required_plot_frontmatter(&text, "未命名剧情", Some(volume_index as u64));
     let text = upsert_frontmatter_fields(
         &text,
         &[
@@ -1888,6 +2265,29 @@ mod tests {
     }
 
     #[test]
+    fn materialize_prose_fallback_fills_required_fm() {
+        let raw = "## 概览\n\n发生什么。\n\n## 剧情走向\n\n开端→落点。\n\n## 冲突与赌注\n\n赌注。\n\n## 出场人物\n\n- 甲\n\n## 收束条件\n\n抵达。\n";
+        let out = materialize_plot_card_markdown(raw, "散文卡", Some(1));
+        assert!(out.contains("scope: local"), "{out}");
+        assert!(out.contains("plot_type: main"), "{out}");
+        assert!(out.contains("needs_bridge: false"), "{out}");
+        assert!(
+            crate::schemas::validate_plot_card(&out).is_ok(),
+            "prose fallback must pass schema: {out}"
+        );
+    }
+
+    #[test]
+    fn materialize_incomplete_fm_gets_required_keys() {
+        let raw = "---\ntitle: 残缺卡\nstatus: planned\n---\n\n# 残缺卡\n\n## 概览\n\nx\n\n## 剧情走向\n\ny\n\n## 冲突与赌注\n\nz\n\n## 出场人物\n\n- 甲\n\n## 收束条件\n\n落点\n";
+        let out = materialize_plot_card_markdown(raw, "残缺卡", Some(1));
+        assert!(out.contains("scope: local"), "{out}");
+        assert!(out.contains("plot_type: main"), "{out}");
+        assert!(out.contains("needs_bridge:"), "{out}");
+        assert!(crate::schemas::validate_plot_card(&out).is_ok(), "{out}");
+    }
+
+    #[test]
     fn materialize_softens_broken_inner_quotes() {
         let raw = r#"{
           "title": "引号卡",
@@ -1933,7 +2333,9 @@ mod tests {
         let _ = rebuild_plot_index(&root);
         assert!(in_progress_plot_missing_exit(&root).is_some());
         match check_plot_write_gate(&root) {
-            PlotWriteGate::Block { message } => assert!(message.contains("收束条件"), "{message}"),
+            PlotWriteGate::Block { message, .. } => {
+                assert!(message.contains("收束条件"), "{message}")
+            }
             other => panic!("expected block, got {other:?}"),
         }
         let _ = fs::remove_dir_all(&root);
@@ -1960,16 +2362,35 @@ mod tests {
             "# a\n\n".to_string() + &"b".repeat(40),
         )
         .unwrap();
+        fs::write(
+            dir.join("artifacts/bible.md"),
+            r#"# 世界观 Bible
+
+## 0. 一句话世界
+世界。
+
+## 1. 时代与叙事框架
+时代。
+
+## 2. 全局势力与阵营
+势力。
+
+## 7. 开放问题
+待揭。
+"#,
+        )
+        .unwrap();
         crate::phases::confirm_setup_approve(&dir).unwrap();
-        crate::phases::set_volume_phase(&dir, crate::phases::VolumePhase::AwaitingSync).unwrap();
+        // No open plot work — otherwise recover_false_volume_end pulls back to drafting.
         fs::write(
             dir.join("plots/a.md"),
-            "---\ntitle: 卡\nvolume_index: 1\nplot_type: main\nstatus: in_progress\n---\n\n## 收束条件\n\n到了。\n",
+            "---\ntitle: 卡\nvolume_index: 1\nplot_type: main\nstatus: completed\n---\n\n## 收束条件\n\n抵达落点并拿到信物。\n",
         )
         .unwrap();
         let _ = rebuild_plot_index(&dir);
+        crate::phases::set_volume_phase(&dir, crate::phases::VolumePhase::AwaitingSync).unwrap();
         match check_plot_write_gate(&dir) {
-            PlotWriteGate::Block { message } => {
+            PlotWriteGate::Block { message, .. } => {
                 assert!(
                     message.contains("awaiting_sync") || message.contains("设定同步"),
                     "{message}"
@@ -1991,6 +2412,33 @@ mod tests {
         let _ = rebuild_plot_index(&root);
         let ctx = active_plot_exit_context(&root).expect("active exit");
         assert!(ctx.1.contains("夹层"), "{}", ctx.1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn exit_condition_prefers_frontmatter_not_shou_shu_prefix() {
+        let md = "---\ntitle: 开局卡\nexit_condition: 主角拿到拓片并决定下井\nstatus: in_progress\n---\n\n# 开局卡\n\n## 收束条件\n\n主角拿到拓片并决定下井。\n";
+        let exit = extract_plot_exit_condition(md);
+        assert!(exit.contains("拓片"), "{exit}");
+        assert!(!exit.eq("条件"), "{exit}");
+        // Bare "## 收束" must not yield leftover「条件」from「## 收束条件」.
+        let only_body = "# 开局卡\n\n## 收束条件\n\n主角拿到拓片并决定下井，秘书处通话结束。\n";
+        let exit2 = extract_plot_exit_condition(only_body);
+        assert!(exit2.contains("拓片"), "{exit2}");
+        assert_ne!(exit2.trim(), "条件");
+    }
+
+    #[test]
+    fn open_plot_work_blocks_when_next_plot_missing() {
+        let root = tmp();
+        fs::create_dir_all(root.join("plots")).unwrap();
+        fs::write(
+            root.join("plots/a.md"),
+            "---\ntitle: 开局卡\nvolume_index: 3\nplot_type: main\nstatus: in_progress\nnext_plot: 下一站集合\n---\n\n# 开局卡\n\n## 收束条件\n\n拿到信物并启程。\n",
+        )
+        .unwrap();
+        let _ = rebuild_plot_index(&root);
+        assert!(volume_has_open_plot_work(&root, 3));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -2064,6 +2512,30 @@ mod tests {
     }
 
     #[test]
+    fn write_gate_bridge_beats_stale_planned_on_other_volume() {
+        let root = tmp();
+        fs::write(
+            root.join("plots/old.md"),
+            "---\ntitle: 旧卷规划\nvolume_index: 2\nplot_type: main\nstatus: planned\n---\n\n# 旧卷规划\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("plots/a.md"),
+            "---\ntitle: 本卷已结束\nvolume_index: 3\nplot_type: main\nstatus: completed\nneeds_bridge: true\nbridge_done: false\n---\n\n# 本卷已结束\n",
+        )
+        .unwrap();
+        let _ = rebuild_plot_index(&root);
+        match check_plot_write_gate(&root) {
+            PlotWriteGate::Allow {
+                mode: PlotWriteMode::Bridge,
+                detail,
+            } => assert!(detail.contains("本卷已结束"), "{detail}"),
+            other => panic!("expected bridge despite stale planned, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn write_gate_auto_bridges_when_agent_needs_bridge() {
         let root = tmp();
         fs::write(
@@ -2087,9 +2559,10 @@ mod tests {
         .unwrap();
         let _ = rebuild_plot_index(&root);
         match check_plot_write_gate(&root) {
-            PlotWriteGate::Block { message } => {
+            PlotWriteGate::Block { message, reason, .. } => {
                 assert!(message.contains("design_plot"), "{message}");
                 assert!(message.contains("卷间交接"), "{message}");
+                assert_eq!(reason, "need_design_plot");
             }
             other => panic!("expected block after bridge_done, got {other:?}"),
         }
@@ -2151,6 +2624,36 @@ mod tests {
         assert!(hits.iter().any(|h| h.contains("新卡")), "{hits:?}");
         assert!(block.contains("新卡"));
         assert!(!hits.iter().any(|h| h.contains("旧卡")), "{hits:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn progress_report_is_chinese_not_machine_dump() {
+        let root = tmp();
+        fs::write(
+            root.join("plots/active.md"),
+            "---\ntitle: 中段卡\nscope: local\nvolume_index: 1\nplot_type: main\nstatus: in_progress\nneeds_bridge: false\n---\n\n# 中段卡\n\n## 概览\nx\n\n## 剧情走向\ny\n\n## 冲突与赌注\nz\n\n## 出场人物\n- 甲\n\n## 收束条件\n抵达落点并拿到信物。\n",
+        )
+        .unwrap();
+        let _ = rebuild_plot_index(&root);
+        let report = format_plot_progress_report(&root);
+        assert!(report.contains("当前主推"), "{report}");
+        assert!(report.contains("中段卡"), "{report}");
+        assert!(report.contains("收束条件"), "{report}");
+        assert!(!report.contains("needs_bridge="), "{report}");
+        assert!(!report.contains("v1 |"), "{report}");
+
+        fs::create_dir_all(root.join("plots")).unwrap();
+        fs::write(
+            root.join("plots/v2.md"),
+            "---\ntitle: 卷二卡\nscope: local\nvolume_index: 2\nplot_type: main\nstatus: in_progress\nneeds_bridge: false\n---\n\n# 卷二卡\n\n## 概览\nx\n\n## 剧情走向\ny\n\n## 冲突与赌注\nz\n\n## 出场人物\n- 甲\n\n## 收束条件\n卷二收束。\n",
+        )
+        .unwrap();
+        let _ = rebuild_plot_index(&root);
+        let v2 = format_plot_progress_report_for(&root, Some(2));
+        assert!(v2.contains("第2卷进度"), "{v2}");
+        assert!(v2.contains("卷二卡"), "{v2}");
+        assert!(!v2.contains("v2 |"), "{v2}");
         let _ = fs::remove_dir_all(&root);
     }
 }

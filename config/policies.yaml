@@ -2,7 +2,10 @@
 # Prefer editing this file over adding `contains("…")` branches in crates/.
 version: 1
 
-# Bare「继续」while next_chapter already has a draft → clarify, don't tool-call / wipe chat.
+# Bare「继续」:
+# - next_chapter already has a draft → clarify + draft_exists gate (don't tool-call / wipe chat)
+# - next_chapter empty → deterministic continue_writing
+# 「继续创作」等见 clear_history_on_write.exact；草稿歧义时同样走 clarify（Rust 合并匹配）。
 bare_continue:
   phrases:
     - 继续

@@ -57,8 +57,15 @@ async fn dispatch_one(
     turn_gate: &Arc<TurnGate>,
 ) -> Result<()> {
     match op {
-        Op::InterruptTurn { .. } => {
+        Op::InterruptTurn { turn_id, .. } => {
             core.set_abort(thread_id, true).await;
+            // Clear only the interrupted turn — never wipe a newer turn that already
+            // claimed the gate after abort was set.
+            if let Some(id) = turn_id.as_deref() {
+                turn_gate.end_if(id).await;
+            } else if let Some(active) = turn_gate.active_id().await {
+                turn_gate.end_if(&active).await;
+            }
         }
         Op::UserInput { items, skills, .. } => {
             user_input_or_turn(

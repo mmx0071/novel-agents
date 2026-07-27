@@ -137,7 +137,7 @@ export function getBulkReadNav(name, args, output, projectFallback = '') {
     }
   }
   if (name === 'list_plots') {
-    return { prefix: `正在阅读${book}`, links: [{ label: '剧情', readerTab: 'plots' }] }
+    return { prefix: `正在核对${book}`, links: [{ label: '卷纲·剧情', readerTab: 'arcs' }] }
   }
   if (name === 'get_project_status') {
     return { prefix: `正在查看${book}`, links: [{ label: '总纲', readerTab: 'master' }] }
@@ -163,7 +163,7 @@ export function formatBulkReadSummary(name, args, output, projectFallback = '') 
 export function readerTabForBulkTool(name, args) {
   const a = typeof args === 'string' ? safeParse(args) || {} : (args || {})
   if (name === 'read_chapter') return 'draft'
-  if (name === 'list_plots') return 'plots'
+  if (name === 'list_plots') return 'arcs'
   if (name === 'list_entities') {
     if (a.kind === 'character') return 'ent:characters'
     if (a.kind === 'item') return 'ent:items'
@@ -186,7 +186,7 @@ function loreSurfaceFromQuery(query) {
   if (/总纲|master/.test(q)) return '总纲'
   if (/卷纲|arc/.test(q)) return '卷纲'
   if (/世界观|bible/.test(q)) return '世界观'
-  if (/剧情|plot/.test(q)) return '剧情'
+  if (/剧情|plot/.test(q)) return '卷纲·剧情'
   if (/人物|character/.test(q)) return '人物'
   if (/物品|item/.test(q)) return '物品'
   if (/地点|location/.test(q)) return '地点'
@@ -197,9 +197,9 @@ function loreSurfaceFromQuery(query) {
 function loreReaderTab(query) {
   const q = String(query || '').toLowerCase()
   if (/总纲|master/.test(q)) return 'master'
-  if (/卷纲|arc/.test(q)) return 'art:arc_outline'
+  if (/卷纲|arc/.test(q)) return 'arcs'
   if (/世界观|bible/.test(q)) return 'art:bible'
-  if (/剧情|plot/.test(q)) return 'plots'
+  if (/剧情|plot/.test(q)) return 'arcs'
   if (/人物|character/.test(q)) return 'ent:characters'
   if (/物品|item/.test(q)) return 'ent:items'
   if (/地点|location/.test(q)) return 'ent:locations'

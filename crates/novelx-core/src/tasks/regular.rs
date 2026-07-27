@@ -68,7 +68,8 @@ pub async fn run_regular_task(
     }
     .await;
 
-    turn_gate.end().await;
+    // Only clear if we still own the gate (interrupt may have started a newer turn).
+    turn_gate.end_if(&turn_id).await;
 
     if let Err(err) = result {
         core.emit_to_thread(

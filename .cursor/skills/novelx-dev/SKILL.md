@@ -36,5 +36,5 @@ description: >-
 
 ## 与其它规范的关系
 
-- 阅读区格式契约见 `config/schemas/README.md`（机器以 `novelx_pipeline::schemas` 为准）。
+- 阅读区/生成格式契约：`config/skills/content-formats.md`（Agent 锚定）与 `config/schemas/README.md`（人读）；机器以 `novelx_pipeline::schemas` 为准。
 - 创作工作流见 `.cursor/skills/create-novel/SKILL.md`（面向「写小说」；本 Skill 面向「改代码」）。

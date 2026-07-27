@@ -3,7 +3,7 @@
 use novelx_harness::PipelineConfig;
 use std::path::Path;
 
-/// Roles that may be spawned as SubAgents (excludes studio/orchestrator roots).
+/// Roles that may be spawned as SubAgents (excludes studio root; `orchestrator` kept denied for legacy ids).
 pub fn is_spawnable_role(role: &str) -> bool {
     !matches!(role, "studio_agent" | "orchestrator" | "")
 }

@@ -46,6 +46,18 @@ pub fn build_chapter_context(
         sections.push(("卷幕目标".into(), truncate_chars(&act_block, 800)));
     }
 
+    // --- 身体与能力状态板（置顶：伤势侧别 / 能力载体；写章硬锁）---
+    if profile == ContextProfile::Full {
+        let body = crate::body_state::format_body_state_board(project_dir, chapter);
+        if !body.trim().is_empty() {
+            hits.push("body_state_board".into());
+            sections.push((
+                "身体与能力状态板（开写前锁定）".into(),
+                truncate_chars(&body, 1200),
+            ));
+        }
+    }
+
     // --- 滚动记忆（近章优先；可按大纲关键词召回旧章摘要）---
     let memory_block = select_memory(project_dir, chapter, &haystack, profile, &mut hits);
     if !memory_block.is_empty() {
@@ -79,8 +91,9 @@ pub fn build_chapter_context(
         sections.push(("相关名词".into(), truncate_chars(&nom, 800)));
     }
 
-    // --- 设定卡（排除 status=exited/consumed；主角 always-include 例外）---
-    let entity_block = select_entities(project_dir, &haystack, &mut hits);
+    // --- 设定卡：章纲 characters/items/locations 名单优先，再辅以撞名 ---
+    let roster = crate::schemas::outline_entity_roster(outline);
+    let entity_block = select_entities(project_dir, &haystack, &roster, &mut hits);
     if !entity_block.is_empty() {
         sections.push(("相关设定卡".into(), entity_block));
     }
@@ -231,17 +244,23 @@ fn select_act_goals(project_dir: &Path, chapter: u32, hits: &mut Vec<String>) ->
 }
 
 fn select_outline_markdown_fallback(project_dir: &Path, hits: &mut Vec<String>) -> String {
-    crate::volume::migrate_legacy_arc_planner(project_dir);
-    for (label, rel) in [
-        ("master_outline", "artifacts/master_outline.md"),
-        ("arc_outline", "artifacts/arc_outline.md"),
-        ("story_outline_md", "artifacts/story_outline.md"),
-    ] {
-        let md = std::fs::read_to_string(project_dir.join(rel)).unwrap_or_default();
-        if md.trim().len() > 20 {
-            hits.push(label.into());
-            return truncate_chars(md.trim(), 800);
-        }
+    crate::volume::migrate_arc_outlines(project_dir);
+    let master = std::fs::read_to_string(project_dir.join("artifacts/master_outline.md"))
+        .unwrap_or_default();
+    if master.trim().len() > 20 {
+        hits.push("master_outline".into());
+        return truncate_chars(master.trim(), 800);
+    }
+    let vol = crate::volume::resolve_arc_outline_volume(project_dir, None);
+    if let Some(arc) = crate::volume::read_arc_outline_text(project_dir, vol) {
+        hits.push(format!("arc_outline_v{vol}"));
+        return truncate_chars(arc.trim(), 800);
+    }
+    let story_md = std::fs::read_to_string(project_dir.join("artifacts/story_outline.md"))
+        .unwrap_or_default();
+    if story_md.trim().len() > 20 {
+        hits.push("story_outline_md".into());
+        return truncate_chars(story_md.trim(), 800);
     }
     String::new()
 }
@@ -446,7 +465,12 @@ fn select_nomenclature(project_dir: &Path, haystack: &str, hits: &mut Vec<String
     matched.join("\n")
 }
 
-fn select_entities(project_dir: &Path, haystack: &str, hits: &mut Vec<String>) -> String {
+fn select_entities(
+    project_dir: &Path,
+    haystack: &str,
+    roster: &crate::schemas::OutlineEntityRoster,
+    hits: &mut Vec<String>,
+) -> String {
     let mut cards: Vec<MarkdownCard> = Vec::new();
     for group in ["characters", "items", "locations"] {
         cards.extend(load_markdown_cards(
@@ -456,40 +480,115 @@ fn select_entities(project_dir: &Path, haystack: &str, hits: &mut Vec<String>) -
     }
     // Project-declared always-include names (meta.json / state), never hardcode titles.
     let always_names = load_always_include_names(project_dir);
-    let mut selected: Vec<&MarkdownCard> = Vec::new();
-    for c in &cards {
-        let always = card_always_include(c, &always_names);
-        // Exited/consumed cards are excluded unless they are the declared protagonist.
-        if !c.is_active_for_canon() && !always {
-            continue;
-        }
-        let keys = c.match_keys();
-        let hit = keys
-            .iter()
-            .any(|k| k.chars().count() >= 2 && haystack.contains(k));
-        if always || hit {
-            selected.push(c);
+    let mut selected_slugs: Vec<String> = Vec::new();
+    let mut seen_slug = std::collections::HashSet::new();
+    let mut missing: Vec<String> = Vec::new();
+
+    // 1) Outline roster — characters / items / locations (exact name/slug/alias).
+    for (kind, names) in [
+        ("character", roster.characters.as_slice()),
+        ("item", roster.items.as_slice()),
+        ("location", roster.locations.as_slice()),
+    ] {
+        for name in names {
+            let Some(card) = find_card_by_declared_name(&cards, name, kind) else {
+                missing.push(format!("{kind}:{name}"));
+                continue;
+            };
+            let always = card_always_include(card, &always_names);
+            if !card.is_active_for_canon() && !always {
+                missing.push(format!("{kind}:{name}(exited)"));
+                continue;
+            }
+            push_entity_slug(
+                &mut selected_slugs,
+                &mut seen_slug,
+                hits,
+                &card.slug,
+                &card.name,
+                "roster",
+            );
         }
     }
-    // Dedup by slug, cap 6
-    let mut seen = std::collections::HashSet::new();
-    selected.retain(|c| seen.insert(c.slug.clone()));
-    selected.truncate(6);
 
-    if selected.is_empty() {
-        // Fallback: first 2 active character cards
+    // 2) Always-include protagonists.
+    for c in &cards {
+        if card_always_include(c, &always_names) {
+            push_entity_slug(
+                &mut selected_slugs,
+                &mut seen_slug,
+                hits,
+                &c.slug,
+                &c.name,
+                "always",
+            );
+        }
+    }
+
+    // 3) Haystack name hits (fill remaining budget).
+    const CAP: usize = 8;
+    for c in &cards {
+        if selected_slugs.len() >= CAP {
+            break;
+        }
+        if seen_slug.contains(&c.slug) || !c.is_active_for_canon() {
+            continue;
+        }
+        let hit = c
+            .match_keys()
+            .iter()
+            .any(|k| k.chars().count() >= 2 && haystack.contains(k));
+        if hit {
+            push_entity_slug(
+                &mut selected_slugs,
+                &mut seen_slug,
+                hits,
+                &c.slug,
+                &c.name,
+                "haystack",
+            );
+        }
+    }
+
+    if selected_slugs.is_empty() {
         for c in cards
             .iter()
             .filter(|c| c.category.contains("character") && c.is_active_for_canon())
             .take(2)
         {
-            selected.push(c);
+            push_entity_slug(
+                &mut selected_slugs,
+                &mut seen_slug,
+                hits,
+                &c.slug,
+                &c.name,
+                "fallback",
+            );
         }
     }
 
+    selected_slugs.truncate(CAP);
+
     let mut blocks = Vec::new();
-    for c in selected {
-        hits.push(format!("entity:{}", c.name));
+    if !roster.characters.is_empty() || !roster.items.is_empty() || !roster.locations.is_empty() {
+        blocks.push(format!(
+            "本章章纲名单：人物 [{}] · 物品 [{}] · 地点 [{}]",
+            roster.characters.join("、"),
+            roster.items.join("、"),
+            roster.locations.join("、")
+        ));
+    }
+    if !missing.is_empty() {
+        hits.push("entity_roster_missing".into());
+        blocks.push(format!(
+            "⚠ 章纲点名但未加载到设定卡：{}（请补卡或改用规范名）",
+            missing.join("、")
+        ));
+    }
+    for slug in &selected_slugs {
+        let Some(c) = cards.iter().find(|c| &c.slug == slug) else {
+            continue;
+        };
         let status = c.meta.get("status").map(|s| s.as_str()).unwrap_or("active");
         let holdings = c
             .meta
@@ -507,6 +606,38 @@ fn select_entities(project_dir: &Path, haystack: &str, hits: &mut Vec<String>) -
         ));
     }
     blocks.join("\n\n")
+}
+
+fn push_entity_slug(
+    selected_slugs: &mut Vec<String>,
+    seen_slug: &mut std::collections::HashSet<String>,
+    hits: &mut Vec<String>,
+    slug: &str,
+    name: &str,
+    via: &str,
+) {
+    if !seen_slug.insert(slug.to_string()) {
+        return;
+    }
+    hits.push(format!("entity:{via}:{name}"));
+    selected_slugs.push(slug.to_string());
+}
+
+/// Prefer cards in the matching group; fall back to any group with the same name.
+fn find_card_by_declared_name<'a>(
+    cards: &'a [MarkdownCard],
+    name: &str,
+    prefer_kind: &str,
+) -> Option<&'a MarkdownCard> {
+    let n = name.trim();
+    if n.is_empty() {
+        return None;
+    }
+    let matches = |c: &MarkdownCard| c.match_keys().iter().any(|k| k == n);
+    cards
+        .iter()
+        .find(|c| c.category.to_lowercase().contains(prefer_kind) && matches(c))
+        .or_else(|| cards.iter().find(|c| matches(c)))
 }
 
 /// Names that should always enter CanonContext for this project.
@@ -724,7 +855,7 @@ mod tests {
         );
         let pack = build_chapter_context(&dir, 1, "客串甲与林舟会面", "", ContextProfile::Full);
         assert!(
-            !pack.hits.iter().any(|h| h == "entity:客串甲"),
+            !pack.hits.iter().any(|h| h.contains("客串甲") && h.starts_with("entity:")),
             "exited card must not enter canon: {:?}",
             pack.hits
         );
@@ -732,6 +863,48 @@ mod tests {
         assert!(pack.markdown.contains("设定缺口"));
         let pacing = build_chapter_context(&dir, 1, "客串甲与林舟会面", "", ContextProfile::Pacing);
         assert!(!pacing.hits.iter().any(|h| h == "entity_gaps"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn outline_roster_loads_item_and_location_cards() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-canon-roster");
+        let _ = fs::remove_dir_all(&dir);
+        fixture_project(&dir);
+        write(
+            &dir.join("entities/items/旧钥.md"),
+            "---\nname: 旧钥\ncategory: item\n---\n\n# 旧钥\n\n生锈铜钥，开城门侧门。\n",
+        );
+        write(
+            &dir.join("entities/locations/城门.md"),
+            "---\nname: 城门\ncategory: location\n---\n\n# 城门\n\n夜间戒严，侧门需钥。\n",
+        );
+        let outline = r#"{
+          "title":"夜奔","pov":"林舟","time_location":"夜·城门",
+          "goal":"出城","conflict":"戒严","emotion_curve":"紧→决",
+          "key_events":["取钥","撞见巡夜"],
+          "characters":["林舟"],
+          "items":["旧钥"],
+          "locations":["城门"],
+          "scene_tags":["chase"],
+          "cliffhanger":"侧门后有人影",
+          "lore_queries":["旧钥是否仍有效"]
+        }"#;
+        // Draft deliberately omits item/location names — roster must still load them.
+        let pack = build_chapter_context(&dir, 2, "他拔腿就跑。", outline, ContextProfile::Full);
+        assert!(
+            pack.hits.iter().any(|h| h.contains("旧钥")),
+            "hits={:?}",
+            pack.hits
+        );
+        assert!(
+            pack.hits.iter().any(|h| h.contains("城门")),
+            "hits={:?}",
+            pack.hits
+        );
+        assert!(pack.markdown.contains("旧钥"));
+        assert!(pack.markdown.contains("城门"));
+        assert!(pack.markdown.contains("本章章纲名单"));
         let _ = fs::remove_dir_all(&dir);
     }
 }

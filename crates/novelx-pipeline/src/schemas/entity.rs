@@ -52,11 +52,35 @@ impl EntityKind {
     fn alias_map(self) -> &'static [(&'static str, &'static [&'static str])] {
         self.required_sections()
     }
+
+    /// Reader-facing Chinese H2 (canon on disk stays English via [`Self::required_sections`]).
+    fn display_zh_map(self) -> &'static [(&'static str, &'static [&'static str])] {
+        match self {
+            Self::Character => &[
+                ("经历", &["History", "经历", "历史"]),
+                ("性格", &["Personality", "性格"]),
+                ("核心事件", &["Core events", "Core Events", "核心事件"]),
+                ("当前状态", &["Current status", "Current Status", "当前状态", "现状"]),
+            ],
+            Self::Item => &[
+                ("来源", &["Origin", "产出地", "来源"]),
+                ("用途", &["Usage", "用途"]),
+                ("当前状态", &["Current status", "Current Status", "当前状态", "现状"]),
+            ],
+            Self::Location => &[
+                ("概述", &["Overview", "概述"]),
+                ("此地势力", &["Factions", "此地势力", "势力"]),
+                ("产出资源", &["Production", "产出资源", "产出"]),
+            ],
+        }
+    }
 }
 
 /// Validate full card; returns normalized full markdown.
 pub fn validate_entity_card(kind: EntityKind, text: &str) -> Result<String, SchemaError> {
-    let (mut meta, body) = split_fm(text);
+    // Models sometimes wrap a full card in ```markdown after a short stub.
+    let text = unwrap_nested_entity_card(text);
+    let (mut meta, body) = split_fm(&text);
     if meta.is_empty() && !text.trim_start().starts_with("---") {
         return Err(SchemaError::new(
             "entity",
@@ -120,7 +144,43 @@ pub fn validate_entity_card(kind: EntityKind, text: &str) -> Result<String, Sche
 
 pub fn display_entity_card(kind: EntityKind, text: &str) -> String {
     let (_meta, body) = split_fm(text);
-    rewrite_h2_aliases(body.trim(), kind.alias_map())
+    // Normalize aliases → English canon, then → Chinese for the reader.
+    let canon = rewrite_h2_aliases(body.trim(), kind.alias_map());
+    rewrite_h2_aliases(&canon, kind.display_zh_map())
+}
+
+/// Prefer an inner fenced full card (` ```markdown --- … ``` `) when present.
+fn unwrap_nested_entity_card(text: &str) -> String {
+    let t = text.trim();
+    if let Some(start) = t.find("```") {
+        if start > 0 {
+            let after = &t[start..];
+            let rest = after.strip_prefix("```").unwrap_or(after);
+            let rest = rest
+                .strip_prefix("markdown")
+                .or_else(|| rest.strip_prefix("md"))
+                .unwrap_or(rest);
+            let rest = rest
+                .strip_prefix('\r')
+                .unwrap_or(rest)
+                .strip_prefix('\n')
+                .unwrap_or(rest);
+            if let Some(end) = rest.find("```") {
+                let inner = rest[..end].trim();
+                if inner.contains("---")
+                    && (inner.contains("## History")
+                        || inner.contains("## 经历")
+                        || inner.contains("## Origin")
+                        || inner.contains("## 来源")
+                        || inner.contains("## Overview")
+                        || inner.contains("## 概述"))
+                {
+                    return inner.to_string();
+                }
+            }
+        }
+    }
+    t.to_string()
 }
 
 pub fn validate_entity_body_edit(
@@ -180,6 +240,34 @@ status: active
     }
 
     #[test]
+    fn display_uses_chinese_headings() {
+        let t = r#"---
+name: 甲
+status: active
+---
+
+## History
+经历正文。
+
+## Personality
+性格正文。
+
+## Core events
+- 事件
+
+## Current status
+现状正文。
+"#;
+        let shown = display_entity_card(EntityKind::Character, t);
+        assert!(shown.contains("## 经历"), "{shown}");
+        assert!(shown.contains("## 性格"), "{shown}");
+        assert!(shown.contains("## 核心事件"), "{shown}");
+        assert!(shown.contains("## 当前状态"), "{shown}");
+        assert!(!shown.contains("## History"), "{shown}");
+        assert!(!shown.contains("---"), "{shown}");
+    }
+
+    #[test]
     fn rejects_missing_personality() {
         let t = r#"---
 name: 甲
@@ -217,5 +305,43 @@ status: active
 "#;
         let out = validate_entity_card(EntityKind::Item, t).unwrap();
         assert!(out.contains("## Origin"));
+    }
+
+    #[test]
+    fn unwraps_fenced_nested_character_card() {
+        let t = r#"---
+name: 甲（别名）
+status: active
+---
+
+# 甲（别名）
+
+一句话 stub。
+
+```markdown
+---
+name: 甲（别名）
+status: exited
+aliases: 别名
+---
+
+## History
+经历。
+
+## Personality
+性格。
+
+## Core events
+- 事件
+
+## Current status
+已故。
+```
+"#;
+        let out = validate_entity_card(EntityKind::Character, t).unwrap();
+        assert!(!out.contains("```"), "{out}");
+        assert!(out.contains("status: exited") || out.contains("status:exited"), "{out}");
+        assert!(out.contains("## History"));
+        assert!(!out.contains("一句话 stub"));
     }
 }

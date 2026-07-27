@@ -33,13 +33,15 @@ description: 介入式实体设计——按当前架构生成人物/物品/地�
 
 `status=exited|consumed` 的卡不会进入后续章 CanonContext（主角 always-include 例外）。
 
-**正文 fields（落盘为固定 H2；缺节拒绝写入）**
+**正文 fields（落盘固定 H2；缺节拒绝写入）**
 
-| 类型 | 必填节（中英标题均可，系统归一） |
-|------|----------------------------------|
-| 人物 character | `## History` / `## Personality` / `## Core events` / `## Current status` |
-| 物品 item | `## Origin` / `## Usage` / `## Current status` |
-| 地点 location | `## Overview` / `## Factions` / `## Production`（`## Notes` 可选） |
+完整契约见 `content-formats`。落盘英文 canon（中文别名可写，系统归一）；Web 展示中文。
+
+| 类型 | 落盘 H2（Agent） | Web |
+|------|------------------|-----|
+| 人物 | History / Personality / Core events / Current status | 经历 / 性格 / 核心事件 / 当前状态 |
+| 物品 | Origin / Usage / Current status | 来源 / 用途 / 当前状态 |
+| 地点 | Overview / Factions / Production | 概述 / 此地势力 / 产出资源 |
 
 JSON `fields` 键名：人物 `history/personality/core_events/current_status`；物品 `origin/usage/current_status`；地点 `overview/factions/production`。`core_events` 为字符串数组。叙事态 `Current status` ≠ frontmatter `status`。
 

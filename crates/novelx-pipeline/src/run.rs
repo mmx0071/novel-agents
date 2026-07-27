@@ -4,8 +4,10 @@ use novelx_draft_patch::{
     RevisionTarget,
 };
 use novelx_harness::{
-    check_draft, collect_signals, evaluate_activation, normalize_consistency_issues,
-    on_consistency_result, on_pacing_result, resolve_pipeline_agents, should_publish,
+    check_draft_with, collect_signals, evaluate_activation, ContentRulesConfig, has_timeline_p0,
+    consistency_human_option_labels, normalize_consistency_issues, on_consistency_result,
+    on_pacing_result,
+    resolve_pipeline_agents, should_publish,
     ChapterBudget, GateDecision, HandlerKind, NamingRules, PipelineConfig,
 };
 use novelx_llm::LlmClient;
@@ -83,6 +85,9 @@ pub struct PipelineRun {
     /// Consistency auditor result (None if auditor did not run).
     #[serde(default)]
     pub consistency_passed: Option<bool>,
+    /// Normalized consistency issues (for studio gate brief / revise).
+    #[serde(default)]
+    pub issues: Vec<Value>,
     /// Whether publish advanced `next_chapter` / `published_count`.
     #[serde(default)]
     pub published: bool,
@@ -101,6 +106,17 @@ pub struct PipelineRun {
     pub volume_ended_start: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_ended_end: Option<u32>,
+    /// Plot cards completed on this publish (setting pass may have run).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plots_completed: Vec<String>,
+    #[serde(default)]
+    pub plot_setting_blocker: bool,
+    /// `plot_acceptor` result when it ran: true=pass, false=fail, None=skipped/absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plot_accept_passed: Option<bool>,
+    /// Rationale when plot accept failed (for gate revise instructions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plot_accept_rationale: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,7 +162,8 @@ pub fn plan_chapter_steps_with_activation(
 
 pub fn plan_revision_steps_with(pipe: &PipelineConfig, local_patch: bool) -> Vec<String> {
     if local_patch {
-        vec!["writer".into()]
+        // Distinct step id so UI/activity shows「局部修订」not full-chapter writer.
+        vec!["local_reviser".into()]
     } else {
         pipe.revise_default().to_vec()
     }
@@ -303,6 +320,7 @@ pub async fn execute_pipeline_with_steps(
         revision_applied_via_patch: false,
         report: String::new(),
         consistency_passed: None,
+        issues: Vec::new(),
         published: false,
         content_rule_blocked: false,
         needs_user_choice: false,
@@ -310,6 +328,10 @@ pub async fn execute_pipeline_with_steps(
         volume_ended_name: None,
         volume_ended_start: None,
         volume_ended_end: None,
+        plots_completed: Vec::new(),
+        plot_setting_blocker: false,
+        plot_accept_passed: None,
+        plot_accept_rationale: None,
     };
     let audit_only = matches!(mode, RunMode::AuditOnly);
     let mut report_parts: Vec<String> = Vec::new();
@@ -321,10 +343,14 @@ pub async fn execute_pipeline_with_steps(
     // Apply only after publish_ok — never complete a plot on unpublished drafts.
     let mut pending_plot_accept: Option<String> = None;
 
-    let skills_root = config_root.join("skills/agents");
-    let skill_outcome = load_skills(&[(SkillScope::Agent, skills_root)]);
+    // Agent SKILL.md + top-level shared docs (e.g. prose-pitfalls.md).
+    let skill_outcome = load_skills(&[
+        (SkillScope::Studio, config_root.join("skills")),
+        (SkillScope::Agent, config_root.join("skills/agents")),
+    ]);
     let naming = NamingRules::load_from_config_root(config_root);
     let naming_block = naming.prompt_block();
+    let content_rules = ContentRulesConfig::load_from_config_root(config_root);
     let chapter_budget = ChapterBudget::load_from_config_root(config_root);
     let pipe = PipelineConfig::load(config_root);
 
@@ -354,8 +380,15 @@ pub async fn execute_pipeline_with_steps(
             },
         );
 
-        // Inject skill full body for this agent (progressive disclosure at step)
-        let injections = build_skill_injections(&skill_outcome.skills, &[agent.replace('_', "-")]);
+        // Inject skill full body for this agent (progressive disclosure at step).
+        // local_reviser reuses writer skill for full-revise fallback; local patches use a
+        // short system prompt inside revise_by_local_patches.
+        let skill_key = if agent == "local_reviser" {
+            "writer".to_string()
+        } else {
+            agent.replace('_', "-")
+        };
+        let injections = build_skill_injections(&skill_outcome.skills, &[skill_key]);
         let skill_body = injections
             .first()
             .map(|i| i.body.as_str())
@@ -369,7 +402,7 @@ pub async fn execute_pipeline_with_steps(
             Some(HandlerKind::ChapterPlanner) => {
                 let canon = rebuild_canon(&draft, &outline, ContextProfile::Full);
                 let prev_outline = outline.clone();
-                let generated = run_chapter_planner(
+                let mut generated = run_chapter_planner(
                     &llm,
                     skill_body,
                     &state,
@@ -378,12 +411,48 @@ pub async fn execute_pipeline_with_steps(
                     &naming_block,
                 )
                 .await?;
-                match write_chapter_outline(&project_dir, chapter, &generated) {
-                    Ok(()) => {
-                        outline = generated;
+                let mut write_err = None;
+                for attempt in 0..2u8 {
+                    match write_chapter_outline(&project_dir, chapter, &generated) {
+                        Ok(()) => {
+                            write_err = None;
+                            break;
+                        }
+                        Err(e) => {
+                            write_err = Some(e);
+                            if attempt == 0 {
+                                tracing::warn!(
+                                    chapter,
+                                    error = %write_err.as_ref().unwrap(),
+                                    "chapter_planner JSON invalid; requesting one repair pass"
+                                );
+                                emit(
+                                    &tx,
+                                    PipelineEvent::LlmDelta {
+                                        agent: agent.clone(),
+                                        delta: "\n章纲 JSON 不合规，正在自动修正…\n".into(),
+                                    },
+                                );
+                                generated = run_chapter_planner_repair(
+                                    &llm,
+                                    skill_body,
+                                    chapter,
+                                    &generated,
+                                    &write_err.as_ref().unwrap().to_string(),
+                                )
+                                .await?;
+                            }
+                        }
+                    }
+                }
+                match write_err {
+                    None => {
+                        // Persist pretty JSON from disk so downstream sees validated form.
+                        outline = read_chapter_outline(&project_dir, chapter)
+                            .unwrap_or(generated);
                         format!("章纲已生成（{} 字）", outline.chars().count())
                     }
-                    Err(e) => {
+                    Some(e) => {
                         // Keep a valid on-disk outline rather than failing the whole chapter.
                         if !prev_outline.trim().is_empty()
                             && crate::schemas::parse_chapter_outline_text(&prev_outline).is_ok()
@@ -430,6 +499,7 @@ pub async fn execute_pipeline_with_steps(
                     &canon_md,
                     &naming_block,
                     &chapter_budget,
+                    &content_rules,
                 )
                 .await?;
                 draft = new_draft;
@@ -582,8 +652,19 @@ pub async fn execute_pipeline_with_steps(
                 )
                 .await?;
                 let (has_p0, issues) = normalize_consistency_issues(issues_raw);
-                // Any P0 (incl. escalated factual anchors) must fail the gate.
-                let passed = passed_raw && !has_p0;
+                // Publish gate follows hard P0 only. Soft/fake P0s are demoted/dropped
+                // in normalize; model `passed=false` on P1-only must not block forever.
+                let passed = !has_p0;
+                if passed_raw != passed {
+                    tracing::info!(
+                        chapter,
+                        passed_raw,
+                        passed,
+                        has_p0,
+                        issues = issues.len(),
+                        "consistency passed recomputed after priority normalize"
+                    );
+                }
                 tracing::info!(
                     chapter,
                     passed,
@@ -593,6 +674,7 @@ pub async fn execute_pipeline_with_steps(
                 );
                 consistency_passed = passed;
                 run.consistency_passed = Some(passed);
+                run.issues = issues.clone();
                 has_blocking = !passed || has_p0;
                 // Persist for steer_run / fail-rate activation.
                 let audit_path = project_dir
@@ -612,22 +694,24 @@ pub async fn execute_pipeline_with_steps(
                     .unwrap_or_else(|_| "{}".into()),
                 );
                 if audit_only {
-                    // Audit-only never rewrites; on fail, guide user to choose a fix path.
+                    // Audit-only never rewrites; on fail, Studio/core opens per-issue decisions.
                     if !passed || has_p0 {
                         await_human = true;
                         has_blocking = true;
                         run.needs_user_choice = true;
+                        let p0_n = issues
+                            .iter()
+                            .filter(|i| {
+                                i.get("priority").and_then(|v| v.as_str()) == Some("P0")
+                            })
+                            .count();
                         emit(
                             &tx,
                             PipelineEvent::AwaitingHuman {
                                 prompt: format!(
-                                    "第{chapter}章一致性未通过，请选择下一步"
+                                    "第{chapter}章未通过（{p0_n} 条阻断），请按问题选择处理项"
                                 ),
-                                options: vec![
-                                    "按审校局部修订".into(),
-                                    "接受问题".into(),
-                                    "其他".into(),
-                                ],
+                                options: consistency_human_option_labels(&issues),
                             },
                         );
                     }
@@ -664,6 +748,7 @@ pub async fn execute_pipeline_with_steps(
                                 &fix_canon.markdown,
                                 &naming_block,
                                 &chapter_budget,
+                                &content_rules,
                             )
                             .await?;
                             draft = new_draft;
@@ -675,17 +760,19 @@ pub async fn execute_pipeline_with_steps(
                             await_human = true;
                             has_blocking = true;
                             run.needs_user_choice = true;
+                            let p0_n = issues
+                                .iter()
+                                .filter(|i| {
+                                    i.get("priority").and_then(|v| v.as_str()) == Some("P0")
+                                })
+                                .count();
                             emit(
                                 &tx,
                                 PipelineEvent::AwaitingHuman {
                                     prompt: format!(
-                                        "第{chapter}章一致性待确认，请选择下一步"
+                                        "第{chapter}章待确认（{p0_n} 条阻断），请按问题选择处理项"
                                     ),
-                                    options: vec![
-                                        "按审校局部修订".into(),
-                                        "接受问题".into(),
-                                        "其他".into(),
-                                    ],
+                                    options: consistency_human_option_labels(&issues),
                                 },
                             );
                         }
@@ -750,6 +837,7 @@ pub async fn execute_pipeline_with_steps(
                             &fix_canon.markdown,
                             &naming_block,
                             &chapter_budget,
+                            &content_rules,
                         )
                         .await?;
                         draft = new_draft;
@@ -848,31 +936,38 @@ pub async fn execute_pipeline_with_steps(
         }
     }
 
-    // Always enforce banned-name hard rules (audit + write).
+    // Always enforce banned-name / meta-chapter hard rules (audit + write).
     if !draft.is_empty() {
-        let violations = check_draft(&draft, &naming.forbidden_names);
+        let violations = check_draft_with(&content_rules, &draft, &naming.forbidden_names);
         if !violations.is_empty() {
-            let detail = violations
+            let listed = violations
                 .iter()
-                .map(|v| v.message.as_str())
+                .enumerate()
+                .map(|(i, v)| format!("{}. {}", i + 1, v.message))
                 .collect::<Vec<_>>()
-                .join("；");
-            tracing::warn!(chapter, %detail, "content rule violations");
-            report_parts.push(format!("## 硬规则\n{detail}"));
+                .join("\n");
+            tracing::warn!(chapter, detail = %listed, "content rule violations");
+            report_parts.push(format!(
+                "## 硬规则（{} 条，本章未发布）\n{listed}\n\n\
+                 如何处理：选择「修正本章」，或说明要改的地方\
+                 （去掉正文「第N章」、理顺倒计时/时段回跳、替换禁名等）。",
+                violations.len()
+            ));
+            let warn = format!(
+                "完成，但有 {} 条硬规则警告（本章未发布）\n{listed}\n\n\
+                 如何处理：选择「修正本章」，或说明要改的地方。",
+                violations.len()
+            );
             if run.message.is_empty() {
-                run.message = format!("完成，但有 {} 条硬规则警告", violations.len());
+                run.message = warn;
             } else {
-                run.message = format!(
-                    "{}；另有 {} 条硬规则警告",
-                    run.message,
-                    violations.len()
-                );
+                run.message = format!("{}\n\n{warn}", run.message);
             }
         }
     }
 
     let banned_blocking = if !draft.is_empty() {
-        !check_draft(&draft, &naming.forbidden_names).is_empty()
+        !check_draft_with(&content_rules, &draft, &naming.forbidden_names).is_empty()
     } else {
         false
     };
@@ -890,6 +985,7 @@ pub async fn execute_pipeline_with_steps(
         let before_published = state.published_count;
         let fin = finalize_chapter_publish(
             &project_dir,
+            config_root,
             chapter,
             mode,
             &mut state,
@@ -899,12 +995,16 @@ pub async fn execute_pipeline_with_steps(
             banned_blocking,
             ran_summarizer,
             pending_plot_accept.as_deref(),
-            &llm,
+            llm.clone(),
             &tx,
         )
         .await?;
         report_parts.extend(fin.report_parts);
         run.published = fin.published;
+        run.plots_completed = fin.plots_completed;
+        run.plot_setting_blocker = fin.plot_setting_blocker;
+        run.plot_accept_passed = fin.plot_accept_passed;
+        run.plot_accept_rationale = fin.plot_accept_rationale;
         if fin.await_human {
             await_human = true;
         }
@@ -949,22 +1049,47 @@ pub async fn execute_pipeline_with_steps(
             format!("第{chapter}章审校报告\n\n{}", run.report)
         };
         // Options are shown in the chat UI — avoid duplicating the menu in tool output.
-        run.message = if run.needs_user_choice {
+        run.message = if run.content_rule_blocked && run.consistency_passed != Some(false) {
+            format!("{base}\n\n（硬规则未通过 — 请在下方选择修正本章）")
+        } else if run.needs_user_choice {
             format!("{base}\n\n（审校未通过 — 请在下方选项中选择下一步）")
         } else {
             base
         };
-    } else if run.message.is_empty() {
-        let gate_note = if !publish_ok && matches!(mode, RunMode::Continue) {
-            "（未发布：待修/待确认）"
-        } else if run.revision_applied_via_patch {
-            "（局部补丁）"
-        } else {
-            ""
-        };
-        run.message = format!("第{chapter}章流水线完成{gate_note}");
+    } else {
+        if run.message.is_empty() {
+            let gate_note = if !publish_ok && matches!(mode, RunMode::Continue) {
+                "（未发布：待修/待确认）"
+            } else if run.revision_applied_via_patch {
+                "（局部补丁）"
+            } else {
+                ""
+            };
+            run.message = format!("第{chapter}章流水线完成{gate_note}");
+        }
+        // Always surface report sections in tool output. Previously this only ran when
+        // message was empty — hard-rule warnings set message first and hid ## 硬规则 details.
         if !run.report.is_empty() {
-            run.message = format!("{}\n\n{}", run.message, run.report);
+            let msg_has_rules = run.message.contains("## 硬规则")
+                || run.message.contains("条硬规则警告");
+            let report_only_rules = run.report.starts_with("## 硬规则")
+                && !run.report.contains("\n\n---\n\n");
+            if !(msg_has_rules && report_only_rules) && !run.message.contains(&run.report) {
+                // If message already listed hard-rule lines, still append other sections.
+                if msg_has_rules && run.report.contains("## 硬规则") {
+                    let rest = run
+                        .report
+                        .split("\n\n---\n\n")
+                        .filter(|part| !part.trim_start().starts_with("## 硬规则"))
+                        .collect::<Vec<_>>()
+                        .join("\n\n---\n\n");
+                    if !rest.trim().is_empty() {
+                        run.message = format!("{}\n\n{}", run.message, rest);
+                    }
+                } else {
+                    run.message = format!("{}\n\n{}", run.message, run.report);
+                }
+            }
         }
     }
     emit(
@@ -990,12 +1115,34 @@ async fn run_chapter_planner(
         "为小说《{}》（题材：{}）撰写第{chapter}章章纲。\n\
          只输出一个 JSON 对象（可包在 ```json 代码块中），不要输出 Markdown 散文或解释。\n\
          必填字段：title, pov, time_location, goal, conflict, emotion_curve,\n\
-         key_events(数组≥2), characters(数组), scene_tags(数组), cliffhanger, lore_queries(数组)。\n\
+         key_events(数组≥2), characters(数组), items(数组), locations(数组),\n\
+         scene_tags(数组), cliffhanger, lore_queries(数组)。\n\
+         items/locations：本章要用的物品卡/地点卡规范名（可空数组）；系统据此加载设定卡。\n\
+         JSON 硬约束：字符串内禁止未转义的英文双引号；对话/强调请用「」或『』；不要尾逗号。\n\
          必须与 CanonContext 卷幕目标、未收线与剧情卡一致，不得引入未定义设定。\n\
          若有【设定缺口】：lore_queries 优先覆盖缺口实体；勿另起缺口外新主要实体；\
          勿安排 status=exited/consumed 角色/物品常规出场（闪回须注明）。\n\
          人物/组织命名遵守取名硬约束。\n\n{naming_block}\n\n{canon}",
         state.name, state.genre
+    );
+    llm.complete_for_agent("chapter_planner", skill, &user).await
+}
+
+/// One-shot repair when planner JSON fails to parse / validate.
+async fn run_chapter_planner_repair(
+    llm: &LlmClient,
+    skill: &str,
+    chapter: u32,
+    broken: &str,
+    error: &str,
+) -> Result<String> {
+    let user = format!(
+        "第{chapter}章章纲 JSON 无法解析，请输出修正后的完整 JSON 对象（可包在 ```json 中），不要解释。\n\
+         错误：{error}\n\
+         要求：保留原情节要点；字符串内不要用未转义英文双引号（改用「」）；去掉尾逗号；\
+         字段齐全：title/pov/time_location/goal/conflict/emotion_curve/key_events(≥2)/\
+         characters/items/locations/scene_tags/cliffhanger/lore_queries。\n\n\
+         # 待修正原文\n{broken}"
     );
     llm.complete_for_agent("chapter_planner", skill, &user).await
 }
@@ -1046,17 +1193,29 @@ async fn run_writer(
     canon: &str,
     naming_block: &str,
     budget: &ChapterBudget,
+    content_rules: &ContentRulesConfig,
 ) -> Result<(String, bool)> {
     let revision_mode = revision.revision_mode
         || !existing_draft.is_empty()
             && (prefer_local || revision.user_instructions.is_some() || !revision.audit_issues.is_empty());
 
     // User asked for expansion/rewrite → skip local patch entirely.
+    // TIMELINE P0 needs whole-chapter monotonic clocks — local multi-span patches
+    // repeatedly fail and loop; escalate to full revise.
     let force_full = revision
         .user_instructions
         .as_deref()
         .map(needs_full_rewrite)
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || has_timeline_p0(&revision.audit_issues);
+    if force_full && has_timeline_p0(&revision.audit_issues) {
+        if let Some(tx) = tx {
+            let _ = tx.send(PipelineEvent::LlmDelta {
+                agent: "writer".into(),
+                delta: "（检测到时间线 P0：改为整章修订以统一倒计时）\n".into(),
+            });
+        }
+    }
 
     if revision_mode && prefer_local && !force_full && !existing_draft.is_empty() {
         let (targets, ok) = plan_revision(
@@ -1066,6 +1225,21 @@ async fn run_writer(
             &revision.pacing_suggestions,
         );
         if ok && !targets.is_empty() {
+            if let Some(tx) = tx {
+                let _ = tx.send(PipelineEvent::LlmDelta {
+                    agent: "local_reviser".into(),
+                    delta: format!(
+                        "（局部修订 {} 处：{}）\n",
+                        targets.len(),
+                        targets
+                            .iter()
+                            .take(6)
+                            .map(|t| t.para_label())
+                            .collect::<Vec<_>>()
+                            .join("、")
+                    ),
+                });
+            }
             match revise_by_local_patches(
                 llm,
                 skill,
@@ -1077,15 +1251,21 @@ async fn run_writer(
             )
             .await
             {
-                Ok((draft, true)) => return Ok((draft, true)),
+                Ok((draft, true)) => return Ok((scrub_writer_draft(draft, content_rules), true)),
                 Ok((draft, false)) if !draft.is_empty() => {
                     // partial — still better than full if we got something; fall through only if empty
                     if draft != existing_draft {
-                        return Ok((draft, true));
+                        return Ok((scrub_writer_draft(draft, content_rules), true));
                     }
                 }
                 _ => {}
             }
+        }
+        if let Some(tx) = tx {
+            let _ = tx.send(PipelineEvent::LlmDelta {
+                agent: "local_reviser".into(),
+                delta: "（局部补丁未落地，改为整章修订…）\n".into(),
+            });
         }
         // full fallback — inject concrete audit issues so rewrite is not blind
         let enriched = enrich_revision_with_issues(revision);
@@ -1102,6 +1282,7 @@ async fn run_writer(
             naming_block,
             budget,
             tx,
+            content_rules,
         )
         .await?;
         return Ok((draft, false));
@@ -1122,6 +1303,7 @@ async fn run_writer(
             naming_block,
             budget,
             tx,
+            content_rules,
         )
         .await?;
         return Ok((draft, false));
@@ -1131,8 +1313,10 @@ async fn run_writer(
     let target_line = budget.writer_target_line();
     let user = format!(
         "小说《{}》第{chapter}章。\n\
-         正文必须服从 CanonContext（人物状态、名词、世界观、剧情走向）。\n\
-         命名遵守取名硬约束，禁止语料脸谱名。\n\n\
+         正文必须服从 CanonContext（尤其【身体与能力状态板】、人物状态、名词、世界观、剧情走向）。\n\
+         写前先扫一眼状态板：伤势侧别/部位与能力寄宿点抄错即属 P0。\n\
+         命名遵守取名硬约束，禁止语料脸谱名。\n\
+         {WRITER_HARD_CONSTRAINTS}\n\n\
          {naming_block}\n\n{canon}\n\n# 章纲\n{}\n\n{target_line}",
         state.name,
         if outline.is_empty() {
@@ -1157,24 +1341,81 @@ async fn run_writer(
         }),
     )
     .await?;
-    Ok((draft, false))
+    Ok((scrub_writer_draft(draft, content_rules), false))
 }
+
+/// Hard constraints duplicated into the user message (skills alone are easy to ignore).
+const WRITER_HARD_CONSTRAINTS: &str = "\
+硬约束（违反会被系统拦截或一致性 P0 打回）：\n\
+1. 章号元叙述：除首行标题 `# 第N章 …` 外，叙述/独白/对话禁止出现「第N章」「第八章」等连载章号；\
+回溯用故事内时间/事件（「上次会面时」「那次事故之后」）。\n\
+2. 明确时间锚：若写钟点/倒计时/还剩时长，全章只维护一条当前读数且单调（倒计时只减不增）；\
+具体读数宜 ≤4 次；禁止假回跳；回忆初始值须写「最初/原先」。\n\
+3. 时段词：上午/傍晚/深夜等须随叙事前进；若回到更早时段，必须交代跨日（翌日/天亮/过了一夜），禁止无过渡回跳。\n\
+4. 伤势侧别/部位：若 CanonContext 有【身体与能力状态板】或近章事实写明左/右、肩/臂/手/腿等，\
+本章必须沿用；禁止无交代左右对调或肩臂挪移。\n\
+5. 能力寄宿/附着/载体：状态板与近章事实中的所在肢体/器物/印记点必须沿用；\
+更换须写可见转移过程，禁止默默换位。";
+
+/// Strip accidental body「第N章」right after generation (title line kept).
+fn scrub_writer_draft(draft: String, content_rules: &ContentRulesConfig) -> String {
+    novelx_harness::rewrite_meta_chapter_refs_with(content_rules, &draft).unwrap_or(draft)
+}
+
+const LOCAL_REVISER_SKILL: &str = "你是小说局部修订编辑。只按用户指令改指定段落；\
+输出替换正文或要求的 JSON，不要写作说明，不要扩写全章。\
+涉及倒计时/钟点时：只保留一条单调当前读数，禁止回跳；回忆初始值须标明「最初/原先」，勿伪装成当前值。\
+涉及伤势/能力位置时：保持左/右与部位、寄宿/载体与改前及 CanonContext 状态板一致，禁止默默挪位。";
 
 async fn revise_by_local_patches(
     llm: &LlmClient,
-    skill: &str,
+    _skill: &str,
     draft: &str,
     targets: &[RevisionTarget],
     tx: &Option<mpsc::UnboundedSender<PipelineEvent>>,
     canon: &str,
     naming_block: &str,
 ) -> Result<(String, bool)> {
-    let paragraphs = segment_paragraphs(draft);
-    let mut replacements: Vec<(usize, String)> = Vec::new();
-    let canon_short = crate::cards::truncate_chars(canon, 2500);
-    let naming_short = crate::cards::truncate_chars(naming_block, 800);
+    let (draft_cur, applied) =
+        revise_by_local_patches_collect(llm, draft, targets, tx, canon, naming_block).await?;
+    Ok((draft_cur, !applied.is_empty()))
+}
 
-    for (i, target) in targets.iter().enumerate() {
+/// Local revise that also returns applied before/after spans (for confirm preview).
+async fn revise_by_local_patches_collect(
+    llm: &LlmClient,
+    draft: &str,
+    targets: &[RevisionTarget],
+    tx: &Option<mpsc::UnboundedSender<PipelineEvent>>,
+    canon: &str,
+    naming_block: &str,
+) -> Result<(String, Vec<novelx_draft_patch::AppliedPatch>)> {
+    let skill = LOCAL_REVISER_SKILL;
+    let canon_short = crate::cards::truncate_chars(canon, 1800);
+    let naming_short = crate::cards::truncate_chars(naming_block, 600);
+    let mut draft_cur = draft.to_string();
+    let mut applied_all = Vec::new();
+
+    for target in targets {
+        if target.source == "timeline_batch" {
+            let (next, batch_applied) = revise_timeline_batch_collect(
+                llm,
+                skill,
+                &draft_cur,
+                target,
+                tx,
+                &canon_short,
+                &naming_short,
+            )
+            .await?;
+            if !batch_applied.is_empty() {
+                draft_cur = next;
+                applied_all.extend(batch_applied);
+            }
+            continue;
+        }
+
+        let paragraphs = segment_paragraphs(&draft_cur);
         let slice = slice_span(&paragraphs, target.start, target.end);
         let user = format!(
             "只改下列段落，输出替换后的段落全文（不要输出其它说明）。\n\
@@ -1184,24 +1425,144 @@ async fn revise_by_local_patches(
             target.para_label(),
             slice
         );
-        let repl = llm.complete_for_agent("writer", skill, &user).await?;
+        let repl = llm.complete_for_agent("local_reviser", skill, &user).await?;
         // Reject oversized outputs (likely full chapter)
         if repl.chars().count() > slice.chars().count().saturating_mul(3).max(2000) {
             continue;
         }
-        if let Some(tx) = tx {
-            let _ = tx.send(PipelineEvent::DraftPatched {
-                start_para: target.start + 1,
-                end_para: target.end + 1,
-                before: slice.chars().take(200).collect(),
-                after: repl.chars().take(200).collect(),
-            });
+        let one = [target.clone()];
+        let result = apply_local_patches(&draft_cur, &one, &[(0, repl.clone())]);
+        if result.used_local_patch {
+            draft_cur = result.draft;
+            for ap in &result.applied {
+                if let Some(tx) = tx {
+                    let _ = tx.send(PipelineEvent::LlmDelta {
+                        agent: "local_reviser".into(),
+                        delta: format!("✓ 已改 {}\n", target.para_label()),
+                    });
+                    let _ = tx.send(PipelineEvent::DraftPatched {
+                        start_para: ap.start + 1,
+                        end_para: ap.end + 1,
+                        before: ap.before.chars().take(2000).collect(),
+                        after: ap.after.chars().take(2000).collect(),
+                    });
+                }
+            }
+            applied_all.extend(result.applied);
         }
-        replacements.push((i, repl));
     }
 
-    let result = apply_local_patches(draft, targets, &replacements);
-    Ok((result.draft, result.used_local_patch))
+    Ok((draft_cur, applied_all))
+}
+
+/// One LLM call for all discrete time-anchor paragraphs (avoids 8× serial patch latency).
+async fn revise_timeline_batch_collect(
+    llm: &LlmClient,
+    skill: &str,
+    draft: &str,
+    target: &RevisionTarget,
+    tx: &Option<mpsc::UnboundedSender<PipelineEvent>>,
+    canon_short: &str,
+    naming_short: &str,
+) -> Result<(String, Vec<novelx_draft_patch::AppliedPatch>)> {
+    let paragraphs = segment_paragraphs(draft);
+    let idxs = target.batch_para_indices();
+    if idxs.is_empty() {
+        return Ok((draft.to_string(), vec![]));
+    }
+    if let Some(tx) = tx {
+        let _ = tx.send(PipelineEvent::LlmDelta {
+            agent: "local_reviser".into(),
+            delta: format!("（批量修订 {}）\n", target.para_label()),
+        });
+    }
+    let mut blocks = String::new();
+    for &idx in &idxs {
+        if idx >= paragraphs.len() {
+            continue;
+        }
+        blocks.push_str(&format!(
+            "### 第{}段\n{}\n\n",
+            idx + 1,
+            paragraphs[idx]
+        ));
+    }
+    let user = format!(
+        "统一修订下列含倒计时/钟点的段落，消除时间互斥。\n\
+         指令：{}\n\
+         规则：只改钟点/倒计时/子夜相关表述，其余句子尽量不动；\
+         全章只维护一条当前读数且单调（倒计时只减不增）；禁止无故回跳；\
+         禁止重复写出已出现过的更早读数当作当前值；\
+         回忆总额/初始值必须写成「最初是…」；尽量删去多余的 A→B→C 递减串，只留当前值。\n\
+         只输出 JSON（不要 markdown）：{{\"patches\":[{{\"para\":段号从1起,\"text\":\"该段全文\"}}]}}\n\
+         每个列出的段都必须给出补丁。\n\n\
+         {naming_short}\n\n{canon_short}\n\n# 待改段落\n{blocks}",
+        target.instruction
+    );
+    let raw = llm.complete_for_agent("local_reviser", skill, &user).await?;
+    let Some(v) = extract_json(&raw) else {
+        tracing::warn!("timeline_batch: no JSON in model output");
+        return Ok((draft.to_string(), vec![]));
+    };
+    let Some(arr) = v.get("patches").and_then(|x| x.as_array()) else {
+        tracing::warn!("timeline_batch: missing patches array");
+        return Ok((draft.to_string(), vec![]));
+    };
+
+    let mut sub_targets = Vec::new();
+    let mut sub_repls = Vec::new();
+    for item in arr {
+        let para_1 = item
+            .get("para")
+            .and_then(|x| x.as_u64())
+            .or_else(|| {
+                item.get("para")
+                    .and_then(|x| x.as_str())
+                    .and_then(|s| s.parse().ok())
+            })
+            .unwrap_or(0) as usize;
+        if para_1 == 0 {
+            continue;
+        }
+        let idx = para_1 - 1;
+        if !idxs.contains(&idx) || idx >= paragraphs.len() {
+            continue;
+        }
+        let text = item
+            .get("text")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .trim();
+        if text.is_empty() {
+            continue;
+        }
+        let orig_len = paragraphs[idx].chars().count();
+        if text.chars().count() > orig_len.saturating_mul(3).max(2000) {
+            continue;
+        }
+        let j = sub_targets.len();
+        sub_targets.push(RevisionTarget {
+            instruction: target.instruction.clone(),
+            start: idx,
+            end: idx,
+            quote: String::new(),
+            source: "timeline_batch".into(),
+        });
+        sub_repls.push((j, text.to_string()));
+    }
+    if sub_targets.is_empty() {
+        return Ok((draft.to_string(), vec![]));
+    }
+    let result = apply_local_patches(draft, &sub_targets, &sub_repls);
+    if result.used_local_patch {
+        if let Some(tx) = tx {
+            let _ = tx.send(PipelineEvent::LlmDelta {
+                agent: "local_reviser".into(),
+                delta: format!("✓ 已改 {}（{} 段）\n", target.para_label(), sub_targets.len()),
+            });
+        }
+    }
+    Ok((result.draft, result.applied))
 }
 
 fn enrich_revision_with_issues(revision: &RevisionOptions) -> RevisionOptions {
@@ -1240,6 +1601,7 @@ async fn revise_full(
     naming_block: &str,
     budget: &ChapterBudget,
     tx: &Option<mpsc::UnboundedSender<PipelineEvent>>,
+    content_rules: &ContentRulesConfig,
 ) -> Result<String> {
     let instr = revision
         .user_instructions
@@ -1261,7 +1623,8 @@ async fn revise_full(
     };
     let user = format!(
         "修订《{}》第{chapter}章。\n指令：{instr}{issues_section}{length_note}\n\
-         修订必须服从 CanonContext，并遵守取名硬约束；清单中的问题必须在正文中可见地消除。\n\n\
+         修订必须服从 CanonContext，并遵守取名硬约束；清单中的问题必须在正文中可见地消除。\n\
+         {WRITER_HARD_CONSTRAINTS}\n\n\
          {naming_block}\n\n{canon}\n\n# 章纲\n{outline}\n\n# 现有正文\n{draft}",
         state.name
     );
@@ -1281,6 +1644,7 @@ async fn revise_full(
         }),
     )
     .await?;
+    let rewritten = scrub_writer_draft(rewritten, content_rules);
     let new_len = rewritten.chars().count();
     let old_len = draft.chars().count();
     // Guard: truncated flash outputs used to wipe a longer draft (e.g. 900 → 373).
@@ -1420,18 +1784,36 @@ async fn run_consistency_auditor(
     let user = format!(
         "对照 CanonContext 审计下列正文。\n\
          优先级（强制）：\n\
-         - P0：设定库/禁名冲突；章号元叙述；能力破设定；**明确时间互斥**（钟点如 5:42、倒计时、经过时长须可加总，例 5:42→约6小时 不得与倒计时11.5小时矛盾）；\
-         **受伤部位**前后矛盾；**能力所在位置/载体**前后矛盾；开篇无视钩子；关键章纲/剧情卡缺失。有任一 P0 则 passed=false。\n\
-         - P1：无明确钟点的时间词略松、次要状态含糊（可补交代）。\n\
+         - P0（阻断）：设定库/禁名硬冲突；**已出现**的章号元叙述；能力破设定；**明确时间互斥/倒计时回跳**；\
+         **章内时段无过渡回跳**（如深夜后又写上午且无翌日/天亮）；\
+         **受伤部位**矛盾；**能力所在位置/载体**矛盾；开篇**无视/未承接/断档/另起**钩子；\
+         章纲关键事件**完全缺失**（type=OUTLINE）。有任一真正 P0 → passed=false。\n\
+         - P1（不阻断）：动机/铺垫不足、可补交代、剧情卡尚未收束、钩子略跳但已接上、次要状态含糊、\
+         时间压缩感但无回跳、能力描写略糊但建议写清。仅有 P1/P2 → passed=true。\n\
          - P2：风格/笔误。\n\
-         章号元叙述硬禁：叙述/独白/对话中不得用「第N章」「第八章」指称情节；须改为故事内时间或事件；标题行除外。\n\
+         禁止：把「无违规/未检出/无实质断裂/可补交代/不算硬冲突/略有压缩感/建议强化」写成 P0；\
+         未检出章号问题时不要输出 META issue。\n\
+         章号元叙述硬禁：叙述/独白/对话中不得用「第N章」「第八章」指称情节；标题行除外。\n\
+         时间线核对：列出本章全部「还剩/剩余/钟点」当前读数是否单调；再核对上午/傍晚/深夜等时段是否随叙事前进。\n\
          只输出 JSON：{{\"passed\":bool,\"issues\":[{{\"type\":\"TIMELINE|INJURY|ABILITY_LOC|LORE|CHARACTER|POV|CONTINUITY|OUTLINE|META|PLOT\",\"priority\":\"P0|P1|P2\",\"message\":\"\",\"location\":\"第N段\",\"quote\":\"\"}}],\"report\":\"可读报告（须说明是否核对了明确时间、伤势部位、能力位置、设定与章号元叙述）\"}}\n\n\
          {naming_block}\n\n{canon}\n\n# 正文\n{excerpt}"
     );
     let agent = "consistency_auditor";
     let model = llm.model_for_agent(agent);
     // Never mirror JSON tokens into the tool card — floods WS and drops ItemCompleted.
-    let raw = stream_agent_llm(llm, &skill_short, &user, &model, agent, tx, false, None).await?;
+    let mut raw =
+        stream_agent_llm(llm, &skill_short, &user, &model, agent, tx, false, None).await?;
+    // One silent retry — empty content used to be common when thinking ate max_tokens.
+    if raw.trim().is_empty() {
+        tracing::warn!(%model, "consistency_auditor empty; retrying once");
+        if let Some(tx) = tx.as_ref() {
+            let _ = tx.send(PipelineEvent::LlmDelta {
+                agent: agent.into(),
+                delta: "（审计返回为空，正在重试…）\n".into(),
+            });
+        }
+        raw = stream_agent_llm(llm, &skill_short, &user, &model, agent, tx, false, None).await?;
+    }
     if raw.trim().is_empty() {
         return Ok((
             false,
@@ -1492,21 +1874,29 @@ async fn run_pacing_reviewer(
         .map(|(i, p)| format!("[{}] {}", i + 1, p.chars().take(60).collect::<String>()))
         .collect::<Vec<_>>()
         .join("\n");
-    let skill_short = trim_skill(skill, 900);
+    // Keep skill contract (fields + non-blocking P0) — do not truncate below ~2k.
+    let skill_short = trim_skill(skill, 2400);
     let user = format!(
         "节奏审查：结合卷幕目标与未收线，检查是否拖沓/信息过载。\n\
-         只输出 JSON：{{\"suggestions\":[{{\"priority\":\"P1\",\"suggestion\":\"\",\"location\":\"第N段\"}}],\"report\":\"\"}}\n\n\
+         门控：节奏 P0/P1 **不阻断发布**；勿把时间线/伤部位/设定硬冲突写成节奏问题。\n\
+         只输出 JSON：{{\"pacing_passed\":bool,\"suggestions\":[{{\
+         \"priority\":\"P0|P1|P2\",\"location\":\"第N段\",\"quote\":\"原文\",\
+         \"action\":\"删减|拆分|补对话|补互动|压缩环境|加强冲突\",\
+         \"detail\":\"具体改法\",\"suggestion\":\"与detail相同\"}}],\"report\":\"总评\"}}\n\n\
          {canon}\n\n# 段落索引\n{numbered}"
     );
     let agent = "pacing_reviewer";
     let model = llm.model_for_agent(agent);
     let raw = stream_agent_llm(llm, &skill_short, &user, &model, agent, tx, false, None).await?;
     if let Some(v) = extract_json(&raw) {
-        let suggestions = v
+        let mut suggestions = v
             .get("suggestions")
             .and_then(|x| x.as_array())
             .cloned()
             .unwrap_or_default();
+        for s in &mut suggestions {
+            normalize_pacing_suggestion(s);
+        }
         let report = v
             .get("report")
             .and_then(|x| x.as_str())
@@ -1515,6 +1905,54 @@ async fn run_pacing_reviewer(
         return Ok((suggestions, report));
     }
     Ok((vec![], raw))
+}
+
+/// Ensure `suggestion` is populated from `detail` for draft-patch / legacy consumers.
+fn normalize_pacing_suggestion(s: &mut Value) {
+    let detail = s
+        .get("detail")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let suggestion = s
+        .get("suggestion")
+        .or_else(|| s.get("message"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let action = s
+        .get("action")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let quote = s
+        .get("quote")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let body = if !detail.is_empty() {
+        detail
+    } else if !suggestion.is_empty() {
+        suggestion
+    } else {
+        "调整节奏".into()
+    };
+    let mut parts = Vec::new();
+    if !action.is_empty() {
+        parts.push(format!("动作：{action}"));
+    }
+    if !quote.is_empty() {
+        parts.push(format!("锚点：「{quote}」"));
+    }
+    parts.push(body);
+    let merged = parts.join("；");
+    if let Some(obj) = s.as_object_mut() {
+        obj.insert("suggestion".into(), Value::String(merged));
+    }
 }
 
 fn trim_skill(skill: &str, max_chars: usize) -> String {
@@ -1734,7 +2172,9 @@ async fn run_summarizer(llm: &LlmClient, skill: &str, draft: &str) -> Result<Str
             skill,
             &format!(
                 "为正文生成 JSON 摘要。字段：event_summary, relationship_changes, new_facts[], \
-                 foreshadow_updates[], ending_hook, plot_progress（可选）。\
+                 body_state:{{injuries:[],ability_loci:[]}}, foreshadow_updates[], ending_hook, \
+                 plot_progress（可选）。\
+                 body_state 必填：伤势写清侧别/部位与行动限制；能力写清寄宿/附着/载体；无变化则空数组。\
                  注意正文可能含中段/章末切片，须覆盖结尾钩子与后半关键事实。只输出 JSON。\
                  剧情卡是否完结由后续 plot_acceptor 判定，本步不要输出 plot_exit_met。\n\n\
                  # 正文\n{excerpt}"
@@ -1748,6 +2188,7 @@ async fn run_summarizer(llm: &LlmClient, skill: &str, draft: &str) -> Result<Str
             "event_summary": raw.chars().take(400).collect::<String>(),
             "relationship_changes": "",
             "new_facts": [],
+            "body_state": { "injuries": [], "ability_loci": [] },
             "foreshadow_updates": [],
             "ending_hook": "",
         })
@@ -2006,12 +2447,19 @@ pub struct PublishFinalizeResult {
     pub volume_ended_name: Option<String>,
     pub volume_ended_start: Option<u32>,
     pub volume_ended_end: Option<u32>,
+    /// Plot titles that transitioned to `completed` this publish.
+    pub plots_completed: Vec<String>,
+    /// True when post-plot setting audit reported a BLOCKER.
+    pub plot_setting_blocker: bool,
+    pub plot_accept_passed: Option<bool>,
+    pub plot_accept_rationale: Option<String>,
 }
 
 /// Advance `next_chapter`, close bridge plots, apply plot_acceptor pass, evaluate volume end.
 /// Call once after a **full** chapter pipeline (not after SPAWN single steps).
 pub async fn finalize_chapter_publish(
     project_dir: &Path,
+    config_root: &Path,
     chapter: u32,
     mode: RunMode,
     state: &mut ProjectState,
@@ -2021,7 +2469,7 @@ pub async fn finalize_chapter_publish(
     banned_blocking: bool,
     ran_summarizer: bool,
     pending_plot_accept: Option<&str>,
-    llm: &LlmClient,
+    llm: Arc<LlmClient>,
     tx: &Option<mpsc::UnboundedSender<PipelineEvent>>,
 ) -> Result<PublishFinalizeResult> {
     let mut out = PublishFinalizeResult {
@@ -2032,6 +2480,10 @@ pub async fn finalize_chapter_publish(
         volume_ended_name: None,
         volume_ended_start: None,
         volume_ended_end: None,
+        plots_completed: Vec::new(),
+        plot_setting_blocker: false,
+        plot_accept_passed: None,
+        plot_accept_rationale: None,
     };
     let publish_ok =
         should_publish(consistency_passed, has_blocking || await_human) && !banned_blocking;
@@ -2075,12 +2527,34 @@ pub async fn finalize_chapter_publish(
         .ok()
     });
     if let Some(verdict) = accept_raw {
+        let v = serde_json::from_str::<serde_json::Value>(&verdict).unwrap_or_default();
+        let skipped = v
+            .get("skipped")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+        if !skipped {
+            let passed = crate::plots::accept_verdict_is_pass(&verdict);
+            out.plot_accept_passed = Some(passed);
+            if !passed {
+                if let Some(r) = v.get("rationale").and_then(|x| x.as_str()) {
+                    let r = r.trim();
+                    if !r.is_empty() {
+                        out.plot_accept_rationale = Some(r.to_string());
+                    }
+                }
+            }
+        }
         match crate::plots::complete_active_plot_on_accept(project_dir, &verdict) {
             Ok(Some(ev)) => plot_events.push(ev),
             Ok(None) => {}
             Err(e) => tracing::warn!(error = %e, "plot accept complete failed"),
         }
     }
+    out.plots_completed = plot_events
+        .iter()
+        .filter(|e| e.to == "completed")
+        .map(|e| e.title.clone())
+        .collect();
     if !plot_events.is_empty() {
         let detail = plot_events
             .iter()
@@ -2098,49 +2572,329 @@ pub async fn finalize_chapter_publish(
             .join(format!("{chapter:03}"))
             .join("summary.json")
             .exists();
+
+    // Evaluate volume end before plot setting pass so we can skip light sync when
+    // the full volume_sync gate is about to open.
+    let mut volume_decision = None;
     if chapter == state.published_count && summary_ready {
-        match crate::volume::evaluate_volume_end(project_dir, chapter, llm).await {
-            Ok(Some(decision)) => {
-                let vol = &decision.volume;
-                let _ = crate::volume::mark_volume_completed(project_dir, vol, chapter);
-                let _ = crate::phases::set_volume_phase(
-                    project_dir,
-                    crate::phases::VolumePhase::AwaitingSync,
-                );
-                out.volume_ended = Some(vol.volume_index);
-                out.volume_ended_name = Some(vol.name.clone());
-                out.volume_ended_start = Some(vol.start_chapter.max(1));
-                out.volume_ended_end = Some(chapter);
-                out.await_human = true;
-                let matched = if decision.matched.is_empty() {
-                    decision.reason.clone()
-                } else {
-                    decision.matched.join("；")
-                };
-                if let Some(tx) = tx {
-                    let _ = tx.send(PipelineEvent::AwaitingHuman {
-                        prompt: format!(
-                            "第{}卷「{}」终止条件已达成（至第{}章），是否同步设定库？",
-                            vol.volume_index, vol.name, chapter
-                        ),
-                        options: vec!["同步设定库".into(), "跳过".into()],
-                    });
-                }
-                out.report_parts.push(format!(
-                    "## 卷末\n第{}卷「{}」至第{}章：终止条件命中。\n- {}\n- 下一章将写第{}章（下卷）。待确认是否同步设定库。",
-                    vol.volume_index,
-                    vol.name,
-                    chapter,
-                    matched,
-                    chapter + 1
-                ));
-            }
+        match crate::volume::evaluate_volume_end(project_dir, chapter, llm.as_ref()).await {
+            Ok(Some(decision)) => volume_decision = Some(decision),
             Ok(None) => {}
             Err(e) => {
                 tracing::warn!(error = %e, chapter, "volume end evaluation failed");
             }
         }
     }
+
+    let volume_ending = volume_decision.is_some();
+    let pass_flags = crate::setting_pass::PlotSettingPassFlags::load(config_root);
+    if pass_flags.enabled && !out.plots_completed.is_empty() {
+        for title in out.plots_completed.clone() {
+            match crate::setting_pass::run_plot_setting_pass(
+                project_dir,
+                config_root,
+                &title,
+                chapter,
+                volume_ending,
+                llm.clone(),
+                tx.clone(),
+            )
+            .await
+            {
+                Ok(pass) => {
+                    if pass.audit.blocker {
+                        out.plot_setting_blocker = true;
+                    }
+                    out.report_parts.push(pass.report_markdown);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        plot = %title,
+                        "plot setting pass failed"
+                    );
+                }
+            }
+        }
+    } else if !volume_ending
+        && out.plots_completed.is_empty()
+        && crate::setting_pass::ChapterSettingPassFlags::load(config_root).enabled
+        && summary_ready
+    {
+        // Plot still open: keep entity status/holdings current for the next chapter.
+        match crate::setting_pass::run_chapter_setting_pass(
+            project_dir,
+            chapter,
+            llm.clone(),
+            tx.clone(),
+        )
+        .await
+        {
+            Ok(report) => {
+                out.report_parts
+                    .push(format!("## 章后设定同步\n{}", report.message));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, chapter, "chapter setting pass failed");
+            }
+        }
+    }
+
+    if let Some(decision) = volume_decision {
+        let vol = &decision.volume;
+        let _ = crate::volume::mark_volume_completed(project_dir, vol, chapter);
+        let _ = crate::phases::set_volume_phase(
+            project_dir,
+            crate::phases::VolumePhase::AwaitingSync,
+        );
+        out.volume_ended = Some(vol.volume_index);
+        out.volume_ended_name = Some(vol.name.clone());
+        out.volume_ended_start = Some(vol.start_chapter.max(1));
+        out.volume_ended_end = Some(chapter);
+        out.await_human = true;
+        let matched = if decision.matched.is_empty() {
+            decision.reason.clone()
+        } else {
+            decision.matched.join("；")
+        };
+        if let Some(tx) = tx {
+            let _ = tx.send(PipelineEvent::AwaitingHuman {
+                prompt: format!(
+                    "第{}卷「{}」终止条件已达成（至第{}章），是否同步设定库？",
+                    vol.volume_index, vol.name, chapter
+                ),
+                options: vec!["同步设定库".into(), "跳过".into()],
+            });
+        }
+        out.report_parts.push(format!(
+            "## 卷末\n第{}卷「{}」至第{}章：终止条件命中。\n- {}\n- 下一章将写第{}章（下卷）。待确认是否同步设定库。",
+            vol.volume_index,
+            vol.name,
+            chapter,
+            matched,
+            chapter + 1
+        ));
+    }
     let _ = mode;
     Ok(out)
+}
+
+/// One planned local patch for confirm UI / cached apply.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalPatchPreviewItem {
+    pub start_para: usize,
+    pub end_para: usize,
+    pub before: String,
+    pub after: String,
+    #[serde(default)]
+    pub instruction: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalRevisionPreview {
+    pub patches: Vec<LocalPatchPreviewItem>,
+    pub summary_markdown: String,
+}
+
+/// Plan local patches with LLM but do **not** write draft.md.
+pub async fn plan_local_revision_preview(
+    projects_root: &Path,
+    config_root: &Path,
+    project: &str,
+    chapter: u32,
+    revision: RevisionOptions,
+    llm: Arc<LlmClient>,
+) -> Result<LocalRevisionPreview> {
+    let project_dir = projects_root.join(project);
+    let existing = read_chapter_draft(&project_dir, chapter).unwrap_or_default();
+    if existing.trim().is_empty() {
+        anyhow::bail!("第{chapter}章无正文，无法规划局部修订");
+    }
+    if revision
+        .user_instructions
+        .as_deref()
+        .map(needs_full_rewrite)
+        .unwrap_or(false)
+        || has_timeline_p0(&revision.audit_issues)
+    {
+        return Ok(LocalRevisionPreview {
+            patches: vec![],
+            summary_markdown: "该指令更适合整章修订，无局部补丁预览。".into(),
+        });
+    }
+    let (targets, ok) = plan_revision(
+        &existing,
+        revision.user_instructions.as_deref(),
+        &revision.audit_issues,
+        &revision.pacing_suggestions,
+    );
+    if !ok || targets.is_empty() {
+        return Ok(LocalRevisionPreview {
+            patches: vec![],
+            summary_markdown: "未能定位可局部修改的段落。".into(),
+        });
+    }
+    let naming = NamingRules::load_from_config_root(config_root);
+    let outline = read_chapter_outline(&project_dir, chapter).unwrap_or_default();
+    let pack = build_chapter_context(
+        &project_dir,
+        chapter,
+        &existing,
+        &outline,
+        ContextProfile::Full,
+    );
+    let (draft_after, applied) = revise_by_local_patches_collect(
+        llm.as_ref(),
+        &existing,
+        &targets,
+        &None,
+        &pack.markdown,
+        &naming.prompt_block(),
+    )
+    .await?;
+    if applied.is_empty() || draft_after == existing {
+        return Ok(LocalRevisionPreview {
+            patches: vec![],
+            summary_markdown: "局部修订未产生有效差异。".into(),
+        });
+    }
+    let mut patches: Vec<LocalPatchPreviewItem> = applied
+        .into_iter()
+        .map(|ap| LocalPatchPreviewItem {
+            start_para: ap.start + 1,
+            end_para: ap.end + 1,
+            before: ap.before.chars().take(2000).collect(),
+            after: ap.after.chars().take(2000).collect(),
+            instruction: ap.instruction,
+        })
+        .collect();
+    // Cache full post-patch draft so apply does not re-run LLM.
+    patches.insert(
+        0,
+        LocalPatchPreviewItem {
+            start_para: 0,
+            end_para: 0,
+            before: String::new(),
+            after: draft_after,
+            instruction: "__full_draft__".into(),
+        },
+    );
+    let visible = patches.len().saturating_sub(1);
+    let mut summary = format!("## 局部修订预览\n共 {visible} 处可见差异。\n");
+    for p in patches.iter().filter(|p| p.instruction != "__full_draft__") {
+        summary.push_str(&format!(
+            "\n### 第{}–{}段\n**−**\n{}\n\n**+**\n{}\n",
+            p.start_para,
+            p.end_para,
+            p.before.chars().take(400).collect::<String>(),
+            p.after.chars().take(400).collect::<String>()
+        ));
+    }
+    Ok(LocalRevisionPreview {
+        patches,
+        summary_markdown: summary,
+    })
+}
+
+/// Apply cached local patches from confirm step (uses `__full_draft__` if present).
+pub fn apply_cached_local_patches(
+    projects_root: &Path,
+    project: &str,
+    chapter: u32,
+    patches: &Value,
+) -> Result<usize> {
+    let project_dir = projects_root.join(project);
+    let Some(arr) = patches.as_array() else {
+        anyhow::bail!("cached_patches 须为数组");
+    };
+    if let Some(full) = arr.iter().find(|p| {
+        p.get("instruction").and_then(|x| x.as_str()) == Some("__full_draft__")
+    }) {
+        let after = full.get("after").and_then(|x| x.as_str()).unwrap_or("");
+        if after.trim().is_empty() {
+            anyhow::bail!("缓存全文为空");
+        }
+        write_chapter_draft(&project_dir, chapter, after)?;
+        return Ok(arr.len().saturating_sub(1).max(1));
+    }
+    let mut draft = read_chapter_draft(&project_dir, chapter).unwrap_or_default();
+    let mut applied = 0usize;
+    for p in arr {
+        let start = p
+            .get("start_para")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(1)
+            .saturating_sub(1) as usize;
+        let end = p
+            .get("end_para")
+            .and_then(|x| x.as_u64())
+            .unwrap_or((start + 1) as u64)
+            .saturating_sub(1) as usize;
+        let after = p.get("after").and_then(|x| x.as_str()).unwrap_or("");
+        if after.is_empty() {
+            continue;
+        }
+        let target = RevisionTarget {
+            instruction: p
+                .get("instruction")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            start,
+            end: end.max(start),
+            quote: String::new(),
+            source: String::new(),
+        };
+        let result = apply_local_patches(&draft, &[target], &[(0, after.to_string())]);
+        if result.used_local_patch {
+            draft = result.draft;
+            applied += 1;
+        }
+    }
+    if applied == 0 {
+        anyhow::bail!("未能应用任何补丁");
+    }
+    write_chapter_draft(&project_dir, chapter, &draft)?;
+    Ok(applied)
+}
+
+#[cfg(test)]
+mod local_patch_confirm_tests {
+    use super::*;
+    use crate::project::{init_project, read_chapter_draft, write_chapter_draft};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn tmp(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "novelx-localpatch-{tag}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_micros()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn apply_cached_full_draft_writes_disk() {
+        let root = tmp("full");
+        let dir = init_project(&root, "book", "未定", 50).unwrap();
+        write_chapter_draft(&dir, 1, "旧正文段落甲。\n\n旧正文段落乙。").unwrap();
+        let patches = json!([
+            {
+                "start_para": 0,
+                "end_para": 0,
+                "before": "",
+                "after": "新正文整章。",
+                "instruction": "__full_draft__"
+            }
+        ]);
+        let n = apply_cached_local_patches(&root, "book", 1, &patches).unwrap();
+        assert!(n >= 1);
+        assert_eq!(read_chapter_draft(&dir, 1).unwrap().trim(), "新正文整章。");
+        let _ = fs::remove_dir_all(&root);
+    }
 }

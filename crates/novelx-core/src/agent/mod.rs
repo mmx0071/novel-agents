@@ -369,5 +369,7 @@ pub fn json_step_result(summary: &str, run: &novelx_pipeline::PipelineRun) -> Va
         "volume_ended_name": run.volume_ended_name,
         "volume_ended_start": run.volume_ended_start,
         "volume_ended_end": run.volume_ended_end,
+        "plots_completed": run.plots_completed,
+        "plot_setting_blocker": run.plot_setting_blocker,
     })
 }

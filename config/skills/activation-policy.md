@@ -28,11 +28,15 @@ Harness 范式：`agents.yaml` 中的 `activation` 条件产生**建议**；本�
 chapter_planner → lore_librarian → writer
 → nomenclature_curator（hook，亦可出现在顺序表中）
 → dialogue_specialist → scene_specialist
+→ pacing_reviewer → literary_editor
 → consistency_auditor → foreshadow_tracker
-→ pacing_reviewer → literary_editor → summarizer → plot_acceptor
+→ summarizer → plot_acceptor
 ```
 
-原则：**先生产、再专改、再质检、再摘要，最后剧情验收**；**发布收尾只在完整章流水线末尾执行一次**（单步 SPAWN 子 Agent 不推进 `next_chapter` / 剧情卡）。
+原则：**先生产、再专改（含节奏/润色）、再一致性质检、再摘要，最后剧情验收**。  
+节奏/润色放在一致性**之前**，避免改稿后破坏时间线/设定且无复审。  
+节奏建议的 P0 **不阻断发布**；仅 consistency 硬 P0 阻断。  
+**发布收尾只在完整章流水线末尾执行一次**（单步 SPAWN 子 Agent 不推进 `next_chapter` / 剧情卡）。
 
 ## Handler 注册（`pipeline.yaml` → `handlers`）
 
@@ -57,11 +61,13 @@ chapter_planner → lore_librarian → writer
 | dialogue_specialist | 对话密集 |
 | scene_specialist | 场景/动作高潮 |
 | foreshadow_tracker | 未收束伏笔 |
-| literary_editor | 风格润色需求 |
+| literary_editor | **非 MVP**。规则建议（近章审校失败率偏高）或 Studio `activate_agents`；用户点名润色时持久激活，勿每章必跑 |
 | master_planner / arc_planner | 尚无总纲/卷纲 |
 
 ## 人工门控
 
-审校后的选项（局部修订 / 接受 / 队列下一步等）见 `config/gates.yaml`：
-每项用 `tool` + `args` 模板（`{{project}}` / `{{chapter}}` …）或 `resolve: skip_volume`，
-不再在 Rust 里按 action 枚举写死工具参数。`steer_run.choice` 用 `revise` / `accept`。
+**仅当一致性审校未通过**（或基础设施失败重试、队列/卷审等系统已 `open_gate`）时，才出现审校决策卡。  
+内容审校失败时优先 **按 issue 决策**（Studio `offer_decisions`，或系统按 P0 兜底），不再固定「整章局部修订 / 接受」二元项。  
+**审校已通过**（即使报告有 P1/P2）**不弹**审校门控；用户要改走 `revise_chapter`。
+
+静态门控模板见 `config/gates.yaml`；动态审校选项由 pending_audit.decision_options 生成。`steer_run` 支持 `issue_ids`。

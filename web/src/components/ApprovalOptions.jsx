@@ -1,3 +1,5 @@
+import MarkdownView from './MarkdownView'
+
 export default function ApprovalOptions({
   prompt,
   options,
@@ -12,7 +14,13 @@ export default function ApprovalOptions({
   const opts = options || []
   return (
     <div className="nx-card nx-approval">
-      {prompt ? <pre className="nx-approval-prompt">{prompt}</pre> : null}
+      {prompt ? (
+        <MarkdownView
+          className="nx-approval-prompt"
+          source={prompt}
+          variant="chat"
+        />
+      ) : null}
       <div className="chat-option-list" role="group" aria-label="请选择下一步">
         <div className="chat-option-hint">请选择下一步（按钮发送选项 id；也可输入序号）</div>
         {opts.map((opt, i) => (

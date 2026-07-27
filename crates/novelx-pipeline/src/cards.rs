@@ -1,8 +1,8 @@
 //! Markdown setting cards (entities / plots) with simple YAML frontmatter.
 
 use serde_json::json;
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 
 /// Soft threshold: sync stubs / thin cards below this are treated incomplete.
 const STUB_BODY_CHARS: usize = 400;
@@ -53,14 +53,11 @@ pub fn entity_status_is_active(status: &str) -> bool {
     )
 }
 
-/// Read `artifacts/arc_outline.md` excerpt for plot design (None if missing/empty).
+/// Read current-volume 卷纲 excerpt for plot design (None if missing/empty).
 pub fn read_arc_outline_excerpt(project_dir: &Path, max_chars: usize) -> Option<String> {
-    let text = std::fs::read_to_string(project_dir.join("artifacts/arc_outline.md")).ok()?;
-    let trimmed = text.trim();
-    if trimmed.chars().count() < 20 {
-        return None;
-    }
-    Some(truncate_chars(trimmed, max_chars))
+    let vol = crate::volume::resolve_arc_outline_volume(project_dir, None);
+    let text = crate::volume::read_arc_outline_text(project_dir, vol)?;
+    Some(truncate_chars(text.trim(), max_chars))
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +131,112 @@ impl MarkdownCard {
             .unwrap_or(from);
         Some((from, to))
     }
+}
+
+/// Atomic identity tokens for entity names like `严国栋（老严）` / `老严（严国栋）`.
+/// Full composite strings are excluded — only parts between / around parentheses.
+pub fn entity_identity_parts(name: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let norm = name
+        .trim()
+        .replace('(', "（")
+        .replace(')', "）");
+    if norm.is_empty() {
+        return out;
+    }
+    let mut buf = String::new();
+    for ch in norm.chars() {
+        if matches!(ch, '（' | '）' | '、' | '/' | '|' | ';' | '；' | ',') {
+            let t = buf.trim().to_string();
+            if !t.is_empty() {
+                out.insert(t);
+            }
+            buf.clear();
+        } else {
+            buf.push(ch);
+        }
+    }
+    let t = buf.trim().to_string();
+    if !t.is_empty() {
+        out.insert(t);
+    }
+    out
+}
+
+/// True when two display names refer to the same entity (paren alias swap / alias subset).
+pub fn entity_names_equivalent(a: &str, b: &str) -> bool {
+    let a = a.trim();
+    let b = b.trim();
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a == b {
+        return true;
+    }
+    let na = a.replace('(', "（").replace(')', "）");
+    let nb = b.replace('(', "（").replace(')', "）");
+    if na == nb {
+        return true;
+    }
+    let ta = entity_identity_parts(&na);
+    let tb = entity_identity_parts(&nb);
+    if ta.is_empty() || tb.is_empty() {
+        return false;
+    }
+    if ta.len() >= 2 && tb.len() >= 2 && ta == tb {
+        return true;
+    }
+    // Bare alias vs `正式名（别名）`
+    if ta.len() == 1 && tb.len() >= 2 && tb.contains(ta.iter().next().unwrap()) {
+        return true;
+    }
+    if tb.len() == 1 && ta.len() >= 2 && ta.contains(tb.iter().next().unwrap()) {
+        return true;
+    }
+    false
+}
+
+/// Resolve write path for an entity: reuse an existing card when names/aliases match.
+/// Returns `(path, existing_card)`.
+pub fn resolve_entity_card_path(
+    folder: &Path,
+    kind: &str,
+    requested_name: &str,
+) -> (PathBuf, Option<MarkdownCard>) {
+    let requested = requested_name.trim();
+    let default = folder.join(format!("{requested}.md"));
+    if requested.is_empty() {
+        return (default, None);
+    }
+    let cards = load_markdown_cards(folder, kind);
+    let mut best: Option<MarkdownCard> = None;
+    for c in cards {
+        let keys = c.match_keys();
+        let hit = keys.iter().any(|k| entity_names_equivalent(k, requested))
+            || entity_names_equivalent(&c.name, requested)
+            || entity_names_equivalent(&c.slug, requested);
+        if !hit {
+            continue;
+        }
+        best = Some(match best {
+            None => c,
+            Some(prev) => {
+                // Prefer the richer / more complete card when several match.
+                if c.complete && !prev.complete {
+                    c
+                } else if c.markdown.len() > prev.markdown.len() {
+                    c
+                } else {
+                    prev
+                }
+            }
+        });
+    }
+    if let Some(card) = best {
+        let path = folder.join(format!("{}.md", card.slug));
+        return (path, Some(card));
+    }
+    (default, None)
 }
 
 /// Load `*.md` cards from a directory.
@@ -231,7 +334,9 @@ fn card_is_complete(meta: &HashMap<String, String>, body: &str) -> bool {
         return false;
     }
     let chars = body.chars().count();
-    if body.contains("## 卷末同步摘要") && chars < STUB_BODY_CHARS {
+    if (body.contains("## 卷末同步摘要") || body.contains("## 剧情同步摘要"))
+        && chars < STUB_BODY_CHARS
+    {
         return false;
     }
     chars > 80
@@ -248,18 +353,22 @@ pub fn collect_entity_gaps(project_dir: &Path) -> Vec<String> {
             all_names.push((group.to_string(), c.name.clone()));
             if !c.complete {
                 gaps.push(format!(
-                    "[{group}]「{}」待补全（短摘要/卷末 stub 或 complete:false）",
+                    "[{group}]「{}」待补全（短摘要/同步 stub 或 complete:false）",
                     c.name
                 ));
-            } else if c.markdown.contains("## 卷末同步摘要")
+            } else if (c.markdown.contains("## 卷末同步摘要")
+                || c.markdown.contains("## 剧情同步摘要"))
                 && c.markdown.chars().count() < STUB_BODY_CHARS
             {
-                gaps.push(format!("[{group}]「{}」仍以卷末同步摘要为主，建议补全设定卡", c.name));
+                gaps.push(format!(
+                    "[{group}]「{}」仍以同步摘要为主，建议补全设定卡",
+                    c.name
+                ));
             }
         }
     }
 
-    // Near-duplicate filenames / display names (prefix collision).
+    // Near-duplicate filenames / display names (paren alias swap / prefix).
     for i in 0..all_names.len() {
         for j in (i + 1)..all_names.len() {
             let (g1, n1) = &all_names[i];
@@ -267,8 +376,10 @@ pub fn collect_entity_gaps(project_dir: &Path) -> Vec<String> {
             if g1 != g2 {
                 continue;
             }
-            if n1 == n2 {
-                gaps.push(format!("[{g1}] 重复卡名「{n1}」"));
+            if n1 == n2 || entity_names_equivalent(n1, n2) {
+                gaps.push(format!(
+                    "[{g1}] 疑似重复：「{n1}」与「{n2}」，建议合并后 delete_entity"
+                ));
                 continue;
             }
             let (a, b) = if n1.chars().count() <= n2.chars().count() {
@@ -368,6 +479,13 @@ mod tests {
         assert_eq!(normalize_entity_status("已消耗"), "consumed");
         assert!(entity_status_is_active("background"));
         assert!(!entity_status_is_active("exited"));
+    }
+
+    #[test]
+    fn paren_alias_names_are_equivalent() {
+        assert!(entity_names_equivalent("严国栋（老严）", "老严（严国栋）"));
+        assert!(entity_names_equivalent("老严", "严国栋（老严）"));
+        assert!(!entity_names_equivalent("周荣", "严国栋（老严）"));
     }
 
     #[test]

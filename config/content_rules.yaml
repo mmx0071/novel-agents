@@ -1,0 +1,120 @@
+# 正文硬规则（确定性扫描）— 发布门控
+# Rust 只保留通用引擎；开关 / 词表 / 阈值 / 文案模板在此编辑。
+# Web「配置 → 硬规则」可查看与保存；保存后下次写章/审校即生效。
+
+rules:
+  banned_name:
+    enabled: true
+    title: 禁名
+    description: 正文不得出现 naming_rules.yaml 中的禁名（名单见「禁名」页）。
+    blocking: true
+
+  contradiction_marker:
+    enabled: true
+    title: 矛盾标记残留
+    description: 正文不得残留管道内部标记。
+    blocking: true
+    marker: "[CONTRADICTION]"
+    message: "正文残留 {marker} 标记"
+
+  too_many_new_facts:
+    enabled: true
+    title: 新事实标记过多
+    description: 单章 [NEW_FACT:…] 标记数量上限。
+    blocking: true
+    max_count: 8
+    pattern: "\\[NEW_FACT:[^\\]]+\\]"
+    message: "[NEW_FACT] 过多（{count}），需收敛"
+
+  meta_chapter_ref:
+    enabled: true
+    title: 章号元叙述
+    description: 非标题行不得用「第N章」指称情节；标题行 `# 第N章 …` 允许。
+    blocking: true
+    pattern: "第\\s*[一二三四五六七八九十百千零〇两\\d]+\\s*章"
+    allow_heading: true
+    rewrite_replacement: "此前"
+    message: "正文出现章号元叙述「{match}」（约第{line}行）：角色不应知道「第N章」；改用故事内时间/事件指称（如「上次会面时」「那次事故之后」）"
+
+  timeline_countdown_jump:
+    enabled: true
+    title: 倒计时回跳
+    description: 「还剩/剩余」当前读数须单调不增；回忆初始值须带豁免词。
+    blocking: true
+    recall_markers:
+      - 最初
+      - 原先
+      - 开始时
+      - 开始时是
+      - 曾经
+      - 那时
+      - 当时还
+      - 刚才还是
+      - 刚才还剩
+      - 想起
+      - 回忆
+      - 梦里
+      - 梦中
+      - 总额
+      - 一共
+      - 总共
+      - 原先是
+    message: "章内倒计时/剩余时长回跳：约第{prev_line}行「还剩/剩余 ≈ {prev_secs}秒」之后，约第{line}行变成更大读数「≈ {secs}秒」。当前读数须单调递减；回忆初始值须标明「最初/原先」。依据：…{prev_snippet}… → …{snippet}…"
+
+  timeline_daypart_regression:
+    enabled: true
+    title: 时段叙述回跳
+    description: 同日时段词不得明显回跳；须有跨日标记。对话引号内与「到凌晨」类区间不计入。
+    blocking: true
+    regression_gap: 2
+    dayparts:
+      - { word: 凌晨, rank: 0 }
+      - { word: 黎明, rank: 1 }
+      - { word: 清晨, rank: 2 }
+      - { word: 早晨, rank: 3 }
+      - { word: 上午, rank: 4 }
+      - { word: 中午, rank: 5 }
+      - { word: 午后, rank: 6 }
+      - { word: 下午, rank: 7 }
+      - { word: 傍晚, rank: 8 }
+      - { word: 黄昏, rank: 9 }
+      - { word: 夜里, rank: 10 }
+      - { word: 夜晚, rank: 10 }
+      - { word: 深夜, rank: 11 }
+      - { word: 半夜, rank: 12 }
+    overnight_markers:
+      - 翌日
+      - 次日
+      - 第二天
+      - 隔日
+      - 天亮
+      - 过了一夜
+      - 一夜之后
+      - 睡到
+      - 醒来已是
+      - 回忆
+      - 想起
+      - 梦里
+      - 梦中
+      - 那时
+      - 当初
+    recall_markers:
+      - 最初
+      - 原先
+      - 开始时
+      - 曾经
+      - 那时
+      - 想起
+      - 回忆
+      - 梦里
+      - 梦中
+    schedule_range_patterns:
+      - 到凌晨
+      - 至凌晨
+      - 到黎明
+      - 至黎明
+      - 到清晨
+      - 至清晨
+      - 到早上
+      - 至早上
+    message: "章内时段叙述回跳：约第{prev_line}行已到「{prev_word}」，约第{line}行又写「{word}」，且未见「翌日/天亮/过了一夜」等跨日交代。请理顺叙事时间或补跨日过渡。"

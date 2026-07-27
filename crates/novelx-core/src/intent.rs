@@ -30,6 +30,8 @@ pub enum ExtractMode {
     Chapter,
     ChapterOptional,
     ChapterRange,
+    /// Optional `第N卷` → `volume` arg (e.g. list_plots filter).
+    VolumeOptional,
 }
 
 impl Default for ExtractMode {
@@ -188,6 +190,11 @@ fn build_match(spec: &IntentSpec, t: &str, project: Option<&str>) -> Option<Inte
             args["to"] = json!(to);
             args["action"] = json!("start");
         }
+        ExtractMode::VolumeOptional => {
+            if let Some(volume) = parse_volume_number(t) {
+                args["volume"] = json!(volume);
+            }
+        }
     }
 
     // Resume an in-progress multi-chapter audit queue.
@@ -195,14 +202,19 @@ fn build_match(spec: &IntentSpec, t: &str, project: Option<&str>) -> Option<Inte
         args["action"] = json!("continue");
     }
 
-    if spec.tool == "revise_chapter" {
+    if spec.tool == "revise_chapter" || spec.tool == "revise_outline" {
         let min = spec.instructions_min_chars.unwrap_or(24);
+        let fallback = if spec.tool == "revise_outline" {
+            "按用户要求修订本章章纲。"
+        } else {
+            "按用户要求修订本章。"
+        };
         let instructions = if t.chars().count() >= min {
             t.to_string()
         } else {
             spec.default_instructions
                 .clone()
-                .unwrap_or_else(|| "按用户要求修订本章。".into())
+                .unwrap_or_else(|| fallback.into())
         };
         args["instructions"] = json!(instructions);
     }
@@ -229,6 +241,27 @@ pub fn parse_chapter_number(text: &str) -> Option<u32> {
         if text.contains(&format!("第{s}章")) {
             return Some(n as u32);
         }
+    }
+    None
+}
+
+pub fn parse_volume_number(text: &str) -> Option<u32> {
+    for n in (1..=99).rev() {
+        if text.contains(&format!("第{n}卷")) || text.contains(&format!("volume {n}")) {
+            return Some(n);
+        }
+    }
+    const CN: &[&str] = &[
+        "", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "十一", "十二", "十三",
+        "十四", "十五", "十六", "十七", "十八", "十九", "二十",
+    ];
+    for (n, s) in CN.iter().enumerate().skip(1) {
+        if text.contains(&format!("第{s}卷")) {
+            return Some(n as u32);
+        }
+    }
+    if text.contains("本卷") || text.contains("这一卷") || text.contains("该卷") {
+        return None; // caller may still list all; no numeric filter
     }
     None
 }
@@ -330,6 +363,15 @@ mod tests {
         assert_eq!(rev.tool, "revise_chapter");
         assert_eq!(rev.args["chapter"], 5);
 
+        let outline = r.match_text("修正第五章章纲：加强章末钩子", Some("demo")).unwrap();
+        assert_eq!(outline.tool, "revise_outline");
+        assert_eq!(outline.args["chapter"], 5);
+        assert!(outline.args["instructions"].as_str().unwrap().contains("章纲"));
+
+        let outline2 = r.match_text("改第2章章纲，补地点名单", Some("demo")).unwrap();
+        assert_eq!(outline2.tool, "revise_outline");
+        assert_eq!(outline2.args["chapter"], 2);
+
         assert!(r.match_text("今天天气不错", Some("demo")).is_none());
         assert!(r.match_text("写第10章", None).is_none());
 
@@ -353,6 +395,24 @@ mod tests {
         assert_eq!(cont.id, "audit_queue_continue");
         assert_eq!(cont.tool, "audit_chapters");
         assert_eq!(cont.args["action"], "continue");
+
+        // Status questions must list plots — never continue_writing.
+        let plots = r
+            .match_text("对照剧情卡 现在到哪了", Some("demo"))
+            .unwrap();
+        assert_eq!(plots.id, "plot_status");
+        assert_eq!(plots.tool, "list_plots");
+        let plots2 = r.match_text("目前的剧情推进到哪了", Some("demo")).unwrap();
+        assert_eq!(plots2.id, "plot_status");
+        let plots3 = r.match_text("剧情进行到哪了", Some("demo")).unwrap();
+        assert_eq!(plots3.id, "plot_status");
+        assert_eq!(plots3.tool, "list_plots");
+        let plots4 = r.match_text("第三卷进行到哪了", Some("demo")).unwrap();
+        assert_eq!(plots4.id, "plot_status");
+        assert_eq!(plots4.tool, "list_plots");
+        assert_eq!(plots4.args["volume"], 3);
+        assert_eq!(parse_volume_number("第三卷进度"), Some(3));
+        assert_eq!(parse_volume_number("第3卷到哪了"), Some(3));
     }
 
     #[test]

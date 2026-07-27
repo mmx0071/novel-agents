@@ -14,7 +14,8 @@ mod plot;
 pub use arc::{display_arc_outline, validate_arc_outline};
 pub use bible::{display_bible, validate_bible};
 pub use chapter_outline::{
-    display_chapter_outline, parse_chapter_outline_text, validate_chapter_outline, ChapterOutline,
+    display_chapter_outline, outline_entity_roster, parse_chapter_outline_text,
+    validate_chapter_outline, ChapterOutline, OutlineEntityRoster,
 };
 pub use draft::{display_draft, normalize_draft_best_effort, validate_draft, MIN_DRAFT_BODY_CHARS};
 pub use entity::{
@@ -22,10 +23,11 @@ pub use entity::{
     EntityKind,
 };
 pub use error::SchemaError;
-pub use master::{display_master_outline, validate_master_outline};
+pub use master::{display_master_outline, normalize_master_outline_input, validate_master_outline};
 pub use migrate::{migrate_project_reader_formats, MigrateReport};
 pub use plot::{
-    display_plot_card_body, validate_plot_card, validate_plot_card_body_edit,
+    display_plot_card_body, normalize_plot_card_best_effort, validate_plot_card,
+    validate_plot_card_body_edit,
 };
 
 /// Fixed entity-gaps reader text (computed list; no on-disk file).

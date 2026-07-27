@@ -42,6 +42,10 @@ impl FeatureFlags {
         m.insert("studio.reject_weak_ui_turns".into(), true);
         m.insert("studio.enforce_setup_gate".into(), true);
         m.insert("studio.enforce_volume_phase".into(), true);
+        m.insert("studio.enforce_chapter_order".into(), true);
+        m.insert("studio.require_mutation_confirm".into(), true);
+        m.insert("studio.impact_cascade".into(), true);
+        m.insert("studio.impact_llm_refine".into(), false);
         Self { map: Arc::new(m) }
     }
 
@@ -76,6 +80,31 @@ impl FeatureFlags {
     pub fn enforce_volume_phase(&self) -> bool {
         self.map
             .get("studio.enforce_volume_phase")
+            .copied()
+            .unwrap_or(true)
+    }
+
+    pub fn require_mutation_confirm(&self) -> bool {
+        self.map
+            .get("studio.require_mutation_confirm")
+            .copied()
+            .unwrap_or(true)
+    }
+
+    pub fn impact_cascade(&self) -> bool {
+        self.map
+            .get("studio.impact_cascade")
+            .copied()
+            .unwrap_or(true)
+    }
+
+    pub fn impact_llm_refine(&self) -> bool {
+        self.enabled("studio.impact_llm_refine")
+    }
+
+    pub fn enforce_chapter_order(&self) -> bool {
+        self.map
+            .get("studio.enforce_chapter_order")
             .copied()
             .unwrap_or(true)
     }

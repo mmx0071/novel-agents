@@ -1,69 +1,58 @@
 # Agent 注册表 — MVP 默认启用，扩展 Agent 按需激活
-# Phase B：activation 条件仅产生「建议」，由 Orchestrator LLM + activation-policy Skill 决策；
-# 运行时可用工具 activate_agents 显式激活扩展 Agent
+# activation 条件只产生「建议」；本章步骤 =
+#   resolve_pipeline_agents(active_agents ∪ pipeline.mvp ∪ suggestions)
+# 按 config/pipeline.yaml 的 order 执行（无独立 Orchestrator LLM）。
+# 亦可用工具 activate_agents 显式激活扩展 Agent。
 
 agents:
-  # ── MVP 最小集（默认 active） ──
-  orchestrator:
-    name: Orchestrator
-    layer: orchestration
-    tier: mvp
-    default_active: true
-    description: 任务调度、依赖解析、冲突仲裁、状态机推进
+  # ── MVP / Studio 注册（实际章节步骤见 pipeline.yaml mvp∪order） ──
 
   studio_agent:
     name: NovelX Agent
     layer: orchestration
     tier: mvp
-    default_active: true
     description: NovelX 调度层 — REACT 解析用户意图，分配给功能 Agent
 
   chapter_planner:
-    name: Chapter Planner
+    name: 章纲规划
     layer: story
     tier: mvp
-    default_active: true
     description: 输出单章详细章纲
     depends_on: []
 
   writer:
-    name: Writer
+    name: 正文写作
     layer: production
     tier: mvp
-    default_active: true
     description: 按章纲撰写正文初稿
     depends_on: [chapter_planner]
 
   consistency_auditor:
-    name: Consistency Auditor
+    name: 一致性审计
     layer: qa
     tier: mvp
-    default_active: true
     description: 检查人物、时间线、设定一致性
     depends_on: [writer]
 
   summarizer:
-    name: Summarizer
+    name: 章节摘要
     layer: memory
     tier: mvp
-    default_active: true
     description: 生成章节摘要与新事实清单
     depends_on: [consistency_auditor]
 
   plot_acceptor:
-    name: Plot Acceptor
+    name: 剧情验收
     layer: story
     tier: mvp
-    default_active: true
     description: 对照进行中剧情卡收束条件验收本章；通过则自动 completed
     depends_on: [summarizer]
 
   # ── 扩展 Agent（按需激活） ──
   world_architect:
-    name: World Architect
+    name: 世界观架构
     layer: world
     tier: extended
-    default_active: false
     description: 搭建世界观 Bible
     activation:
       - condition: no_bible
@@ -72,10 +61,9 @@ agents:
         reason: 设定变更超过 3 次未同步 Bible
 
   lore_librarian:
-    name: Lore Librarian
+    name: 设定检索
     layer: world
     tier: mvp
-    default_active: true
     description: 维护结构化知识库，章纲后 query、摘要后 assert
     depends_on: [chapter_planner]
     activation:
@@ -87,10 +75,9 @@ agents:
         reason: 已发布超过 5 章，需要 RAG 检索
 
   nomenclature_curator:
-    name: Nomenclature Curator
+    name: 名词管理
     layer: world
     tier: extended
-    default_active: false
     description: 为人物/物品/设定取名，名与能力语义绑定，规避语料高频名
     activation:
       - condition: no_nomenclature
@@ -101,10 +88,9 @@ agents:
         reason: 本章出现未登记的新实体待命名
 
   master_planner:
-    name: Master Planner
+    name: 总纲规划
     layer: story
     tier: extended
-    default_active: false
     description: 制定总纲
     activation:
       - condition: no_master_outline
@@ -114,10 +100,9 @@ agents:
         reason: 超过 30 章需复盘总纲偏离度
 
   arc_planner:
-    name: Arc Planner
+    name: 卷纲规划
     layer: story
     tier: extended
-    default_active: false
     description: 规划单卷/故事弧
     activation:
       - condition: no_arc_outline
@@ -127,10 +112,9 @@ agents:
         reason: 本卷已有 8+ 章但未规划卷纲
 
   dialogue_specialist:
-    name: Dialogue Specialist
+    name: 对话专改
     layer: production
     tier: extended
-    default_active: false
     description: 专改对话声线与潜台词
     activation:
       - condition: dialogue_ratio_gt
@@ -141,10 +125,9 @@ agents:
         reason: 同场对话人物超过 4 人
 
   scene_specialist:
-    name: Scene Specialist
+    name: 场景专改
     layer: production
     tier: extended
-    default_active: false
     description: 专改场景与动作描写
     activation:
       - condition: has_scene_tags
@@ -152,10 +135,9 @@ agents:
         reason: 章纲标记为战斗/追逐/高潮场景
 
   foreshadow_tracker:
-    name: Foreshadow Tracker
+    name: 伏笔追踪
     layer: qa
     tier: extended
-    default_active: false
     description: 追踪伏笔埋收
     activation:
       - condition: active_foreshadows_gt
@@ -166,37 +148,35 @@ agents:
         reason: 超过 10 章需系统化伏笔管理
 
   pacing_reviewer:
-    name: Pacing Reviewer
+    name: 节奏审查
     layer: qa
     tier: mvp
-    default_active: true
-    description: 检查节奏与信息密度
+    # 已在 pipeline.yaml mvp，每章必跑；下列 activation 仅兼容旧逻辑/说明，不表示「超阈值才审」。
+    description: 检查节奏与信息密度（MVP 每章必跑；节奏 P0 不阻断发布）
     activation:
       - condition: word_count_gt
         threshold: 5000
-        reason: 本章超过 5000 字需节奏审查
+        reason: 本章超过 5000 字（提示加严节奏审，非启用门槛）
       - condition: audit_fail_rate_gt
         threshold: 0.2
-        reason: 近 5 章质检 FAIL 率超过 20%
+        reason: 近 5 章质检 FAIL 率超过 20%（提示加严节奏审）
 
   literary_editor:
-    name: Literary Editor
+    name: 文学润色
     layer: qa
     tier: extended
-    default_active: false
-    description: 润色表达、去 AI 腔
+    description: 润色表达、去 AI 腔（非 MVP；activation 建议 + Studio activate_agents）
     activation:
-      # Minimal rule activation: avoid always-on (costly); unlock after a few chapters.
-      - condition: chapter_count_gt
-        threshold: 3
-        reason: 已发布超过 3 章，启用文学编辑
+      # 续写规划时 draft 多为空，勿用 word_count。用户点名润色由 Studio 持久激活。
+      - condition: audit_fail_rate_gt
+        threshold: 0.25
+        reason: 近章审校失败率偏高，建议润色压重复与表述问题
 
   # ── 介入式设定 Agent（不进章流水线，由 NovelX / hook 调用）──
   entity_designer:
-    name: Entity Designer
+    name: 设定卡设计
     layer: world
     tier: extended
-    default_active: false
     description: 新增/补全人物·物品·地点设定卡，写入前过冲突审计
     activation:
       - condition: has_new_entity_hints
@@ -205,11 +185,10 @@ agents:
         reason: 尚无实体体系，需要设计卡
 
   setting_auditor:
-    name: Setting Auditor
+    name: 设定审计
     layer: qa
     tier: extended
-    default_active: false
-    description: 设定层冲突审计（规则体系/人设/物品/重复），不审章正文
+    description: 设定层冲突/遗漏/异常审计（含 stub 缺口与摘要漂移）；剧情收束后自动巡检
     activation:
       - condition: has_bible
         reason: 已有 Bible，设定变更需冲突审计
@@ -218,10 +197,9 @@ agents:
         reason: 实体增多，需设定一致性审计
 
   plot_designer:
-    name: Plot Designer
+    name: 剧情卡设计
     layer: story
     tier: extended
-    default_active: false
     description: 为大纲整卷或卷内局部设计剧情卡，写入前过冲突审计
     activation:
       - condition: no_master_outline

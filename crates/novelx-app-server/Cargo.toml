@@ -9,6 +9,7 @@ axum = { workspace = true }
 chrono = { workspace = true }
 futures-util = { workspace = true }
 novelx-core = { workspace = true }
+novelx-harness = { workspace = true }
 novelx-llm = { workspace = true }
 novelx-pipeline = { workspace = true }
 novelx-protocol = { workspace = true }

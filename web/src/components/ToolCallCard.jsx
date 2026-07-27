@@ -4,6 +4,7 @@ import {
   getBulkReadNav,
   isBulkContextTool,
 } from './toolMarkup'
+import { toolLabelZh, toolVerbZh } from './toolLabels'
 
 /**
  * Codex-like tool cell.
@@ -16,7 +17,13 @@ export default function ToolCallCard({ item, project, onReaderJump }) {
   const nav = bulk
     ? getBulkReadNav(item.name, item.arguments, item.output, project)
     : null
-  const showExpandableBody = !bulk && !!(item.output || formatArgsSummary(item.arguments))
+  // Always allow a body while running — otherwise mid-tool turns only show a
+  // header spinner and the "回合 N" separator looks like the only activity.
+  const showExpandableBody = !bulk && (
+    status === 'in_progress'
+    || status === 'failed'
+    || !!(item.output || formatArgsSummary(item.arguments))
+  )
   const [open, setOpen] = useState(
     !bulk
       && (status === 'in_progress'
@@ -31,12 +38,19 @@ export default function ToolCallCard({ item, project, onReaderJump }) {
     if (!bulk && status === 'in_progress') setOpen(true)
   }, [bulk, status])
 
-  // Follow latest ▶ / ✓ lines inside the card's own scroll box.
+  // Follow latest ▶ / ✓ lines inside the card — rAF-throttle to avoid layout thrash.
+  const scrollRafRef = useRef(0)
   useEffect(() => {
     if (bulk || !open) return
-    const el = outRef.current
-    if (!el) return
-    el.scrollTop = el.scrollHeight
+    if (scrollRafRef.current) cancelAnimationFrame(scrollRafRef.current)
+    scrollRafRef.current = requestAnimationFrame(() => {
+      scrollRafRef.current = 0
+      const el = outRef.current
+      if (el) el.scrollTop = el.scrollHeight
+    })
+    return () => {
+      if (scrollRafRef.current) cancelAnimationFrame(scrollRafRef.current)
+    }
   }, [bulk, open, item.output, status])
 
   const jump = (link) => {
@@ -55,7 +69,7 @@ export default function ToolCallCard({ item, project, onReaderJump }) {
           <span className="nx-toolcell-bullet" aria-hidden="true">
             {status === 'completed' ? '✓' : status === 'failed' ? '✕' : '•'}
           </span>
-          <span className="nx-toolcell-verb">{verbForBulk(status)}</span>
+          <span className="nx-toolcell-verb">{toolVerbZh(status, { bulk: true })}</span>
           <span className="nx-toolcell-name nx-toolcell-readlabel">
             {status === 'in_progress' && !nav ? (
               <>正在阅读《{project || item.arguments?.project || '小说'}》…</>
@@ -82,7 +96,7 @@ export default function ToolCallCard({ item, project, onReaderJump }) {
                 ) : null}
               </>
             ) : (
-              item.name
+              toolLabelZh(item.name)
             )}
           </span>
           {item.duration_ms != null && status !== 'in_progress' ? (
@@ -100,8 +114,8 @@ export default function ToolCallCard({ item, project, onReaderJump }) {
           <span className="nx-toolcell-bullet" aria-hidden="true">
             {status === 'completed' ? '✓' : status === 'failed' ? '✕' : '•'}
           </span>
-          <span className="nx-toolcell-verb">{verbFor(status)}</span>
-          <span className="nx-toolcell-name">{item.name}</span>
+          <span className="nx-toolcell-verb">{toolVerbZh(status)}</span>
+          <span className="nx-toolcell-name">{toolLabelZh(item.name)}</span>
           {argsSummary ? (
             <span className="nx-toolcell-args">· {argsSummary}</span>
           ) : null}
@@ -141,20 +155,6 @@ function normalizeStatus(s) {
     return 'in_progress'
   }
   return 'in_progress'
-}
-
-function verbFor(status) {
-  if (status === 'completed') return 'Ran'
-  if (status === 'failed') return 'Failed'
-  if (status === 'cancelled') return 'Cancelled'
-  return 'Running'
-}
-
-function verbForBulk(status) {
-  if (status === 'failed') return 'Failed'
-  if (status === 'cancelled') return 'Cancelled'
-  if (status === 'completed') return 'Read'
-  return 'Reading'
 }
 
 function formatDur(ms) {

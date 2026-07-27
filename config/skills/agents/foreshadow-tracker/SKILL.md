@@ -62,6 +62,13 @@ description: 追踪伏笔埋设与回收状态，评估悬念递进与悬空风�
 - 无新变化时数组可空，但不要省略字段
 - 只输出 JSON，不要 markdown
 
+## 与 Summarizer 的分工
+
+| 通道 | 职责 | 权威性 |
+|------|------|--------|
+| `foreshadow_tracker`（本 Agent） | 结构化 `buried` / `resolved` / `dangling`，写入 `foreshadow.json` 与线索库 | **权威**：冲突时以本输出为准 |
+| `summarizer.foreshadow_updates` | 章摘要附带的轻量伏笔动态，供下章记忆/Lore | 辅助；不得把本 Agent 已 `resolved` 的条目改回悬空 |
+
 ## 原则
 
 - 客观可验证；勿把普通环境描写一律标成伏笔

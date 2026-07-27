@@ -1,0 +1,8 @@
+2026-07-24T06:37:45.271989Z  INFO novelx_llm: LLM profile=dev: all tasks use cheapest/fastest model force=deepseek-v4-flash
+2026-07-24T06:37:45.272103Z  INFO novelx_llm: LLM client ready env=DEEPSEEK_API_KEY model=deepseek-v4-flash base=https://api.deepseek.com/v1 tasks=7
+2026-07-24T06:37:45.277817Z  INFO novelx_core::intent: studio intents loaded count=7
+2026-07-24T06:37:45.279047Z  INFO novelx_core::gates: studio gates loaded count=18
+2026-07-24T06:37:45.279302Z  INFO novelx_core::features: studio features loaded count=10
+2026-07-24T06:37:45.279657Z  INFO novelx_harness::policies: studio policies loaded
+2026-07-24T06:37:45.281474Z  INFO novelx_app_server: serving web UI from /Users/xiongchongyang/Projects/novel-agents/web/dist
+2026-07-24T06:37:45.281741Z  INFO novelx_app_server: NovelX listening on http://127.0.0.1:8765

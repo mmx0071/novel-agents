@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import SkillPopup from './SkillPopup'
 import TodoList from './TodoList'
 import TurnTimeline from './TurnTimeline'
@@ -10,6 +10,7 @@ import {
   readerTabForBulkTool,
   stripToolMarkup,
 } from './toolMarkup'
+import { stepLabelZh, toolLabelZh } from './toolLabels'
 
 const API = '/api'
 
@@ -22,7 +23,9 @@ function normalizeItem(raw) {
   if (!raw) return null
   const type = raw.type
   const status = normalizeWireStatus(raw.status)
-  return { ...raw, type, status, _key: raw.id || `${type}-${Math.random()}` }
+  // Stable key — Math.random() remounted rows every delta and made Turn N flash.
+  const key = raw.id || raw._key || `${type}:${raw.name || raw.agent || 'x'}`
+  return { ...raw, type, status, _key: key }
 }
 
 /** Wire may send camelCase (inProgress) or PascalCase (Completed). */
@@ -54,6 +57,22 @@ function finishOpenItems(items) {
   })
 }
 
+/** Close prior turns so only `keepId` can show streaming carets /「进行中」. */
+function sealOtherTurns(turns, keepId) {
+  return (turns || []).map((t) => {
+    if (!t || t.id === keepId) return t
+    if (t.status !== 'running' && t.status !== 'awaiting') {
+      return t.approval ? { ...t, approval: null } : t
+    }
+    return {
+      ...t,
+      status: 'complete',
+      approval: null,
+      items: finishOpenItems(t.items),
+    }
+  })
+}
+
 /** Audit/revise often stream a gate line before ItemCompleted arrives. */
 function looksLikeToolGateDone(output) {
   if (!output) return false
@@ -79,6 +98,7 @@ function isAuditToolName(name) {
 const PREVIEW_MUTATING_TOOLS = new Set([
   'continue_writing',
   'revise_chapter',
+  'revise_outline',
   'design_plot',
   'update_plot',
   'design_entity',
@@ -109,12 +129,17 @@ function looksLikePreviewStepDone(delta) {
 function readerHintFromPipelineDelta(delta) {
   if (!delta) return null
   const t = String(delta)
-  // 章纲：仅 chapter_planner 落盘后刷新（审校/润色流式不碰阅读区）
-  if (/✓\s+chapter_planner\b/i.test(t)) {
+  // 章纲：仅章纲规划落盘后刷新（审校/润色流式不碰阅读区）
+  // 不用 \b：中文标签后紧跟「:」时 JS 词边界不可靠。
+  if (/✓\s+(?:chapter_planner|章纲规划)(?:\b|[:：\s]|$)/i.test(t)) {
     return { focusLatestChapter: true, readerTab: 'outline' }
   }
-  // 正文：仅 writer 间歇落盘 / writer 步骤完成。literary / 审校 / 专改只在工具卡流式。
-  if (/正文已写入/i.test(t) || /↻\s*draft/i.test(t) || /✓\s+writer\b/i.test(t)) {
+  // 正文：仅写作间歇落盘 / 正文写作步骤完成。文学润色 / 审校 / 专改只在工具卡流式。
+  if (
+    /正文已写入/i.test(t)
+    || /↻\s*draft/i.test(t)
+    || /✓\s+(?:writer|正文写作)(?:\b|[:：\s]|$)/i.test(t)
+  ) {
     return { focusLatestChapter: true, readerTab: 'draft' }
   }
   return null
@@ -140,7 +165,50 @@ function normalizeServerGate(gate) {
       id: o.id || o.label,
       label: o.label || o.id || '',
     })),
+    // Keep preview so restore can re-attach DraftPatch / MutationPreview cards.
+    preview: gate.preview || null,
+    kind: gate.kind || null,
+    mutation_kind: gate.mutation_kind || null,
   }
+}
+
+/** Attach open_gate.preview diffs/markdown onto the last turn's items (HTTP restore). */
+function attachGatePreviewItems(turns, gate) {
+  if (!Array.isArray(turns) || !turns.length || !gate?.preview) return turns
+  const preview = gate.preview
+  const items = []
+  const diffs = Array.isArray(preview.diffs) ? preview.diffs : []
+  for (const d of diffs) {
+    items.push({
+      type: 'draft_patch',
+      status: 'completed',
+      project: preview.project || '',
+      chapter: preview.chapter || 0,
+      start_para: d.start_para || 1,
+      end_para: d.end_para || d.start_para || 1,
+      before: d.before || '',
+      after: d.after || '',
+    })
+  }
+  if (!items.length && (preview.markdown || preview.fields)) {
+    items.push({
+      type: 'mutation_preview',
+      status: 'completed',
+      kind: gate.mutation_kind || preview.kind || 'mutation',
+      markdown: preview.markdown || '',
+      fields: preview.fields || null,
+    })
+  }
+  if (!items.length) return turns
+  return turns.map((t, idx) => {
+    if (idx !== turns.length - 1) return t
+    const existing = Array.isArray(t.items) ? t.items : []
+    const hasPreview = existing.some(
+      (it) => it?.type === 'draft_patch' || it?.type === 'mutation_preview',
+    )
+    if (hasPreview) return t
+    return { ...t, items: [...existing, ...items] }
+  })
 }
 
 /** Prefer approval already on the last turn (from gates.yaml via server). */
@@ -302,6 +370,65 @@ function compactToolItem(item, project) {
   return { ...item, output: summary }
 }
 
+/** Prefer the richer timeline so HTTP restore / remount cannot flash-back mid-turn. */
+function turnsContentScore(turns) {
+  if (!Array.isArray(turns) || !turns.length) return 0
+  let score = turns.length * 10
+  for (const t of turns) {
+    for (const it of t.items || []) {
+      score += 3
+      if (it.type === 'tool_call') score += String(it.output || '').length
+      if (it.type === 'agent_message') score += String(it.text || '').length
+      if (it.type === 'draft_patch' || it.type === 'mutation_preview' || it.type === 'audit_report') {
+        score += 80
+      }
+    }
+    if (t.approval) score += 40
+  }
+  return score
+}
+
+function pickRicherTurns(candidate, current) {
+  if (!candidate?.length) return null
+  if (!current?.length) return candidate
+  return turnsContentScore(candidate) >= turnsContentScore(current) ? candidate : null
+}
+
+/** When ui_turns only kept Read tool cards, recover NovelX prose from messages. */
+function mergeAgentProseFromMessages(serverTurns, fromMessages) {
+  if (!serverTurns?.length) return fromMessages || serverTurns
+  if (!fromMessages?.length) return serverTurns
+  const proseFrom = [...fromMessages].reverse().find((t) => (
+    (t.items || []).some((it) => it.type === 'agent_message' && String(it.text || '').trim())
+  ))
+  const proseItems = (proseFrom?.items || []).filter((it) => (
+    it.type === 'agent_message' && String(it.text || '').trim()
+  ))
+  if (!proseItems.length) return serverTurns
+  return serverTurns.map((turn, idx) => {
+    const isLast = idx === serverTurns.length - 1
+    if (!isLast) return turn
+    const items = [...(turn.items || [])]
+    const hasProse = items.some((it) => it.type === 'agent_message' && String(it.text || '').trim())
+    if (hasProse) return turn
+    // Drop empty leading NovelX placeholders; append recovered answer after tools.
+    const withoutEmptyAgent = items.filter((it) => !(
+      it.type === 'agent_message' && !String(it.text || '').trim()
+    ))
+    return {
+      ...turn,
+      items: [
+        ...withoutEmptyAgent,
+        ...proseItems.map((it, i) => ({
+          ...it,
+          id: it.id || `recovered-agent-${i}`,
+          status: 'completed',
+        })),
+      ],
+    }
+  })
+}
+
 /**
  * Codex-style NovelX chat:
  * - Turn timeline with separators
@@ -322,24 +449,88 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
   const [activity, setActivity] = useState('')
   const [todos, setTodos] = useState([])
   const [setupGateOpen, setSetupGateOpen] = useState(false)
+  /** Sticky id for「回合 N · 进行中」— ignores mid-stream status flaps. */
+  const [liveTurnId, setLiveTurnId] = useState('')
   const wsRef = useRef(null)
   const endRef = useRef(null)
+  const messagesRef = useRef(null)
+  const followChatBottomRef = useRef(true)
+  /** Ignore scroll events caused by our own stick-to-bottom writes. */
+  const pinningScrollRef = useRef(false)
+  const chatScrollRafRef = useRef(0)
   const activeTurnRef = useRef('')
   const readyRef = useRef(false)
   const loadingRef = useRef(false)
   loadingRef.current = loading
+  const turnsRef = useRef(turns)
+  turnsRef.current = turns
   const previewRefreshAtRef = useRef(0)
   const previewRefreshTimerRef = useRef(null)
+  /** Coalesce tool output into React state (~8fps) so Turn separators don't repaint every token. */
+  const toolDeltaBufRef = useRef(new Map())
+  const toolDeltaTimerRef = useRef(0)
+  /** Latest handlers for WS — keep connectWs / mount effect identity stable. */
+  const handleEventRef = useRef(() => {})
+  const wsPendingRef = useRef([])
 
   useEffect(() => () => {
     if (previewRefreshTimerRef.current) clearTimeout(previewRefreshTimerRef.current)
+    if (toolDeltaTimerRef.current) clearTimeout(toolDeltaTimerRef.current)
+    if (chatScrollRafRef.current) cancelAnimationFrame(chatScrollRafRef.current)
   }, [])
+
+  /** Stick chat pane to bottom (tool cards grow); skip if user scrolled up. */
+  const stickChatBottom = useCallback(() => {
+    if (!followChatBottomRef.current) return
+    const el = messagesRef.current
+    if (!el) return
+    if (chatScrollRafRef.current) cancelAnimationFrame(chatScrollRafRef.current)
+    chatScrollRafRef.current = requestAnimationFrame(() => {
+      chatScrollRafRef.current = 0
+      const pane = messagesRef.current
+      if (!pane || !followChatBottomRef.current) return
+      pinningScrollRef.current = true
+      pane.scrollTop = pane.scrollHeight
+      // Late layout (tool card body grow) — pin again next frame.
+      requestAnimationFrame(() => {
+        const again = messagesRef.current
+        if (again && followChatBottomRef.current) {
+          again.scrollTop = again.scrollHeight
+        }
+        pinningScrollRef.current = false
+      })
+    })
+  }, [])
+
+  const onChatScroll = useCallback(() => {
+    if (pinningScrollRef.current) return
+    const el = messagesRef.current
+    if (!el) return
+    const dist = el.scrollHeight - el.scrollTop - el.clientHeight
+    followChatBottomRef.current = dist < 160
+  }, [])
+
+  // Wheel/trackpad: explicit scroll-up unpins; near-bottom scroll-down re-pins.
+  useEffect(() => {
+    const el = messagesRef.current
+    if (!el) return undefined
+    const onWheel = (e) => {
+      if (e.deltaY < 0) {
+        followChatBottomRef.current = false
+        return
+      }
+      const dist = el.scrollHeight - el.scrollTop - el.clientHeight
+      if (dist < 160) followChatBottomRef.current = true
+    }
+    el.addEventListener('wheel', onWheel, { passive: true })
+    return () => el.removeEventListener('wheel', onWheel)
+  }, [threadId])
 
   /** Throttled mid-turn preview sync; pipeline ✓ can jump reader to 章纲/正文. */
   const syncPreview = useCallback((opts = {}) => {
     if (!project || !onPreviewRefresh) return
     const keepSelection = opts.keepSelection !== false
-    const minGap = opts.immediate ? 0 : 1200
+    const minGap = opts.immediate ? 0 : 2800
     const now = Date.now()
     const wait = Math.max(0, minGap - (now - previewRefreshAtRef.current))
     const run = () => {
@@ -363,20 +554,136 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
   const upsertTurn = useCallback((turnId, mutator) => {
     setTurns((prev) => {
       const idx = prev.findIndex((t) => t.id === turnId)
-      if (idx < 0) {
-        const created = mutator({
+      if (idx >= 0) {
+        const next = [...prev]
+        next[idx] = mutator({ ...next[idx], items: [...(next[idx].items || [])] })
+        return next
+      }
+      // Events can arrive before turn_started. Adopt the optimistic local turn
+      // instead of spawning a sibling empty "回合 N" that only flashes.
+      const localIdx = prev.findIndex(
+        (t) => t.status === 'running' && isOptimisticTurnId(t.id),
+      )
+      if (localIdx >= 0 && turnId && !isOptimisticTurnId(turnId)) {
+        const next = [...prev]
+        const base = {
+          ...next[localIdx],
           id: turnId,
           status: 'running',
-          items: [],
-          approval: null,
-        })
-        return [...prev, created]
+          items: [...(next[localIdx].items || [])],
+        }
+        next[localIdx] = mutator(base)
+        activeTurnRef.current = turnId
+        return next
       }
-      const next = [...prev]
-      next[idx] = mutator({ ...next[idx], items: [...(next[idx].items || [])] })
-      return next
+      const created = mutator({
+        id: turnId,
+        status: 'running',
+        items: [],
+        approval: null,
+      })
+      return [...prev, created]
     })
   }, [])
+
+  const applyToolOutputDelta = useCallback((ev) => {
+    upsertTurn(ev.turn_id, (t) => {
+      // Late/spurious complete must not leave the live turn unlabeled mid-tool.
+      const nextStatus = t.status === 'aborted'
+        ? 'aborted'
+        : (t.status === 'awaiting' ? 'awaiting' : 'running')
+      const items = [...(t.items || [])]
+      let i = items.findIndex((x) => x.id === ev.item_id)
+      // Missed item_started / id mismatch — still show live progress.
+      if (i < 0 && ev.item_id) {
+        items.push({
+          type: 'tool_call',
+          id: ev.item_id,
+          name: 'tool',
+          arguments: {},
+          output: '',
+          status: 'in_progress',
+          _key: `tool_call:${ev.item_id}`,
+        })
+        i = items.length - 1
+      }
+      if (i >= 0) {
+        const prevStatus = items[i].status
+        const bulk = isBulkContextTool(items[i].name)
+        // Bulk-read: replace with short line (never append multi-KB context into React state).
+        const delta = String(ev.delta || '')
+        const prevOut = String(items[i].output || '')
+        const dTrim = delta.trim()
+        const pTrim = prevOut.trim()
+        // Skip full duplicate appends (streamed report + same coda / double WS).
+        const skipDup = !!(
+          dTrim
+          && pTrim
+          && (
+            prevOut.includes(dTrim)
+            || (dTrim.includes(pTrim) && dTrim.length <= pTrim.length + 8)
+            || (dTrim.includes('审校报告') && pTrim.includes('审校报告') && dTrim.length > 80)
+            || (dTrim.includes('已提交') && pTrim.includes('已提交') && /决策/.test(dTrim + pTrim))
+          )
+        )
+        const output = bulk
+          ? (formatBulkReadSummary(items[i].name, items[i].arguments, ev.delta, project)
+            || formatBulkReadSummary(items[i].name, items[i].arguments, '', project)
+            || delta.slice(0, 200))
+          : (skipDup ? prevOut : `${prevOut}${delta}`)
+        // Pipeline may finish (report / ⏸ gate) while ItemCompleted is delayed by WS backpressure.
+        const doneHint = !bulk && looksLikeToolGateDone(output)
+        items[i] = {
+          ...items[i],
+          output,
+          status: isTerminalStatus(prevStatus)
+            ? prevStatus
+            : (doneHint ? 'completed' : (prevStatus || 'in_progress')),
+        }
+        // Keep mirrored agent status lines quiet (no caret) while the tool streams.
+        for (let j = 0; j < items.length; j += 1) {
+          if (items[j]?.type === 'agent_message' && items[j].status === 'in_progress') {
+            items[j] = { ...items[j], status: 'completed' }
+          }
+        }
+      }
+      return { ...t, status: nextStatus, items }
+    })
+    if (ev.turn_id) {
+      activeTurnRef.current = ev.turn_id
+      setLiveTurnId(ev.turn_id)
+    }
+  }, [project, upsertTurn])
+
+  const flushToolDeltaBuf = useCallback(() => {
+    if (toolDeltaTimerRef.current) {
+      clearTimeout(toolDeltaTimerRef.current)
+      toolDeltaTimerRef.current = 0
+    }
+    const batch = [...toolDeltaBufRef.current.values()]
+    toolDeltaBufRef.current.clear()
+    for (const e of batch) applyToolOutputDelta(e)
+  }, [applyToolOutputDelta])
+
+  const queueToolOutputDelta = useCallback((ev) => {
+    const key = `${ev.turn_id}:${ev.item_id}`
+    const prev = toolDeltaBufRef.current.get(key)
+    if (prev) {
+      prev.delta = `${prev.delta || ''}${ev.delta || ''}`
+    } else {
+      toolDeltaBufRef.current.set(key, {
+        turn_id: ev.turn_id,
+        item_id: ev.item_id,
+        delta: ev.delta || '',
+      })
+    }
+    if (!toolDeltaTimerRef.current) {
+      toolDeltaTimerRef.current = window.setTimeout(() => {
+        toolDeltaTimerRef.current = 0
+        flushToolDeltaBuf()
+      }, 120)
+    }
+  }, [flushToolDeltaBuf])
 
   const handleEvent = useCallback(
     (ev) => {
@@ -389,6 +696,8 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
           const serverTurn = ev.turn_id
           setLoading(true)
           setActivity('working…')
+          activeTurnRef.current = serverTurn
+          setLiveTurnId(serverTurn)
           // Merge optimistic `local_*` into the server turn. Never drop an existing
           // approval on the server turn (RequestUserInput may have already arrived).
           setTurns((prev) => {
@@ -396,86 +705,130 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
               (t) => t.status === 'running' && isOptimisticTurnId(t.id),
             )
             const serverIdx = prev.findIndex((t) => t.id === serverTurn)
-            activeTurnRef.current = serverTurn
 
+            let next = prev
             if (localIdx >= 0 && serverIdx >= 0 && localIdx !== serverIdx) {
               const local = prev[localIdx]
               const server = prev[serverIdx]
               const userItems = (local.items || []).filter((i) => i.type === 'user_message')
               const serverItems = server.items || []
+              const seen = new Set()
+              const mergedItems = []
+              for (const it of [...userItems, ...serverItems.filter((i) => i.type !== 'user_message')]) {
+                const k = it.id || it._key
+                if (k && seen.has(k)) continue
+                if (k) seen.add(k)
+                mergedItems.push(it)
+              }
               const merged = {
                 ...server,
                 status: 'running',
                 approval: server.approval || local.approval || null,
-                items: [
-                  ...userItems,
-                  ...serverItems.filter((i) => i.type !== 'user_message'),
-                ],
+                items: mergedItems,
               }
-              return prev
+              next = prev
                 .filter((_, i) => i !== localIdx)
                 .map((t) => (t.id === serverTurn ? merged : t))
-            }
-
-            if (localIdx >= 0 && prev[localIdx].id !== serverTurn) {
-              const next = [...prev]
+            } else if (localIdx >= 0 && prev[localIdx].id !== serverTurn) {
+              next = [...prev]
               next[localIdx] = {
                 ...next[localIdx],
                 id: serverTurn,
                 status: 'running',
                 approval: next[localIdx].approval ?? null,
               }
-              return next
+            } else if (serverIdx < 0) {
+              next = [...prev, { id: serverTurn, status: 'running', items: [], approval: null }]
             }
-
-            if (serverIdx >= 0) return prev
-            return [...prev, { id: serverTurn, status: 'running', items: [], approval: null }]
+            // Prior awaiting/running turns must not keep carets — that was「两次回复一起闪」.
+            return sealOtherTurns(next, serverTurn)
           })
           break
         }
         case 'turn_complete':
-          // Force-finish spinning tools/agents across turns (late deltas / id mismatch).
+          flushToolDeltaBuf()
+          // Only finish the matched turn — completing every running turn made「进行中」闪灭.
           setTurns((prev) => prev.map((t) => {
-            const matched = t.id === ev.turn_id
+            if (t.id !== ev.turn_id) return t
             return {
               ...t,
-              status: matched
-                ? 'complete'
-                : (t.status === 'running' ? 'complete' : t.status),
+              status: 'complete',
               approval: t.approval,
               items: finishOpenItems(t.items),
             }
           }))
+          setLiveTurnId((id) => (id === ev.turn_id ? '' : id))
           setLoading(false)
           setActivity('')
           syncPreview({ keepSelection: false, immediate: true })
           break
         case 'turn_aborted':
+          flushToolDeltaBuf()
           upsertTurn(ev.turn_id, (t) => ({
             ...t,
             status: 'aborted',
             items: finishOpenItems(t.items),
           }))
+          setLiveTurnId((id) => (id === ev.turn_id ? '' : id))
           setLoading(false)
-          setActivity('interrupted')
+          setActivity('已中断')
           break
         case 'item_started':
         case 'item_completed': {
+          if (ev.type === 'item_completed') {
+            // CRITICAL path bypasses rAF — pull matching tool deltas out of the
+            // pending queue first so we don't apply ItemCompleted on an empty card
+            // then append late deltas (闪回 / 结束后才见全文).
+            const itemId = ev.item?.id
+            const turnId = ev.turn_id
+            if (itemId && turnId) {
+              const pending = wsPendingRef.current
+              let mergedDelta = ''
+              const kept = []
+              for (const p of pending) {
+                if (
+                  p?.type === 'tool_call_output_delta'
+                  && p.item_id === itemId
+                  && p.turn_id === turnId
+                ) {
+                  mergedDelta += p.delta || ''
+                } else {
+                  kept.push(p)
+                }
+              }
+              wsPendingRef.current = kept
+              if (mergedDelta) {
+                queueToolOutputDelta({
+                  turn_id: turnId,
+                  item_id: itemId,
+                  delta: mergedDelta,
+                })
+              }
+            }
+            flushToolDeltaBuf()
+          }
           const item = normalizeItem(ev.item)
           if (!item) break
           if (item.type === 'tool_call') {
             const compact = compactToolItem(item, project)
+            const zhName = toolLabelZh(item.name)
             const label = isBulkContextTool(item.name) && compact.output
               ? compact.output
-              : item.name
+              : zhName
             setActivity(
               item.status === 'completed'
-                ? (isBulkContextTool(item.name) ? label : `✓ ${item.name}`)
-                : (isBulkContextTool(item.name) ? `Reading…` : `Running ${item.name}…`),
+                ? (isBulkContextTool(item.name) ? label : `✓ ${zhName}`)
+                : (isBulkContextTool(item.name)
+                  ? '查阅中…'
+                  : (item.name === 'revise_chapter' || item.name === 'steer_run')
+                    ? '修订中…'
+                    : (item.name === 'continue_writing')
+                      ? '写作中…'
+                      : `运行中 · ${zhName}…`),
             )
           } else if (item.type === 'skill_load') {
             setActivity(
-              item.status === 'completed' ? `Loaded $${item.name}` : `Loading $${item.name}…`,
+              item.status === 'completed' ? `已加载 $${item.name}` : `加载 $${item.name}…`,
             )
           }
           // Skip duplicate user_message if we already optimistic-inserted
@@ -503,8 +856,7 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
             const i = items.findIndex((x) => x.id === stored.id)
             if (i >= 0) {
               const prev = items[i]
-              // Gate/steer mirrors ▶ / （调用模型…） into the agent bubble; ItemCompleted
-              // may carry a short closing — never shrink away the streamed process.
+              // ItemCompleted often carries a short coda; never shrink away streamed ▶/✓ process.
               if (
                 stored.type === 'agent_message'
                 && prev.type === 'agent_message'
@@ -515,6 +867,20 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
                   ...stored,
                   text: prev.text,
                   status: stored.status || prev.status,
+                }
+              } else if (
+                stored.type === 'tool_call'
+                && prev.type === 'tool_call'
+                && String(prev.output || '').length > String(stored.output || '').length
+              ) {
+                items[i] = {
+                  ...prev,
+                  ...stored,
+                  output: prev.output,
+                  name: stored.name || prev.name,
+                  arguments: stored.arguments || prev.arguments,
+                  status: stored.status || prev.status,
+                  duration_ms: stored.duration_ms ?? prev.duration_ms,
                 }
               } else {
                 items[i] = { ...prev, ...stored }
@@ -545,11 +911,14 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
           ) {
             if (PREVIEW_MUTATING_TOOLS.has(item.name)) {
               const writing = item.name === 'continue_writing' || item.name === 'revise_chapter'
+              const outlining = item.name === 'revise_outline'
+              const ch = Number(item.arguments?.chapter) || undefined
               syncPreview({
-                keepSelection: !writing,
+                keepSelection: !(writing || outlining),
+                chapter: outlining ? ch : undefined,
                 focusLatestChapter: writing,
-                readerTab: writing ? 'draft' : undefined,
-                immediate: writing,
+                readerTab: writing ? 'draft' : outlining ? 'outline' : undefined,
+                immediate: writing || outlining,
               })
             } else if (isBulkContextTool(item.name)) {
               const tab = readerTabForBulkTool(item.name, item.arguments)
@@ -593,17 +962,31 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
           if (!delta) break
           upsertTurn(ev.turn_id, (t) => {
             const turnDone = t.status === 'awaiting' || t.status === 'complete' || t.status === 'aborted'
+            // Gate/steer mirrors ▶/✓ into the agent bubble while a tool runs. Never reopen
+            // that bubble as in_progress — the streaming caret made the whole Turn flash.
+            const hasTool = (t.items || []).some((x) => x.type === 'tool_call')
+            const toolRunning = (t.items || []).some(
+              (x) => x.type === 'tool_call' && !isTerminalStatus(x.status),
+            )
+            const quietAgent = turnDone || toolRunning || hasTool
             const items = [...t.items]
             const i = items.findIndex((x) => x.id === ev.item_id)
             if (i >= 0) {
               const prevStatus = items[i].status
+              const prevText = String(items[i].text || '')
+              const dTrim = delta.trim()
+              // Don't paste the same checklist / brief twice into one bubble.
+              const skipDup = !dTrim
+                || prevText.includes(dTrim)
+                || (prevText.includes('问题清单') && dTrim.includes('问题清单'))
+              const nextText = skipDup
+                ? prevText
+                : stripToolMarkup(`${prevText}${delta}`)
               items[i] = {
                 ...items[i],
                 type: 'agent_message',
-                text: stripToolMarkup(`${items[i].text || ''}${delta}`),
-                // After tool rounds the bubble may be marked completed; reopen while turn is live.
-                // Once paused/complete, never revive the caret from late deltas.
-                status: turnDone
+                text: nextText,
+                status: quietAgent
                   ? (isTerminalStatus(prevStatus) ? prevStatus : 'completed')
                   : 'in_progress',
               }
@@ -612,7 +995,7 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
                 type: 'agent_message',
                 id: ev.item_id,
                 text: delta,
-                status: 'in_progress',
+                status: quietAgent ? 'completed' : 'in_progress',
               })
             }
             return { ...t, items }
@@ -620,50 +1003,76 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
           break
         }
         case 'tool_call_output_delta':
-          upsertTurn(ev.turn_id, (t) => {
-            const items = [...t.items]
-            const i = items.findIndex((x) => x.id === ev.item_id)
-            if (i >= 0) {
-              const prevStatus = items[i].status
-              const bulk = isBulkContextTool(items[i].name)
-              // Bulk-read: replace with short line (never append multi-KB context into React state).
-              const output = bulk
-                ? (formatBulkReadSummary(items[i].name, items[i].arguments, ev.delta, project)
-                  || formatBulkReadSummary(items[i].name, items[i].arguments, '', project)
-                  || String(ev.delta || '').slice(0, 200))
-                : `${items[i].output || ''}${ev.delta || ''}`
-              // Pipeline may finish (report / ⏸ gate) while ItemCompleted is delayed by WS backpressure.
-              const doneHint = !bulk && looksLikeToolGateDone(output)
-              items[i] = {
-                ...items[i],
-                output,
-                status: isTerminalStatus(prevStatus)
-                  ? prevStatus
-                  : (doneHint ? 'completed' : (prevStatus || 'in_progress')),
-              }
-            }
-            return { ...t, items }
-          })
+          // Buffer into React ~8fps — per-token setTurns was flashing「回合 N · 进行中」.
+          queueToolOutputDelta(ev)
           {
             const d = String(ev.delta || '')
-            const step = d.match(/▶\s*([a-zA-Z0-9_]+)/)
-            const done = d.match(/✓\s*([a-zA-Z0-9_]+)/)
-            const wait = /调用模型|生成中|等待首包|流式生成中/.test(d)
-            if (step) setActivity(`Running ${step[1]}…`)
-            else if (done) setActivity(`✓ ${done[1]}`)
-            else if (wait) setActivity((prev) => prev || 'streaming…')
-            else setActivity((prev) => (prev && prev.startsWith('Running') ? prev : 'streaming…'))
+            // English id or Chinese label after ▶ / ✓
+            const step = d.match(/▶\s*([^\n:：]+)/)
+            const done = d.match(/✓\s*([^\n:：]+)/)
+            const draftChars = d.match(/(?:正文已写入|正文生成中|↻\s*draft)[^\d]*(\d+)/i)
+            const genChars = d.match(/生成中\s*·\s*(\d+)\s*字/)
+            const wait = /调用模型|等待首包/.test(d)
+            // revise_chapter / steer_run also run writer — don't label that as new-chapter Writing.
+            const activeTool = (() => {
+              const items = turnsRef.current
+                ?.find((t) => t.id === ev.turn_id)
+                ?.items || []
+              const running = [...items].reverse().find((it) => (
+                it.type === 'tool_call'
+                && (it.status === 'in_progress' || it.status === 'inProgress' || !it.status)
+              ))
+              return running?.name || ''
+            })()
+            const revising = activeTool === 'revise_chapter' || activeTool === 'steer_run'
+              || /整章修订|局部修订/.test(d)
+            // Only continue_writing is「写作中」; steer/revise (incl. full rewrite) is「修订中」.
+            const writingNew = activeTool === 'continue_writing'
+            const stepName = (step?.[1] || done?.[1] || '').trim()
+            const stepZh = stepLabelZh(stepName)
+            const localRev = /local_reviser|局部修订/i.test(stepName) || /局部修订/.test(d)
+            if (draftChars) {
+              setActivity(
+                writingNew
+                  ? `写作中 · ${draftChars[1]}字`
+                  : `修订中 · ${draftChars[1]}字`,
+              )
+            } else if (genChars) {
+              setActivity(
+                writingNew
+                  ? `生成中 · ${genChars[1]}字`
+                  : (revising ? `修订中 · ${genChars[1]}字` : `生成中 · ${genChars[1]}字`),
+              )
+            } else if (step) {
+              setActivity(
+                localRev
+                  ? '局部修订中…'
+                  : (revising ? `修订 · ${stepZh}` : `运行中 · ${stepZh}…`),
+              )
+            } else if (done) {
+              setActivity(localRev ? '✓ 局部修订' : `✓ ${stepZh}`)
+            }
+            else if (wait) setActivity((prev) => prev || '生成中…')
+            else if (/生成中|流式生成中|正文已写入|↻\s*draft/i.test(d)) {
+              setActivity((prev) => prev || (revising ? '修订中…' : (writingNew ? '写作中…' : '生成中…')))
+            } else {
+              setActivity((prev) => (prev && /^(运行中|写作中|修订|生成中)/.test(prev)
+                ? prev
+                : '生成中…'))
+            }
           }
           // Mid-pipeline: chapter/card files land before the whole tool finishes.
           // Jump reader to latest chapter + 章纲/正文 so creation is visible live.
           const hint = readerHintFromPipelineDelta(ev.delta)
           if (hint) {
             const liveFlush = /正文已写入|↻\s*draft/i.test(String(ev.delta || ''))
+            // Live draft flush: keepSelection to avoid reader/chapter thrash (was
+            // re-rendering the whole studio and amplifying Turn flicker).
             syncPreview({
-              keepSelection: false,
-              focusLatestChapter: !!hint.focusLatestChapter,
+              keepSelection: true,
+              focusLatestChapter: !liveFlush && !!hint.focusLatestChapter,
               readerTab: hint.readerTab,
-              // Step ✓: refresh ASAP; intermittent draft flush: throttle (~1.2s).
+              // Step ✓: refresh ASAP; intermittent draft flush: throttle harder.
               immediate: !liveFlush,
             })
           }
@@ -689,6 +1098,7 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
               items: finishAuditTools(finishOpenItems(t.items)),
               status: (t.status === 'running' || t.status === 'awaiting') ? 'complete' : t.status,
             })))
+            setLiveTurnId('')
             setLoading(false)
           }
           break
@@ -696,6 +1106,10 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
         case 'chat_history_reset': {
           const summary = ev.summary || '对话历史已清理。'
           const keepId = ev.keep_turn_id || ''
+          if (keepId) {
+            activeTurnRef.current = keepId
+            setLiveTurnId(keepId)
+          }
           setTurns((prev) => {
             let next
             if (keepId) {
@@ -744,17 +1158,32 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
         }
         case 'request_user_input': {
           const opts = ev.options || []
+          const activeId = activeTurnRef.current
           // Empty options = queue finished / dismiss all gate cards.
           if (!opts.length) {
             setSetupGateOpen(false)
-            setTurns((prev) => prev.map((t) => ({
-              ...t,
-              approval: null,
-              status: t.status === 'awaiting' || t.status === 'running' ? 'complete' : t.status,
-              items: finishAuditTools(finishOpenItems(t.items)),
-            })))
-            setLoading(false)
-            setActivity(ev.prompt || '')
+            let activeStillRunning = false
+            setTurns((prev) => prev.map((t) => {
+              const isActiveRunning = !!(activeId && t.id === activeId && t.status === 'running')
+              if (isActiveRunning) activeStillRunning = true
+              return {
+                ...t,
+                approval: null,
+                // Do not force-complete the in-flight steer/reaudit turn — that was
+                // unlocking the composer while consistency_auditor was still calling.
+                status: isActiveRunning
+                  ? 'running'
+                  : (t.status === 'awaiting' || t.status === 'running' ? 'complete' : t.status),
+                items: isActiveRunning
+                  ? (t.items || [])
+                  : finishAuditTools(finishOpenItems(t.items)),
+              }
+            }))
+            if (!activeStillRunning) {
+              setLiveTurnId('')
+              setLoading(false)
+              setActivity(ev.prompt || '')
+            }
             break
           }
           const isSetupGate = opts.some((o) => o.id === 'sc_approve' || o.id === 'sc_revise'
@@ -784,7 +1213,10 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
             }
             return prev.map((t) => {
               const matched = t.id === targetId
-              const items = finishAuditTools(finishOpenItems(t.items))
+              const keepRunning = !!(activeId && t.id === activeId && t.status === 'running' && !matched)
+              const items = keepRunning
+                ? (t.items || [])
+                : finishAuditTools(finishOpenItems(t.items))
               // If matched turn is empty, keep a prompt line so dialogue does not vanish.
               const nextItems = matched && !(items || []).length
                 ? [{
@@ -798,7 +1230,7 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
                 ...t,
                 status: matched
                   ? (t.status === 'complete' ? 'complete' : 'awaiting')
-                  : (t.status === 'running' ? 'awaiting' : t.status),
+                  : (keepRunning ? 'running' : (t.status === 'running' ? 'awaiting' : t.status)),
                 approval: matched ? gate : null,
                 items: nextItems,
               }
@@ -818,8 +1250,10 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
           break
       }
     },
-    [project, syncPreview, upsertTurn],
+    [flushToolDeltaBuf, project, queueToolOutputDelta, syncPreview, upsertTurn],
   )
+
+  handleEventRef.current = handleEvent
 
   const connectWs = useCallback(
     (tid) => new Promise((resolve, reject) => {
@@ -833,22 +1267,8 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
       setWsState('connecting')
       const ws = new WebSocket(wsUrl(`/ws/thread/${tid}`))
       wsRef.current = ws
-      ws.onopen = () => {
-        setWsState('open')
-        readyRef.current = true
-        resolve(ws)
-      }
-      ws.onerror = () => {
-        setWsState('error')
-        reject(new Error('ws error'))
-      }
-      ws.onclose = () => {
-        setWsState('closed')
-        readyRef.current = false
-      }
-      // Drain many events per frame. Critical control events bypass the queue
-      // so ItemCompleted / RequestUserInput are never stuck behind token spam.
-      const pending = []
+      const pending = wsPendingRef.current
+      pending.length = 0
       let raf = 0
       const BATCH = 128
       const CRITICAL = new Set([
@@ -862,6 +1282,7 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
         'turn_started',
         'error',
       ])
+      const dispatch = (ev) => handleEventRef.current?.(ev)
       const flush = () => {
         raf = 0
         if (!pending.length) return
@@ -884,20 +1305,37 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
               }
               i += 1
             }
-            handleEvent(merged)
+            dispatch(merged)
           } else {
-            handleEvent(ev)
+            dispatch(ev)
             i += 1
           }
         }
         pending.splice(0, n)
         if (pending.length) raf = requestAnimationFrame(flush)
       }
+      ws.onopen = () => {
+        setWsState('open')
+        readyRef.current = true
+        resolve(ws)
+      }
+      ws.onerror = () => {
+        setWsState('error')
+        reject(new Error('ws error'))
+      }
+      ws.onclose = () => {
+        setWsState('closed')
+        readyRef.current = false
+        if (raf) cancelAnimationFrame(raf)
+        raf = 0
+      }
+      // Drain many events per frame. Critical control events bypass the queue
+      // so ItemCompleted / RequestUserInput are never stuck behind token spam.
       ws.onmessage = (msg) => {
         try {
           const ev = JSON.parse(msg.data)
           if (CRITICAL.has(ev?.type)) {
-            handleEvent(ev)
+            dispatch(ev)
             return
           }
           pending.push(ev)
@@ -907,7 +1345,7 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
         }
       }
     }),
-    [handleEvent],
+    [],
   )
 
   useEffect(() => {
@@ -942,27 +1380,34 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
           // ui_turns lagged behind (e.g. revise finished but client overwrote with old audit card).
           nextTurns = fromMessages
         } else if (serverTurns.length) {
-          nextTurns = serverTurns
+          // Tool cards alone with empty NovelX bubbles → fill prose from messages.
+          nextTurns = mergeAgentProseFromMessages(serverTurns, fromMessages)
         } else if (fromMessages.length && !cached?.turns?.length) {
           nextTurns = fromMessages
         } else if (cached?.turns?.length) {
-          nextTurns = cached.turns
+          nextTurns = mergeAgentProseFromMessages(cached.turns, fromMessages)
         }
         const hasQueue = !!(started.pending_audit_queue?.chapters?.length)
         setTodos(hasQueue ? queueToTodos(started.pending_audit_queue) : [])
+        const turnActive = started.turn_active === true
         // gates.yaml via server open_gate / turn.approval — never invent buttons from Chinese scrape.
-        const restoredGate = normalizeServerGate(started.open_gate)
-          || approvalFromTurns(serverTurns)
-          || approvalFromTurns(nextTurns)
+        // While a turn is active, ignore restored gates (revise/reaudit in flight).
+        const restoredGate = turnActive
+          ? null
+          : (normalizeServerGate(started.open_gate)
+            || approvalFromTurns(serverTurns)
+            || approvalFromTurns(nextTurns))
         const hasHumanGate = !!(
           restoredGate
-          || started.pending_audit
+          || (!turnActive && started.pending_audit)
           || started.pending_volume_sync
           || started.pending_setup
           || started.pending_chapter_next
           || started.pending_volume_audit
+          || started.pending_mutation
+          || started.pending_chapter_order
         )
-        setSetupGateOpen(!!started.pending_setup)
+        setSetupGateOpen(!!started.pending_setup && !turnActive)
         if (nextTurns?.length && restoredGate) {
           nextTurns = nextTurns.map((t, idx) => {
             const last = idx === nextTurns.length - 1
@@ -973,11 +1418,14 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
               approval: last ? restoredGate : null,
             }
           })
+          nextTurns = attachGatePreviewItems(nextTurns, restoredGate)
+          const lastId = nextTurns[nextTurns.length - 1]?.id || ''
+          activeTurnRef.current = lastId
+          setLiveTurnId(lastId)
           setLoading(false)
           setActivity('waiting for input')
         } else if (nextTurns?.length && !hasHumanGate) {
           // Drop stale approval cards; also clear「调用模型中」if the turn already ended.
-          const turnActive = started.turn_active === true
           nextTurns = nextTurns.map((t) => {
             const stuckRunning = !turnActive && t.status === 'running'
             return {
@@ -989,14 +1437,26 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
                 : finishAuditTools(t.items || []),
             }
           })
-          if (!turnActive) {
+          if (turnActive) {
+            const live = [...nextTurns].reverse().find((t) => t.status === 'running')
+            if (live?.id) {
+              activeTurnRef.current = live.id
+              setLiveTurnId(live.id)
+              setLoading(true)
+            }
+          } else {
+            setLiveTurnId('')
             setLoading(false)
             setActivity('')
           }
         }
         if (nextTurns?.length) {
-          setTurns(nextTurns)
-          saveChatCache(project, tid, nextTurns)
+          setTurns((prev) => {
+            // Remount / StrictMode must not flash-back to a weaker server snapshot.
+            const chosen = pickRicherTurns(nextTurns, prev) || prev || nextTurns
+            saveChatCache(project, tid, chosen)
+            return chosen
+          })
           // Never push stale Running timelines back while a gate is open.
           if (!serverTurns.length && cached?.turns?.length && !hasHumanGate) {
             fetch(`${API}/thread/turns`, {
@@ -1015,6 +1475,8 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
     })()
     return () => {
       cancelled = true
+      // Only close when this effect is torn down for a real project switch /
+      // unmount — connectWs is stable so parent re-renders no longer reconnect.
       wsRef.current?.close()
     }
   }, [project, connectWs])
@@ -1036,13 +1498,31 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
     return () => clearTimeout(t)
   }, [project, threadId, turns, loading])
 
-  // Keep the latest turn / tool progress in view (outer chat scroller).
-  const turnsSig = turns.map((t) => (
-    `${t.id}:${t.status}:${(t.items || []).map((it) => `${it.id}:${it.status}:${String(it.output || '').length}`).join('|')}`
+  // Structure change (new tool/bubble) → resume follow + stick.
+  const scrollStructSig = turns.map((t) => (
+    `${t.id}:${(t.items || []).map((it) => `${it.id || it._key}:${it.type}`).join('|')}`
   )).join(';')
-  useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
-  }, [turnsSig, activity])
+  const lastScrollSigRef = useRef('')
+  useLayoutEffect(() => {
+    if (scrollStructSig === lastScrollSigRef.current) return
+    lastScrollSigRef.current = scrollStructSig
+    followChatBottomRef.current = true
+    stickChatBottom()
+  }, [scrollStructSig, stickChatBottom])
+
+  // Tool / agent stream growth → keep chat window pinned while following.
+  // (Inner tool pre also scrolls; outer pane must move as the card grows.)
+  const streamLenSig = turns.reduce((acc, t) => (
+    acc + (t.items || []).reduce((n, it) => {
+      if (it.type === 'tool_call') return n + String(it.output || '').length
+      if (it.type === 'agent_message') return n + String(it.text || '').length
+      return n
+    }, 0)
+  ), 0)
+  useLayoutEffect(() => {
+    if (!loading && !liveTurnId) return
+    stickChatBottom()
+  }, [streamLenSig, loading, liveTurnId, activity, stickChatBottom])
 
   const detectSkillTrigger = (value, caret) => {
     const before = value.slice(0, caret)
@@ -1056,34 +1536,67 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
     }
   }
 
+  const forceUnlockComposer = () => {
+    loadingRef.current = false
+    setLoading(false)
+    setLiveTurnId('')
+    activeTurnRef.current = ''
+  }
+
   const sendText = async (text) => {
     const msg = (text || '').trim()
     if (!msg || !threadId) return
     // Prevent double-click / concurrent start_turn (was re-triggering audit queues).
-    if (loadingRef.current) return
+    // If a prior turn never got turn_complete, loading sticks and the composer
+    // stays disabled — status questions must interrupt then send.
+    if (loadingRef.current) {
+      // Narrow status match — do NOT use bare「第N卷」(kills real writes on mis-send).
+      const looksStatus =
+        /到哪了|写到哪|进行到哪|剧情进度|对照.*剧情|本卷到哪|这一卷到哪|卷进行到/.test(msg)
+      if (looksStatus) {
+        try {
+          await handleStop()
+        } catch {
+          /* continue */
+        }
+        forceUnlockComposer()
+        // fall through — auto-resend status questions
+      } else {
+        // Unlock composer only; do not interrupt a live write/audit turn.
+        forceUnlockComposer()
+        setActivity('输入已解锁 — 若回合仍在跑请点「中断」，或再点一次发送')
+        return
+      }
+    }
     loadingRef.current = true
     setLoading(true)
+    followChatBottomRef.current = true
     setShowOther(false)
     setOtherText('')
     setActivity('sending…')
     // Choosing a next step dismisses any pending approval cards.
     setSetupGateOpen(false)
-    setTurns((prev) => prev.map((t) => (t.approval ? { ...t, approval: null } : t)))
 
     // Optimistic local turn (Codex shows user input immediately)
     const localTurnId = newOptimisticTurnId()
     activeTurnRef.current = localTurnId
-    upsertTurn(localTurnId, (t) => ({
-      ...t,
-      id: localTurnId,
-      status: 'running',
-      approval: null,
-      items: [{
-        type: 'user_message',
-        id: newLocalId('item'),
-        text: msg,
-      }],
-    }))
+    setLiveTurnId(localTurnId)
+    setTurns((prev) => {
+      const sealed = sealOtherTurns(prev, localTurnId)
+      return [
+        ...sealed,
+        {
+          id: localTurnId,
+          status: 'running',
+          approval: null,
+          items: [{
+            type: 'user_message',
+            id: newLocalId('item'),
+            text: msg,
+          }],
+        },
+      ]
+    })
 
     const op = {
       op: 'start_turn',
@@ -1161,24 +1674,36 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
 
   const handleStop = async () => {
     const turnId = activeTurnRef.current
-    if (!threadId || !turnId) return
-    const op = {
-      op: 'interrupt_turn',
-      thread_id: threadId,
-      turn_id: turnId,
+    if (threadId && turnId) {
+      const op = {
+        op: 'interrupt_turn',
+        thread_id: threadId,
+        turn_id: turnId,
+      }
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify(op))
+      } else {
+        await fetch(`${API}/turn/interrupt`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(op),
+        }).catch(() => {})
+      }
     }
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(op))
-    } else {
-      await fetch(`${API}/turn/interrupt`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(op),
-      }).catch(() => {})
-    }
-    setLoading(false)
-    setActivity('interrupted')
+    forceUnlockComposer()
+    setActivity(turnId ? '已中断' : '')
   }
+
+  // Stuck「working…」after a missed turn_complete / hung API: unlock quickly.
+  useEffect(() => {
+    if (!loading) return undefined
+    const t = window.setTimeout(() => {
+      if (!loadingRef.current) return
+      forceUnlockComposer()
+      setActivity('上一回合超时未结束 — 已解锁，可重发')
+    }, 25_000)
+    return () => window.clearTimeout(t)
+  }, [loading])
 
   const handleNewTask = async () => {
     const label = project || '当前会话'
@@ -1199,6 +1724,7 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
     setActivity('新开任务…')
     setLoading(false)
     activeTurnRef.current = ''
+    setLiveTurnId('')
     try {
       wsRef.current?.close()
     } catch {
@@ -1267,11 +1793,12 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
         </div>
       </div>
       <TodoList todos={todos} />
-      <div className="chat-messages">
+      <div className="chat-messages" ref={messagesRef} onScroll={onChatScroll}>
         <TurnTimeline
           turns={turns}
           loading={loading}
           project={project}
+          liveTurnId={liveTurnId}
           onReaderJump={(opts) => syncPreview({
             ...opts,
             immediate: true,
@@ -1317,19 +1844,19 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
               }
             }}
             rows={3}
-            disabled={loading || !threadId}
+            disabled={!threadId}
           />
           <div className="chat-input-actions">
-            {loading && (
+            {(loading || /working|sending|运行中/.test(activity || '')) && (
               <button type="button" className="btn-ghost btn-inline" onClick={handleStop}>
-                停止
+                中断
               </button>
             )}
             <button
               type="button"
               className="btn-primary btn-inline"
               onClick={handleSend}
-              disabled={loading || !input.trim() || !threadId}
+              disabled={!input.trim() || !threadId}
             >
               发送
             </button>

@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use novelx_llm::{load_llm_config, LlmClient};
-use novelx_pipeline::{init_project, list_projects, load_project_state};
+use novelx_pipeline::{
+    init_project, list_projects, load_project_state, migrate_project_reader_formats,
+};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -43,6 +45,11 @@ enum Commands {
     Projects,
     /// List registered pipeline agents
     Agents,
+    /// Migrate a project toward locked reader/content-formats schemas
+    Migrate {
+        /// Project directory name under projects/
+        name: String,
+    },
     /// Start NovelX web server
     Web {
         #[arg(long, default_value = "127.0.0.1:8765")]
@@ -98,6 +105,44 @@ async fn main() -> Result<()> {
         Commands::Agents => {
             for a in novelx_harness::PipelineConfig::load(&config).order() {
                 println!("{a}");
+            }
+        }
+        Commands::Migrate { name } => {
+            let dir = projects.join(&name);
+            if !dir.is_dir() {
+                anyhow::bail!("项目不存在：{}", dir.display());
+            }
+            let report = migrate_project_reader_formats(&dir);
+            println!("migrated project: {name}");
+            if !report.outlines_migrated.is_empty() {
+                println!("  outlines→json: {:?}", report.outlines_migrated);
+            }
+            if !report.outlines_padded.is_empty() {
+                println!("  outlines padded items/locations: {:?}", report.outlines_padded);
+            }
+            if !report.entities_stub_folded.is_empty() {
+                println!(
+                    "  entity sync stubs folded: {}",
+                    report.entities_stub_folded.len()
+                );
+            }
+            if !report.entities_padded.is_empty() {
+                println!("  entities normalized: {}", report.entities_padded.len());
+            }
+            if !report.plots_normalized.is_empty() {
+                println!("  plots normalized: {:?}", report.plots_normalized);
+            }
+            if report.bible_rewritten {
+                println!("  bible.md restructured");
+            }
+            for n in &report.notes {
+                println!("  note: {n}");
+            }
+            for (ch, err) in &report.outlines_failed {
+                println!("  outline fail ch{ch}: {err}");
+            }
+            for (p, err) in &report.plot_failed {
+                println!("  plot fail {p}: {err}");
             }
         }
         Commands::Web { bind } => {

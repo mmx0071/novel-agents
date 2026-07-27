@@ -16,3 +16,18 @@ features:
   # Persist volume_phase, rebuild sync gate from disk, and hard-block continue_writing /
   # design_plot outside drafting_volume (and ignore design_plot force during handoff).
   studio.enforce_volume_phase: true
+  # Refuse continue_writing when chapter > next_chapter or earlier chapters are missing.
+  studio.enforce_chapter_order: true
+  # Mutating tools preview first; user must confirm via ApprovalOptions before disk write.
+  studio.require_mutation_confirm: true
+  # After mutating tools apply: scan dependent artifacts and offer cascade revise gate.
+  studio.impact_cascade: true
+  # Optional LLM refine of impact hits (default off; deterministic scan is enough for P0/P1).
+  studio.impact_llm_refine: false
+  # After a plot card completes: run setting_auditor巡检；无 BLOCKER 时轻量 sync（不改 volume_phase）。
+  # 若同时命中卷末，则跳过轻量 sync，留给 sync_volume 门控。
+  studio.plot_setting_pass: true
+  # After each published chapter while the plot card stays open: light entity
+  # status/holdings sync so the next chapter reads up-to-date setting cards.
+  # Skipped when plot just completed (plot_setting_pass covers it) or volume end.
+  studio.chapter_setting_pass: true

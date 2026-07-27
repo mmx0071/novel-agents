@@ -38,6 +38,12 @@ impl NamingRules {
         Self::load(&config_root.join("naming_rules.yaml"))
     }
 
+    /// Validate YAML text for Web PUT.
+    pub fn parse_yaml(text: &str) -> Result<Self, String> {
+        serde_yaml::from_str::<NamingRules>(text)
+            .map_err(|e| format!("naming_rules.yaml 解析失败：{e}"))
+    }
+
     /// Compact block for LLM system/user prompts.
     pub fn prompt_block(&self) -> String {
         if self.forbidden_names.is_empty() && self.naming_principles.is_empty() {
