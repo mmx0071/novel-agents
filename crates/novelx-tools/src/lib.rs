@@ -1,6 +1,7 @@
 //! Tool handlers for NovelX agent loop (Codex-style handler + spec).
 
 mod audit_queue;
+mod expected_tools;
 mod multi_agent;
 mod mutation;
 mod mutation_gate;
@@ -14,7 +15,7 @@ pub use mutation::{
     apply_without_mutation_id, confirm_skipped, maybe_preview, mutation_confirm_enabled,
     preview_mutation, reject_apply_without_id, wants_apply, with_confirm_skip,
 };
-pub use tool_ui::{agent_label_zh, is_bulk_context_tool, tool_output_for_ui};
+pub use tool_ui::{agent_label_zh, tool_output_for_ui};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -45,7 +46,7 @@ use novelx_pipeline::{
 use novelx_protocol::{AgentPath, ThreadId};
 use novelx_skills::{build_skill_injections, load_skills, SkillScope};
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -116,6 +117,8 @@ pub struct ToolContext {
     pub agent_runtime: Option<Arc<dyn AgentRuntime>>,
     /// Calling thread (root or subagent) for spawn parent attribution.
     pub caller_thread_id: Option<ThreadId>,
+    /// Expected-event ids skipped for this turn (skip_once).
+    pub skipped_expected_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -235,6 +238,19 @@ impl ToolHandler for ContinueWriting {
             }
         }
         let _ = rebuild_plot_index(&dir);
+        let skip_expected = args
+            .get("confirm_skip_expected")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if let Some(block) = expected_tools::continue_writing_expected_block(
+            &dir,
+            &project,
+            chapter,
+            &ctx.skipped_expected_ids,
+            skip_expected,
+        ) {
+            return Ok(block);
+        }
         let enforce = PhaseEnforceFlags::load(&ctx.config_root);
         if enforce.chapter_order {
             if let Some(block) = check_chapter_order(&dir, chapter) {
@@ -2418,13 +2434,22 @@ impl ToolHandler for DesignArcOutline {
         }
         let vol_phase = resolve_volume_phase(&dir);
         let offer_setup = setup == SetupPhase::AwaitingConfirm;
+        let next_ch = load_project_state(&dir)
+            .map(|s| s.next_chapter.max(1))
+            .unwrap_or(1);
+        let ee_hard = novelx_pipeline::list_hard_ok_candidates(&dir, next_ch).len();
         Ok(ToolResult {
             output: format!(
-                "已写入第{arc}卷卷纲 {}（终止条件 {} 条）；setup_phase={}；volume_phase={}",
+                "已写入第{arc}卷卷纲 {}（终止条件 {} 条）；setup_phase={}；volume_phase={}{}",
                 path.display(),
                 cond_n,
                 setup.as_str(),
-                vol_phase.as_str()
+                vol_phase.as_str(),
+                if ee_hard > 0 {
+                    format!("；有 {ee_hard} 条预期硬条件已满足，建议 review_expected_events(scope=volume)")
+                } else {
+                    String::new()
+                }
             ),
             data: json!({
                 "path": path,
@@ -2434,6 +2459,8 @@ impl ToolHandler for DesignArcOutline {
                 "volume_phase": vol_phase.as_str(),
                 "offer_setup_confirm": offer_setup,
                 "offer_volume_handoff": vol_phase == VolumePhase::AwaitingNextPlot,
+                "offer_expected_review": ee_hard > 0,
+                "expected_hard_ok": ee_hard,
                 "project": project,
                 "audit": mutation_gate::audit_preview_value(&audit),
                 "impact_source": impact_source_arc(arc, &before_arc, &text),
@@ -3125,14 +3152,20 @@ impl ToolHandler for GetProjectStatus {
             obj.insert("published_count".into(), json!(state.published_count));
             obj.insert("next_chapter".into(), json!(state.next_chapter));
         }
+        let (ee_pending, ee_approved, ee_due) = novelx_pipeline::count_by_status(&dir);
         Ok(ToolResult {
-            output,
+            output: format!(
+                "{output} 预期(待={ee_pending}/批={ee_approved}/到期={ee_due})"
+            ),
             data: json!({
                 "state": state_json,
                 "chapters": chapters,
                 "setup_phase": setup.as_str(),
                 "volume_phase": volume.as_str(),
                 "brief": brief,
+                "deferred_pending": ee_pending,
+                "deferred_approved": ee_approved,
+                "deferred_due": ee_due,
             }),
         })
     }
@@ -3772,6 +3805,11 @@ pub fn all_tools() -> Vec<Arc<dyn ToolHandler>> {
         Arc::new(SteerRun),
         Arc::new(OfferDecisions),
         Arc::new(ActivateAgents),
+        Arc::new(expected_tools::EnqueueExpectedEvent),
+        Arc::new(expected_tools::UpdateExpectedEvent),
+        Arc::new(expected_tools::ListExpectedEvents),
+        Arc::new(expected_tools::ReviewExpectedEvents),
+        Arc::new(expected_tools::ResolveExpectedEvent),
         Arc::new(SpawnAgent),
         Arc::new(SendAgentMessage),
         Arc::new(FollowupTask),
@@ -3852,28 +3890,6 @@ fn audit_tool_coda(run: &novelx_pipeline::PipelineRun, chapter: u32) -> String {
         return "\n——\n一致性通过".into();
     }
     format!("\n——\n第{chapter}章审校完成")
-}
-
-/// Run pipeline with event channel (for WS bridge).
-pub async fn continue_with_events(
-    ctx: &ToolContext,
-    project: &str,
-    chapter: u32,
-    mode: RunMode,
-    revision: RevisionOptions,
-    tx: mpsc::UnboundedSender<novelx_pipeline::PipelineEvent>,
-) -> Result<novelx_pipeline::PipelineRun> {
-    execute_pipeline(
-        &ctx.projects_root,
-        &ctx.config_root,
-        project,
-        chapter,
-        mode,
-        revision,
-        ctx.llm.clone(),
-        Some(tx),
-    )
-    .await
 }
 
 /// Pipeline run that forwards step / LLM deltas into `ctx.progress` when set.
@@ -4032,10 +4048,6 @@ pub async fn run_pipeline_streaming(
     .await;
     let _ = forward.await;
     run
-}
-
-pub fn resolve_roots(cwd: &Path) -> (PathBuf, PathBuf) {
-    (cwd.join("projects"), cwd.join("config"))
 }
 
 enum LlmProgressKind {

@@ -31,36 +31,6 @@ export function buildVolumePlotGroups(arcOutlines, plots) {
     })
 }
 
-/** @deprecated use buildVolumePlotGroups — flat tree for legacy callers */
-export function buildVolumePlotTree(arcOutlines, plots) {
-  const out = []
-  for (const g of buildVolumePlotGroups(arcOutlines, plots)) {
-    out.push({
-      kind: 'arc',
-      key: `v${g.volume}`,
-      label: g.title,
-      complete: true,
-      level: 0,
-      volume: g.volume,
-      raw: g.arc,
-    })
-    for (const p of g.plots) {
-      const key = p?.slug || p?.id || p?.title || ''
-      if (!key) continue
-      out.push({
-        kind: 'plot',
-        key,
-        label: p.title || '未命名剧情',
-        complete: !!p.complete,
-        level: 1,
-        volume: g.volume,
-        raw: p,
-      })
-    }
-  }
-  return out
-}
-
 /** Plot status → tie-break rank (lower = earlier when chain ties). */
 const PLOT_PROGRESS_RANK = {
   completed: 0,
@@ -70,7 +40,7 @@ const PLOT_PROGRESS_RANK = {
   abandoned: 4,
 }
 
-export function normalizePlotStatus(status) {
+function normalizePlotStatus(status) {
   const s = String(status || '').trim().toLowerCase()
   if (['in_progress', 'inprogress', 'active', 'running', '进行中', '进行'].includes(s)) {
     return 'in_progress'

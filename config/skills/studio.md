@@ -160,6 +160,17 @@ description: NovelX 主 Agent — Codex Session 编排、SubAgent spawn、工具
 - 裸「继续」、清历史、全文重写关键词 → `config/policies.yaml`  
 - 章流水线顺序 / MVP / step→handler → `config/pipeline.yaml`
 
+## 预处理预期（延后意图）
+
+用户说「以后再处理 / 读者要求但不现在做 / 先记下加角色·退场·复活」时：
+
+1. `enqueue_expected_event` — 结合 `get_project_status` / `list_plots` / `list_entities` 补全 `conditions`（章窗、卷、剧情卡 status、实体 status 等），预览确认后落盘  
+2. **禁止**把未批准预期当成当前章必写；禁止静默改实体 status 或写死角色  
+3. 写章前若硬条件已满足：系统会软拦并弹卡 → `review_expected_events` 或跳过检阅  
+4. 检阅出「高/中」拟合 → 用户选「纳入本次 / 本次跳过 / 稍后」；纳入后 Canon 出现「已批准预期」，再用 `design_entity` / `design_plot` / `revise_*` 落地，最后 `resolve_expected_event(status=incorporated)`  
+5. 卷纲更新后若有硬条件满足项，引导 `review_expected_events(scope=volume)`  
+6. 查看列表：`list_expected_events`（右侧阅读区「预期」Tab）
+
 ## 其他工具
 
 | 意图 | 工具 |
@@ -168,12 +179,13 @@ description: NovelX 主 Agent — Codex Session 编排、SubAgent spawn、工具
 | 立项 | `create_novel` / `init_novel` |
 | 锁定灵感 | `lock_brief` |
 | 确认/打回定稿 | `confirm_setup`（approve / revise） |
-| 项目状态 | `get_project_status`（含 setup_phase / volume_phase / brief） |
+| 项目状态 | `get_project_status`（含 setup_phase / volume_phase / brief / 预期计数） |
 | 读章节正文 | `read_chapter`（draft.md + outline；核对时间线/伤势用这个） |
 | 查设定/记忆 | `query_lore` / `query_memory` / `list_entities`（`query_lore` **不含**正文全文） |
 | 设计/删除实体 | `design_entity` / `delete_entity`（去重合并后删冗余卡） |
 | 设计剧情 | `design_plot`（须已有卷纲；切卷内一段，勿复述整卷；**有 in_progress/bridging 或未写完衔接时禁止新建**） |
 | 剧情卡列表/状态 | `list_plots` / `update_plot`（主路径：planned→in_progress→completed；可选 completed→bridging→completed） |
+| 预处理预期 | `enqueue_expected_event` / `update_expected_event` / `list_expected_events` / `review_expected_events` / `resolve_expected_event` |
 | 补世界观 | `upsert_setting` / `supplement_setting`（topic≠名词表 → Bible） |
 | 补名词表 | `upsert_setting(topic=名词表)` → `artifacts/nomenclature.md` + `lore/nomenclature.json`（不要写进 Bible） |
 | 设定审计 | `audit_setting`（冲突 + stub 缺口 + 摘要漂移；剧情收束后也会自动巡检） |

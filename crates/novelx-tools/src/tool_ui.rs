@@ -26,12 +26,18 @@ pub fn agent_label_zh(id: &str) -> &str {
         "audit_volume" => "整卷复盘",
         "steer_run" => "门控续作",
         "offer_decisions" => "提出决策",
+        "expectation_reviewer" => "预期检阅",
+        "enqueue_expected_event" => "登记预期",
+        "update_expected_event" => "更新预期",
+        "list_expected_events" => "预期列表",
+        "review_expected_events" => "检阅预期",
+        "resolve_expected_event" => "处理预期",
         other => other,
     }
 }
 
 /// Tools whose full payload should not be streamed into the chat timeline.
-pub fn is_bulk_context_tool(name: &str) -> bool {
+pub(crate) fn is_bulk_context_tool(name: &str) -> bool {
     matches!(
         name,
         "read_chapter"
@@ -39,6 +45,7 @@ pub fn is_bulk_context_tool(name: &str) -> bool {
             | "query_memory"
             | "list_entities"
             | "list_plots"
+            | "list_expected_events"
             | "get_project_status"
     )
 }
@@ -93,6 +100,14 @@ pub fn tool_output_for_ui(name: &str, args: &Value, output: &str, data: &Value) 
                 })
                 .unwrap_or(0);
             format!("正在阅读《{title}》剧情（{n} 项）")
+        }
+        "list_expected_events" => {
+            let n = data
+                .get("events")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            format!("正在查阅《{title}》预处理预期（{n} 项）")
         }
         "get_project_status" => format!("正在查看《{title}》项目状态"),
         _ => format!("正在查阅《{title}》"),

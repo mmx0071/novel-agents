@@ -199,6 +199,20 @@ pub(crate) struct PendingPlotWrite {
     pub volume: u32,
 }
 
+/// Preprocess expected-event gate: review first, or approve/skip a candidate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PendingExpectedEvent {
+    pub project: String,
+    /// `need_review` | `decide`
+    pub kind: String,
+    #[serde(default)]
+    pub chapter: u32,
+    #[serde(default)]
+    pub event_id: String,
+    #[serde(default)]
+    pub event_text: String,
+}
+
 /// Generic mutation confirm: apply cached tool args after user approval.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PendingMutation {
@@ -265,6 +279,12 @@ pub(crate) struct ThreadState {
     /// Plot write gate: activate planned card / design next plot.
     #[serde(default)]
     pub(crate) pending_plot_write: Option<PendingPlotWrite>,
+    /// Expected-event gate: review / approve / skip / later.
+    #[serde(default)]
+    pub(crate) pending_expected_event: Option<PendingExpectedEvent>,
+    /// Event ids the user chose「本次跳过」for this session.
+    #[serde(default)]
+    pub(crate) skipped_expected_ids: Vec<String>,
     /// Disk mutation awaiting confirm (apply / discard).
     #[serde(default)]
     pub(crate) pending_mutation: Option<PendingMutation>,
@@ -350,6 +370,7 @@ impl NovelxCore {
                     progress: None,
                     agent_runtime: Some(agent_runtime),
                     caller_thread_id: None,
+                    skipped_expected_ids: Vec::new(),
                 },
                 tools: all_tools(),
                 threads: Arc::new(RwLock::new(HashMap::new())),
@@ -370,6 +391,12 @@ impl NovelxCore {
     fn tool_ctx(&self, thread_id: &str) -> ToolContext {
         let mut ctx = self.roots.clone();
         ctx.caller_thread_id = Some(thread_id.to_string());
+        // Best-effort sync fill of skipped expected ids for continue_writing soft-block.
+        if let Ok(guard) = self.threads.try_read() {
+            if let Some(t) = guard.get(thread_id) {
+                ctx.skipped_expected_ids = t.skipped_expected_ids.clone();
+            }
+        }
         ctx
     }
 
@@ -516,6 +543,7 @@ impl NovelxCore {
             || t.pending_chapter_next.is_some()
             || t.pending_chapter_order.is_some()
             || t.pending_plot_write.is_some()
+            || t.pending_expected_event.is_some()
             || t.pending_mutation.is_some()
             || t.pending_impact.is_some()
     }
@@ -702,6 +730,8 @@ impl NovelxCore {
                             pending_chapter_next: None,
                             pending_chapter_order: None,
                             pending_plot_write: None,
+                            pending_expected_event: None,
+                            skipped_expected_ids: Vec::new(),
                             pending_mutation: None,
                             pending_impact: None,
                             session_source: SessionSource::Root,
@@ -1638,6 +1668,109 @@ impl NovelxCore {
             return Ok(());
         }
 
+        // Deterministic: expected-event review / incorporate gate.
+        if let Some(op) = self.parse_expected_event_op(&thread_id, &text).await {
+            match op {
+                ExpectedEventGateOp::Dismiss => {
+                    let summary = "已关闭预期决策卡。可稍后 list_expected_events / review_expected_events。"
+                        .to_string();
+                    if let Some(t) = self.threads.write().await.get_mut(&thread_id) {
+                        t.messages.push(ChatMessage {
+                            role: "assistant".into(),
+                            content: summary.clone(),
+                            tool_call_id: None,
+                            tool_calls: None,
+                            ..Default::default()
+                        });
+                        t.ui_turns = append_completion_ui_turn(
+                            std::mem::take(&mut t.ui_turns),
+                            &turn_id,
+                            &summary,
+                            false,
+                        );
+                    }
+                    let _ = self.persist_thread(&thread_id).await;
+                    self.emit_to_thread(
+                        &thread_id,
+                        EventMsg::TurnComplete {
+                            thread_id: thread_id.clone(),
+                            turn_id: turn_id.clone(),
+                        },
+                    )
+                    .await;
+                    return Ok(());
+                }
+                ExpectedEventGateOp::Tool { tool_name, args } => {
+                    tracing::info!(%tool_name, args = %args, "studio direct expected_event gate");
+                    if let Some(t) = self.threads.write().await.get_mut(&thread_id) {
+                        t.pending_expected_event = None;
+                        t.ui_turns = strip_ui_approvals(std::mem::take(&mut t.ui_turns));
+                    }
+                    let agent_item_id = new_id("item");
+                    self.emit_to_thread(
+                        &thread_id,
+                        EventMsg::ItemStarted {
+                            thread_id: thread_id.clone(),
+                            turn_id: turn_id.clone(),
+                            item: TurnItem::AgentMessage {
+                                id: agent_item_id.clone(),
+                                text: String::new(),
+                                status: ItemStatus::InProgress,
+                            },
+                        },
+                    )
+                    .await;
+                    let (output, data) = self
+                        .run_one_tool(&thread_id, &turn_id, &tool_name, &args.to_string())
+                        .await?;
+                    self.apply_expected_event_tool_side_effects(&thread_id, &tool_name, &data)
+                        .await;
+                    let _ = self
+                        .maybe_offer_expected_event(&thread_id, &turn_id, &tool_name, &args, &data)
+                        .await?;
+                    let summary = output;
+                    if let Some(t) = self.threads.write().await.get_mut(&thread_id) {
+                        t.messages.push(ChatMessage {
+                            role: "assistant".into(),
+                            content: summary.clone(),
+                            tool_call_id: None,
+                            tool_calls: None,
+                            ..Default::default()
+                        });
+                        t.ui_turns = append_completion_ui_turn(
+                            std::mem::take(&mut t.ui_turns),
+                            &turn_id,
+                            &summary,
+                            false,
+                        );
+                    }
+                    self.emit_to_thread(
+                        &thread_id,
+                        EventMsg::ItemCompleted {
+                            thread_id: thread_id.clone(),
+                            turn_id: turn_id.clone(),
+                            item: TurnItem::AgentMessage {
+                                id: agent_item_id,
+                                text: summary,
+                                status: ItemStatus::Completed,
+                            },
+                        },
+                    )
+                    .await;
+                    let _ = self.persist_thread(&thread_id).await;
+                    self.emit_to_thread(
+                        &thread_id,
+                        EventMsg::TurnComplete {
+                            thread_id: thread_id.clone(),
+                            turn_id: turn_id.clone(),
+                        },
+                    )
+                    .await;
+                    return Ok(());
+                }
+            }
+        }
+
         // Deterministic: planned/need plot write gate.
         if let Some(action) = self.parse_plot_write_op(&thread_id, &text).await {
             self.run_plot_write_gate_action(&thread_id, &turn_id, action)
@@ -2083,23 +2216,43 @@ impl NovelxCore {
                 self.maybe_offer_plot_write(&thread_id, &turn_id, &tool_name, &args, &data)
                     .await?
             };
-            let asked_setup = if asked_mutation || asked_impact || asked_order || asked_plot {
-                false
-            } else {
-                self.maybe_offer_setup_confirm(&thread_id, &turn_id, &tool_name, &args, &data)
-                    .await?
-            };
-            let asked_draft =
-                if asked_mutation || asked_impact || asked_order || asked_plot || asked_setup {
+            let asked_expected =
+                if asked_mutation || asked_impact || asked_order || asked_plot {
                     false
                 } else {
-                    self.maybe_offer_draft_exists(&thread_id, &turn_id, &tool_name, &args, &data)
+                    self.maybe_offer_expected_event(
+                        &thread_id,
+                        &turn_id,
+                        &tool_name,
+                        &args,
+                        &data,
+                    )
+                    .await?
+                };
+            let asked_setup =
+                if asked_mutation || asked_impact || asked_order || asked_plot || asked_expected {
+                    false
+                } else {
+                    self.maybe_offer_setup_confirm(&thread_id, &turn_id, &tool_name, &args, &data)
                         .await?
                 };
+            let asked_draft = if asked_mutation
+                || asked_impact
+                || asked_order
+                || asked_plot
+                || asked_expected
+                || asked_setup
+            {
+                false
+            } else {
+                self.maybe_offer_draft_exists(&thread_id, &turn_id, &tool_name, &args, &data)
+                    .await?
+            };
             let asked_audit = if asked_mutation
                 || asked_impact
                 || asked_order
                 || asked_plot
+                || asked_expected
                 || asked_setup
                 || asked_draft
             {
@@ -2112,6 +2265,7 @@ impl NovelxCore {
                 || asked_impact
                 || asked_order
                 || asked_plot
+                || asked_expected
                 || asked_setup
                 || asked_draft
                 || asked_audit
@@ -2125,6 +2279,7 @@ impl NovelxCore {
                 || asked_impact
                 || asked_order
                 || asked_plot
+                || asked_expected
                 || asked_setup
                 || asked_draft
                 || asked_audit
@@ -2139,6 +2294,7 @@ impl NovelxCore {
                 || asked_impact
                 || asked_order
                 || asked_plot
+                || asked_expected
                 || asked_setup
                 || asked_draft
                 || asked_audit
@@ -2166,6 +2322,14 @@ impl NovelxCore {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
                 summary = format!("不能跳章。请先写第{next}章。");
+            } else if asked_expected {
+                summary = data
+                    .get("output")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| {
+                        "预处理预期待决策：请在审批卡选择纳入 / 跳过 / 稍后。".into()
+                    });
             } else if asked_plot {
                 let title = data
                     .get("plot_title")
@@ -3783,23 +3947,43 @@ impl NovelxCore {
                 self.maybe_offer_plot_write(&thread_id, &turn_id, &tool_name, &args, &data)
                     .await?
             };
-            let asked_setup = if asked_mutation || asked_impact || asked_order || asked_plot {
+            let asked_expected =
+                if asked_mutation || asked_impact || asked_order || asked_plot {
+                    false
+                } else {
+                    self.maybe_offer_expected_event(
+                        &thread_id, &turn_id, &tool_name, &args, &data,
+                    )
+                    .await?
+                };
+            let asked_setup = if asked_mutation
+                || asked_impact
+                || asked_order
+                || asked_plot
+                || asked_expected
+            {
                 false
             } else {
                 self.maybe_offer_setup_confirm(&thread_id, &turn_id, &tool_name, &args, &data)
                     .await?
             };
-            let asked_draft =
-                if asked_mutation || asked_impact || asked_order || asked_plot || asked_setup {
-                    false
-                } else {
-                    self.maybe_offer_draft_exists(&thread_id, &turn_id, &tool_name, &args, &data)
-                        .await?
-                };
+            let asked_draft = if asked_mutation
+                || asked_impact
+                || asked_order
+                || asked_plot
+                || asked_expected
+                || asked_setup
+            {
+                false
+            } else {
+                self.maybe_offer_draft_exists(&thread_id, &turn_id, &tool_name, &args, &data)
+                    .await?
+            };
             let asked_volume = if asked_mutation
                 || asked_impact
                 || asked_order
                 || asked_plot
+                || asked_expected
                 || asked_setup
                 || asked_draft
             {
@@ -3812,6 +3996,7 @@ impl NovelxCore {
                 || asked_impact
                 || asked_order
                 || asked_plot
+                || asked_expected
                 || asked_setup
                 || asked_draft
                 || asked_volume
@@ -3825,6 +4010,7 @@ impl NovelxCore {
                 || asked_impact
                 || asked_order
                 || asked_plot
+                || asked_expected
                 || asked_setup
                 || asked_draft
                 || asked_volume
@@ -3839,6 +4025,7 @@ impl NovelxCore {
                 || asked_impact
                 || asked_order
                 || asked_plot
+                || asked_expected
                 || asked_setup
                 || asked_draft
                 || asked_volume
@@ -3854,6 +4041,7 @@ impl NovelxCore {
                 || asked_impact
                 || asked_order
                 || asked_plot
+                || asked_expected
                 || asked_setup
                 || asked_draft
                 || asked_volume
@@ -4595,6 +4783,15 @@ impl NovelxCore {
                         )
                         .await?
                     || self
+                        .maybe_offer_expected_event(
+                            &thread_id,
+                            &turn_id,
+                            &tc.name,
+                            &args_val,
+                            &data,
+                        )
+                        .await?
+                    || self
                         .maybe_offer_setup_confirm(
                             &thread_id,
                             &turn_id,
@@ -4881,6 +5078,8 @@ impl NovelxCore {
                 pending_chapter_next: None,
                 pending_chapter_order: None,
                 pending_plot_write: None,
+                pending_expected_event: None,
+                skipped_expected_ids: Vec::new(),
                 pending_mutation: None,
                 pending_impact: None,
                 session_source: source,
@@ -5439,6 +5638,7 @@ impl NovelxCore {
             t.pending_chapter_next = None;
             t.pending_chapter_order = None;
             t.pending_plot_write = None;
+            t.pending_expected_event = None;
             t.pending_mutation = None;
             t.pending_impact = None;
         }
@@ -7187,6 +7387,26 @@ impl NovelxCore {
                 }),
             });
         }
+        if let Some(e) = &t.pending_expected_event {
+            return Some(match e.kind.as_str() {
+                "need_review" => json!({
+                    "kind": "need_expected_review",
+                    "prompt": format!(
+                        "第{}章写前：有预处理预期硬条件已满足。请选择：检阅预期 / 跳过检阅继续写。",
+                        e.chapter
+                    ),
+                    "options": self.gates.need_expected_review_options(),
+                }),
+                _ => json!({
+                    "kind": "expected_event",
+                    "prompt": format!(
+                        "预处理预期「{}」可纳入本次创作。请选择：纳入 / 本次跳过 / 稍后。",
+                        if e.event_text.is_empty() { "候选" } else { &e.event_text }
+                    ),
+                    "options": self.gates.expected_event_options(&e.event_text),
+                }),
+            });
+        }
         if let Some(a) = &t.pending_audit {
             if a.awaiting_offer {
                 return None;
@@ -7360,10 +7580,6 @@ impl NovelxCore {
 
     pub fn volume_audit_options(&self) -> Vec<UserInputOption> {
         self.gates.options("volume_audit")
-    }
-
-    pub fn setup_confirm_options(&self) -> Vec<UserInputOption> {
-        self.gates.options("setup_confirm")
     }
 
     pub fn chapter_next_options(
@@ -8129,6 +8345,231 @@ impl NovelxCore {
         Ok(true)
     }
 
+    async fn apply_expected_event_tool_side_effects(
+        &self,
+        thread_id: &str,
+        tool_name: &str,
+        data: &Value,
+    ) {
+        if tool_name != "resolve_expected_event" && tool_name != "review_expected_events" {
+            return;
+        }
+        if let Some(t) = self.threads.write().await.get_mut(thread_id) {
+            if data.get("skip_once").and_then(|v| v.as_bool()) == Some(true) {
+                if let Some(id) = data.get("event_id").and_then(|v| v.as_str()) {
+                    if !t.skipped_expected_ids.iter().any(|s| s == id) {
+                        t.skipped_expected_ids.push(id.to_string());
+                    }
+                }
+            }
+            if data.get("dismiss_expected_gate").and_then(|v| v.as_bool()) == Some(true)
+                || data.get("approved").and_then(|v| v.as_bool()) == Some(true)
+            {
+                t.pending_expected_event = None;
+            }
+        }
+    }
+
+    async fn parse_expected_event_op(
+        &self,
+        thread_id: &str,
+        text: &str,
+    ) -> Option<ExpectedEventGateOp> {
+        let pending = self
+            .threads
+            .read()
+            .await
+            .get(thread_id)
+            .and_then(|th| th.pending_expected_event.clone())?;
+        let resolved = if pending.kind == "need_review" {
+            self.gates.resolve_need_expected_review_visible(
+                text,
+                &pending.project,
+                pending.chapter,
+            )?
+        } else {
+            self.gates.resolve_expected_event_gate_visible(
+                text,
+                &pending.project,
+                &pending.event_id,
+                &pending.event_text,
+            )?
+        };
+        match resolved {
+            GateResolve::DismissGate => {
+                if let Some(t) = self.threads.write().await.get_mut(thread_id) {
+                    t.pending_expected_event = None;
+                    t.ui_turns = strip_ui_approvals(std::mem::take(&mut t.ui_turns));
+                }
+                Some(ExpectedEventGateOp::Dismiss)
+            }
+            GateResolve::Tool { name, args } => {
+                Some(ExpectedEventGateOp::Tool {
+                    tool_name: name,
+                    args,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    async fn maybe_offer_expected_event(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        tool_name: &str,
+        args: &Value,
+        data: &Value,
+    ) -> Result<bool> {
+        self.apply_expected_event_tool_side_effects(thread_id, tool_name, data)
+            .await;
+
+        let reason = data.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+        let needs_choice = data.get("needs_user_choice").and_then(|v| v.as_bool()) == Some(true);
+        let offer_volume_review =
+            data.get("offer_expected_review").and_then(|v| v.as_bool()) == Some(true);
+
+        let (kind, project, chapter, event_id, event_text, prompt, options) = if tool_name
+            == "continue_writing"
+            && data.get("blocked").and_then(|v| v.as_bool()) == Some(true)
+            && reason == "need_expected_review"
+        {
+            let project = data
+                .get("project")
+                .and_then(|v| v.as_str())
+                .or_else(|| args.get("project").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_string();
+            let chapter = data
+                .get("chapter")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32)
+                .unwrap_or(0);
+            (
+                "need_review".to_string(),
+                project,
+                chapter,
+                String::new(),
+                String::new(),
+                format!("第{chapter}章写前：有预处理预期硬条件已满足。请选择：检阅预期 / 跳过检阅继续写。"),
+                self.gates.need_expected_review_options(),
+            )
+        } else if (tool_name == "continue_writing"
+            && data.get("blocked").and_then(|v| v.as_bool()) == Some(true)
+            && reason == "expected_event_pending")
+            || (tool_name == "review_expected_events" && needs_choice)
+        {
+            let project = data
+                .get("project")
+                .and_then(|v| v.as_str())
+                .or_else(|| args.get("project").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_string();
+            let chapter = data
+                .get("chapter")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32)
+                .unwrap_or(0);
+            let event_id = data
+                .get("event_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let event_text = data
+                .get("event_text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if event_id.is_empty() {
+                return Ok(false);
+            }
+            let short: String = event_text.chars().take(40).collect();
+            (
+                "decide".to_string(),
+                project,
+                chapter,
+                event_id,
+                event_text.clone(),
+                format!("预处理预期「{short}」可纳入本次创作。请选择：纳入 / 本次跳过 / 稍后。"),
+                self.gates.expected_event_options(&event_text),
+            )
+        } else if tool_name == "design_arc_outline" && offer_volume_review {
+            let project = data
+                .get("project")
+                .and_then(|v| v.as_str())
+                .or_else(|| args.get("project").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_string();
+            let chapter = data
+                .get("chapter")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32)
+                .unwrap_or(0);
+            (
+                "need_review".to_string(),
+                project,
+                chapter,
+                String::new(),
+                String::new(),
+                "卷纲已更新，且有预处理预期硬条件已满足。请选择：检阅预期 / 稍后（继续卷交接）。"
+                    .to_string(),
+                self.gates.need_expected_review_options(),
+            )
+        } else {
+            return Ok(false);
+        };
+
+        if project.is_empty() || options.is_empty() {
+            return Ok(false);
+        }
+        {
+            let guard = self.threads.read().await;
+            if let Some(t) = guard.get(thread_id) {
+                if t.pending_mutation.is_some()
+                    || t.pending_impact.is_some()
+                    || t.pending_volume_sync.is_some()
+                    || t.pending_volume_handoff.is_some()
+                    || t.pending_setup.is_some()
+                    || t.pending_audit.is_some()
+                    || t.pending_chapter_order.is_some()
+                    || t.pending_plot_write.is_some()
+                    || t.pending_expected_event.is_some()
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        if let Some(t) = self.threads.write().await.get_mut(thread_id) {
+            t.pending_expected_event = Some(PendingExpectedEvent {
+                project: project.clone(),
+                kind,
+                chapter,
+                event_id,
+                event_text,
+            });
+            t.pending_chapter_next = None;
+            t.ui_turns = attach_ui_approval(
+                std::mem::take(&mut t.ui_turns),
+                turn_id,
+                &prompt,
+                &options,
+            );
+        }
+        self.clear_queued_inputs(thread_id).await;
+        self.emit_to_thread(
+            thread_id,
+            EventMsg::RequestUserInput {
+                thread_id: thread_id.to_string(),
+                turn_id: turn_id.to_string(),
+                prompt,
+                options,
+            },
+        )
+        .await;
+        let _ = self.persist_thread(thread_id).await;
+        Ok(true)
+    }
+
     async fn maybe_offer_plot_write(
         &self,
         thread_id: &str,
@@ -8158,6 +8599,7 @@ impl NovelxCore {
                     || t.pending_audit.is_some()
                     || t.pending_chapter_order.is_some()
                     || t.pending_plot_write.is_some()
+                    || t.pending_expected_event.is_some()
                 {
                     return Ok(false);
                 }
@@ -8365,6 +8807,15 @@ impl NovelxCore {
                         )
                         .await?;
                     let _ = self
+                        .maybe_offer_expected_event(
+                            thread_id,
+                            turn_id,
+                            "continue_writing",
+                            &write_args,
+                            &write_data,
+                        )
+                        .await?;
+                    let _ = self
                         .maybe_offer_chapter_next(
                             thread_id,
                             turn_id,
@@ -8480,6 +8931,11 @@ enum PlotWriteGateAction {
     ActivateAndWrite { project: String, title: String },
     Dismiss,
     Tool { name: String, args: Value },
+}
+
+enum ExpectedEventGateOp {
+    Dismiss,
+    Tool { tool_name: String, args: Value },
 }
 
 fn extract_volume_number(text: &str) -> Option<u32> {

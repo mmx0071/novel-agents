@@ -56,6 +56,11 @@ pub fn lore_query(project_dir: &Path, chapter: u32, outline: &str, draft: &str) 
         parts.push(format!("## Lore·未收线\n{}", open.join("\n")));
     }
 
+    let expected = crate::expected_events::format_expected_for_lore(project_dir, chapter);
+    if !expected.is_empty() {
+        parts.push(expected);
+    }
+
     // Entity cards: outline roster first, then name hits in outline/draft.
     let roster = crate::schemas::outline_entity_roster(outline);
     let mut cards = Vec::new();

@@ -2,7 +2,7 @@ const STORAGE_KEY = 'novel-agents-studio-v2'
 
 export const DRAFT_WORKSPACE_KEY = '__draft__'
 
-export function projectSessionId(projectId) {
+function projectSessionId(projectId) {
   if (!projectId) return 'novel__draft'
   return `novel__${projectId}`
 }
@@ -60,7 +60,7 @@ export function saveStudioCache(payload) {
   }
 }
 
-export function messagesForCache(messages) {
+function messagesForCache(messages) {
   return (messages || [])
     .filter((m) => m && !m.transient && !String(m.id || '').startsWith('think-'))
     .slice(-150)

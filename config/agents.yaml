@@ -206,3 +206,11 @@ agents:
         reason: 尚无总纲时可用剧情卡沉淀情节
       - condition: has_bible
         reason: 已有世界观，可用剧情卡插入与审计情节
+
+  expectation_reviewer:
+    name: 预期检阅
+    layer: story
+    tier: extended
+    description: 检阅预处理预期事件是否可纳入当前章/卷；不改正文，决策权在用户
+    # 不进章流水线；由 Studio `review_expected_events` 按需调用
+    activation: []

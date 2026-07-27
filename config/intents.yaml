@@ -181,6 +181,46 @@ intents:
       按对话要求修订本章章纲：保留未点名的情节骨架，落实点名修改（目标/冲突/关键事件/出场名单/章末钩子等），并与 CanonContext 一致。
     instructions_min_chars: 16
 
+  # 「查看预期 / 列出预设事件」→ list_expected_events
+  - id: list_expected_events
+    tool: list_expected_events
+    priority: 75
+    require_project: true
+    extract: none
+    any_keywords:
+      - 查看预期
+      - 列出预期
+      - 预设事件
+      - 预处理预期
+      - 预期事件
+      - list_expected
+    all_keyword_groups:
+      - [预期, 列表]
+      - [预期, 查看]
+      - [预设, 事件]
+    none_keywords:
+      - 检阅
+      - 登记
+      - 纳入
+
+  # 「检阅预期」→ review_expected_events
+  - id: review_expected_events
+    tool: review_expected_events
+    priority: 76
+    require_project: true
+    extract: none
+    any_keywords:
+      - 检阅预期
+      - 审预期
+      - review_expected
+    all_keyword_groups:
+      - [检阅, 预期]
+      - [审, 预期]
+    none_keywords:
+      - 审校
+      - 审阅章
+      - 这一卷
+
   # 「修正/扩写第五章」「按审校局部修订第N章」→ revise_chapter
   - id: revise_chapter
     tool: revise_chapter

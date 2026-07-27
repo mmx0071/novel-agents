@@ -57,12 +57,14 @@ export function formatArgsSummary(args) {
 }
 
 /** Tools that dump large context — chat shows a short “正在阅读…” line instead. */
-export const BULK_CONTEXT_TOOLS = new Set([
+const BULK_CONTEXT_TOOLS = new Set([
   'read_chapter',
   'query_lore',
   'query_memory',
   'list_entities',
   'list_plots',
+  'list_expected_events',
+  'review_expected_events',
   'get_project_status',
 ])
 
@@ -139,6 +141,9 @@ export function getBulkReadNav(name, args, output, projectFallback = '') {
   if (name === 'list_plots') {
     return { prefix: `正在核对${book}`, links: [{ label: '卷纲·剧情', readerTab: 'arcs' }] }
   }
+  if (name === 'list_expected_events' || name === 'review_expected_events') {
+    return { prefix: `正在查阅${book}`, links: [{ label: '预处理预期', readerTab: 'expected' }] }
+  }
   if (name === 'get_project_status') {
     return { prefix: `正在查看${book}`, links: [{ label: '总纲', readerTab: 'master' }] }
   }
@@ -164,6 +169,7 @@ export function readerTabForBulkTool(name, args) {
   const a = typeof args === 'string' ? safeParse(args) || {} : (args || {})
   if (name === 'read_chapter') return 'draft'
   if (name === 'list_plots') return 'arcs'
+  if (name === 'list_expected_events' || name === 'review_expected_events') return 'expected'
   if (name === 'list_entities') {
     if (a.kind === 'character') return 'ent:characters'
     if (a.kind === 'item') return 'ent:items'

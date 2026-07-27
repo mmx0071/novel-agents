@@ -64,6 +64,7 @@ struct TemplateVars {
     chapters: Option<Vec<u32>>,
     instructions: Option<String>,
     title: Option<String>,
+    event_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -373,10 +374,6 @@ impl GateCatalog {
         Self::materialize(self.find_option("volume_audit", text)?, &vars)
     }
 
-    pub fn resolve_setup(&self, text: &str, project: &str) -> Option<GateResolve> {
-        self.resolve_setup_progress(text, project, "setup_confirm")
-    }
-
     pub fn resolve_setup_progress(
         &self,
         text: &str,
@@ -518,6 +515,82 @@ impl GateCatalog {
         self.options("need_plot")
     }
 
+    pub fn need_expected_review_options(&self) -> Vec<UserInputOption> {
+        self.options("need_expected_review")
+    }
+
+    pub fn expected_event_options(&self, event_text: &str) -> Vec<UserInputOption> {
+        self.options("expected_event")
+            .into_iter()
+            .map(|mut o| {
+                let short: String = event_text.chars().take(24).collect();
+                if !short.is_empty() && o.id == "ee_approve" {
+                    o.label = format!("纳入「{short}」");
+                }
+                o
+            })
+            .collect()
+    }
+
+    pub fn resolve_need_expected_review(
+        &self,
+        text: &str,
+        project: &str,
+        chapter: u32,
+    ) -> Option<GateResolve> {
+        let vars = TemplateVars {
+            project: project.to_string(),
+            chapter: Some(chapter),
+            ..Default::default()
+        };
+        Self::materialize(self.find_option("need_expected_review", text)?, &vars)
+    }
+
+    pub fn resolve_need_expected_review_visible(
+        &self,
+        text: &str,
+        project: &str,
+        chapter: u32,
+    ) -> Option<GateResolve> {
+        if let Some(r) = self.resolve_need_expected_review(text, project, chapter) {
+            return Some(r);
+        }
+        let idx = parse_one_based_index(text)?;
+        let opts = self.need_expected_review_options();
+        let id = opts.get(idx.checked_sub(1)?)?.id.clone();
+        self.resolve_need_expected_review(&id, project, chapter)
+    }
+
+    pub fn resolve_expected_event_gate(
+        &self,
+        text: &str,
+        project: &str,
+        event_id: &str,
+    ) -> Option<GateResolve> {
+        let vars = TemplateVars {
+            project: project.to_string(),
+            event_id: Some(event_id.to_string()),
+            ..Default::default()
+        };
+        Self::materialize(self.find_option("expected_event", text)?, &vars)
+    }
+
+    pub fn resolve_expected_event_gate_visible(
+        &self,
+        text: &str,
+        project: &str,
+        event_id: &str,
+        event_text: &str,
+    ) -> Option<GateResolve> {
+        if let Some(r) = self.resolve_expected_event_gate(text, project, event_id) {
+            return Some(r);
+        }
+        let idx = parse_one_based_index(text)?;
+        let opts = self.expected_event_options(event_text);
+        let id = opts.get(idx.checked_sub(1)?)?.id.clone();
+        self.resolve_expected_event_gate(&id, project, event_id)
+    }
+
     pub fn resolve_need_plot(
         &self,
         text: &str,
@@ -585,10 +658,6 @@ impl GateCatalog {
         self.resolve_chapter_next(&id, project, chapter)
     }
 
-    pub fn resolve_setup_visible(&self, text: &str, project: &str) -> Option<GateResolve> {
-        self.resolve_setup_progress_visible(text, project, "setup_confirm")
-    }
-
     pub fn resolve_volume_audit_visible(
         &self,
         text: &str,
@@ -640,6 +709,7 @@ fn render_string_value(s: &str, vars: &TemplateVars) -> Value {
         "{{chapters}}" => json!(vars.chapters.clone().unwrap_or_default()),
         "{{instructions}}" => json!(vars.instructions.clone().unwrap_or_default()),
         "{{title}}" => json!(vars.title.clone().unwrap_or_default()),
+        "{{event_id}}" => json!(vars.event_id.clone().unwrap_or_default()),
         _ => {
             let mut out = s.to_string();
             out = out.replace("{{project}}", &vars.project);
@@ -660,6 +730,9 @@ fn render_string_value(s: &str, vars: &TemplateVars) -> Value {
             }
             if let Some(title) = &vars.title {
                 out = out.replace("{{title}}", title);
+            }
+            if let Some(eid) = &vars.event_id {
+                out = out.replace("{{event_id}}", eid);
             }
             json!(out)
         }
@@ -739,7 +812,9 @@ mod tests {
         }
         // Must not steal audit_queue option id "1".
         assert!(g.resolve_volume_audit("1", "demo", &[1]).is_none());
-        let r = g.resolve_setup("sc_approve", "demo").unwrap();
+        let r = g
+            .resolve_setup_progress("sc_approve", "demo", "setup_confirm")
+            .unwrap();
         match r {
             GateResolve::Tool { name, args } => {
                 assert_eq!(name, "confirm_setup");
@@ -747,7 +822,9 @@ mod tests {
             }
             _ => panic!("expected confirm_setup"),
         }
-        let r = g.resolve_setup("修改再生成", "demo").unwrap();
+        let r = g
+            .resolve_setup_progress("修改再生成", "demo", "setup_confirm")
+            .unwrap();
         match r {
             GateResolve::Tool { name, args } => {
                 assert_eq!(name, "confirm_setup");
@@ -835,7 +912,9 @@ mod tests {
             GateResolve::Tool { name, .. } => assert_eq!(name, "revise_chapter"),
             _ => panic!("expected revise as second option when plot open"),
         }
-        let r = g.resolve_setup_visible("1", "demo").unwrap();
+        let r = g
+            .resolve_setup_progress_visible("1", "demo", "setup_confirm")
+            .unwrap();
         match r {
             GateResolve::Tool { name, args } => {
                 assert_eq!(name, "confirm_setup");
@@ -894,6 +973,21 @@ mod tests {
         assert!(matches!(
             g.resolve_impact_confirm("暂不同步").unwrap(),
             GateResolve::SkipImpact
+        ));
+        let r = g
+            .resolve_expected_event_gate("纳入本次创作", "demo", "ee_abc")
+            .unwrap();
+        match r {
+            GateResolve::Tool { name, args } => {
+                assert_eq!(name, "resolve_expected_event");
+                assert_eq!(args["id"], "ee_abc");
+                assert_eq!(args["status"], "approved");
+            }
+            _ => panic!("expected resolve_expected_event tool"),
+        }
+        assert!(matches!(
+            g.resolve_need_expected_review("稍后", "demo", 3).unwrap(),
+            GateResolve::DismissGate
         ));
     }
 }

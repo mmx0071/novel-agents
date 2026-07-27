@@ -102,6 +102,65 @@ function formatEntityCard(e, emptyLabel = '设定卡') {
   return `${metaBlock}${e.markdown || `# ${e.name}`}${gaps}${mark ? `\n${mark}` : ''}`
 }
 
+const EXPECTED_KIND_LABELS = {
+  add_character: '加角色',
+  exit_character: '退场',
+  revive_character: '复活',
+  plot: '剧情',
+  setting: '设定',
+  other: '其他',
+}
+
+const EXPECTED_STATUS_LABELS = {
+  waiting: '等待中',
+  eligible: '可检阅',
+  approved: '已批准',
+  incorporated: '已纳入',
+  dismissed: '已搁置',
+}
+
+function formatExpectedConditions(c) {
+  if (!c || typeof c !== 'object') return '无硬条件（随时可检阅）'
+  const parts = []
+  if (c.min_chapter) parts.push(`≥第${c.min_chapter}章`)
+  if (c.max_chapter) parts.push(`≤第${c.max_chapter}章`)
+  if (c.volume) parts.push(`第${c.volume}卷`)
+  if (c.require_plot_id) {
+    parts.push(`剧情卡${c.require_plot_id}${c.require_plot_status ? `:${c.require_plot_status}` : ''}`)
+  } else if (c.require_plot_status) {
+    parts.push(`剧情status=${c.require_plot_status}`)
+  }
+  if (c.require_entity) {
+    parts.push(`实体${c.require_entity}${c.require_entity_status ? `:${c.require_entity_status}` : ''}`)
+  }
+  if (c.after_event_id) parts.push(`依赖${c.after_event_id}`)
+  if (c.freeform) parts.push(String(c.freeform).slice(0, 80))
+  return parts.length ? parts.join(' · ') : '无硬条件（随时可检阅）'
+}
+
+function formatExpectedEvent(e) {
+  if (!e) return '（暂无预处理预期）'
+  const kind = EXPECTED_KIND_LABELS[e.kind] || e.kind || '其他'
+  const status = EXPECTED_STATUS_LABELS[e.status] || e.status || ''
+  const elig = e.eligibility?.label || ''
+  const fit = e.last_review?.agent_fit || '—'
+  const reason = e.last_review?.reason || '—'
+  const suggestion = e.last_review?.suggestion || ''
+  return (
+    `# ${String(e.text || '未命名预期').slice(0, 80)}\n\n`
+    + `- **id**：\`${e.id || ''}\`\n`
+    + `- **类型**：${kind}\n`
+    + `- **状态**：${status}${elig ? `（${elig}）` : ''}\n`
+    + `- **来源**：${e.source === 'reader' ? '读者' : '作者'}\n`
+    + (e.entity_ref ? `- **实体**：${e.entity_ref}\n` : '')
+    + `- **触发条件**：${formatExpectedConditions(e.conditions)}\n`
+    + `- **最近检阅**：拟合 ${fit} · ${reason}\n`
+    + (suggestion ? `- **建议做法**：${suggestion}\n` : '')
+    + (e.notes ? `\n## 备注\n\n${e.notes}\n` : '')
+    + '\n> 只读展示。纳入/跳过请在对话审批卡操作；落地用设定/剧情工具后 resolve。\n'
+  )
+}
+
 function formatPlotCard(p) {
   if (!p) {
     return (
@@ -334,8 +393,10 @@ export default function App() {
   const entities = preview?.entities || {}
   const plots = sortPlotsByProgress(preview?.plots || [])
   const entityGaps = preview?.entity_gaps || []
+  const expectedEvents = preview?.expected_events || []
   const volumeGroups = buildVolumePlotGroups(arcOutlines, plots)
   const isArcNav = readerTab === 'arcs' || readerTab === 'plots'
+  const isExpectedNav = readerTab === 'expected'
 
   const activeVolumeGroup = (() => {
     if (!volumeGroups.length) return null
@@ -388,6 +449,20 @@ export default function App() {
         complete: !!e.complete,
         status: e.status || '',
         statusLabel: entityStatusLabel(e.status),
+        raw: e,
+      }))
+    }
+    if (isExpectedNav) {
+      return expectedEvents.map((e) => ({
+        kind: 'expected',
+        key: e.id || e.text || '',
+        label: String(e.text || e.id || '未命名').slice(0, 28),
+        complete: e.status === 'incorporated' || e.status === 'approved',
+        status: e.status || '',
+        statusLabel: e.eligibility?.label
+          || EXPECTED_STATUS_LABELS[e.status]
+          || e.status
+          || '',
         raw: e,
       }))
     }
@@ -473,6 +548,10 @@ export default function App() {
           ? '（软提示·不阻断写章）待补全：\n\n' + entityGaps.map((g) => `- ${g}`).join('\n')
           : '设定卡与世界观暂无明显缺口。')
     }
+    if (isExpectedNav) {
+      if (!expectedEvents.length) return '（尚无预处理预期事件）'
+      return formatExpectedEvent(selectedReaderCard || expectedEvents[0])
+    }
     if (isArcNav) {
       if (!volumeGroups.length) return '（尚无卷纲 / 剧情卡）'
       if (selectedReaderEntry?.kind === 'plot') {
@@ -554,6 +633,7 @@ export default function App() {
       show: Boolean(entities[key]?.length),
     })),
     { id: 'entity_gaps', label: '设定缺口', show: Boolean(entityGaps.length) },
+    { id: 'expected', label: '预期', show: Boolean(expectedEvents.length) },
     ...artifactTabs.map((k) => ({
       id: `art:${k}`, label: ARTIFACT_LABELS[k] || k, show: true,
     })),
@@ -562,7 +642,8 @@ export default function App() {
   const readerCanEdit = Boolean(
     project
     && readerTab
-    && readerTab !== 'entity_gaps',
+    && readerTab !== 'entity_gaps'
+    && readerTab !== 'expected',
   )
 
   const setupAwaitingConfirm = preview?.setup_phase === 'awaiting_confirm' || chatSetupGateOpen

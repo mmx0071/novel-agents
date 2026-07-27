@@ -121,5 +121,6 @@ agents:
   summarizer: analysis
   plot_acceptor: analysis
   lore_librarian: analysis
+  expectation_reviewer: analysis
 
 # orchestrator：未实现（原 Harness Phase B LLM 规划）；勿注册 agents.yaml / 勿 spawn。

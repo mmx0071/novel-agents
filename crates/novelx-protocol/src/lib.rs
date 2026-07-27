@@ -477,14 +477,6 @@ impl Submission {
             client_user_message_id: None,
         }
     }
-
-    pub fn with_id(id: impl Into<String>, op: Op) -> Self {
-        Self {
-            id: id.into(),
-            op,
-            client_user_message_id: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

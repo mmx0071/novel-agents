@@ -46,10 +46,6 @@ impl TurnGate {
         true
     }
 
-    pub async fn end(&self) {
-        *self.active.lock().await = None;
-    }
-
     /// Clear the gate only when it still belongs to `turn_id` (safe after interrupt + new turn).
     pub async fn end_if(&self, turn_id: &str) {
         let mut guard = self.active.lock().await;
@@ -73,7 +69,7 @@ mod tests {
         assert!(g.try_begin("t1".into()).await);
         assert!(!g.try_begin("t2".into()).await);
         assert_eq!(g.active_id().await.as_deref(), Some("t1"));
-        g.end().await;
+        g.end_if("t1").await;
         assert!(g.try_begin("t3".into()).await);
     }
 

@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+chrono = { workspace = true }
 novelx-draft-patch = { workspace = true }
 novelx-harness = { workspace = true }
 novelx-llm = { workspace = true }

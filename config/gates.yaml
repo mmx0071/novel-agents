@@ -299,6 +299,57 @@ gates:
           instructions: "消除正文硬规则违规：除标题行外禁止出现「第N章」元叙述，并替换禁名；只改违规句，勿整章重写。"
         aliases: [修正本章, 修正, 修改本章, 修订]
 
+  # continue_writing: hard-ok expected events need review first.
+  need_expected_review:
+    options:
+      - id: eer_review
+        label: 检阅预期
+        tool: review_expected_events
+        args:
+          project: "{{project}}"
+          chapter: "{{chapter}}"
+        aliases: [检阅预期, 检阅, 审预期]
+      - id: eer_skip_write
+        label: 跳过检阅继续写
+        tool: continue_writing
+        args:
+          project: "{{project}}"
+          chapter: "{{chapter}}"
+          confirm_skip_expected: true
+          confirm_skip: true
+        aliases: [跳过检阅继续写, 跳过检阅, 先写章]
+      - id: eer_later
+        label: 稍后
+        resolve: dismiss_gate
+        aliases: [稍后, 取消, 暂不处理]
+
+  # Expected-event candidate ready — user decides whether to incorporate.
+  expected_event:
+    options:
+      - id: ee_approve
+        label: 纳入本次创作
+        tool: resolve_expected_event
+        args:
+          project: "{{project}}"
+          id: "{{event_id}}"
+          status: approved
+          apply: true
+          confirm_skip: true
+        aliases: [纳入本次创作, 纳入, 批准]
+      - id: ee_skip
+        label: 本次跳过
+        tool: resolve_expected_event
+        args:
+          project: "{{project}}"
+          id: "{{event_id}}"
+          action: skip_once
+          confirm_skip: true
+        aliases: [本次跳过, 跳过]
+      - id: ee_later
+        label: 稍后处理
+        resolve: dismiss_gate
+        aliases: [稍后处理, 稍后, 取消]
+
   # IDs must NOT collide with audit/audit_queue ("1"/"2"/"3") — bare id match is global per gate.
   volume_audit:
     options:

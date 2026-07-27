@@ -293,10 +293,6 @@ impl LlmClient {
         }
     }
 
-    pub fn has_key(&self) -> bool {
-        self.api_key.is_some()
-    }
-
     pub fn model_for_agent(&self, agent: &str) -> String {
         if let Some(task) = self.config.agents.get(agent) {
             if let Some(m) = self.config.tasks.get(task) {
@@ -370,16 +366,6 @@ impl LlmClient {
         let model = self.model_for_agent(agent);
         let max = self.max_tokens_for_agent(agent);
         self.complete_limited(system, user, Some(&model), Some(max))
-            .await
-    }
-
-    pub async fn complete_messages(
-        &self,
-        messages: Vec<ChatMessage>,
-        model: Option<&str>,
-        tools: Option<&[ToolSpec]>,
-    ) -> Result<CompletionResult> {
-        self.complete_messages_limited(messages, model, tools, None)
             .await
     }
 
@@ -772,21 +758,6 @@ impl LlmClient {
             Some(reasoning)
         };
         Ok((content, tool_calls, delta_events, reasoning_content))
-    }
-
-    pub async fn complete_stream<F, Fut>(
-        &self,
-        system: &str,
-        user: &str,
-        model: Option<&str>,
-        on_delta: F,
-    ) -> Result<String>
-    where
-        F: FnMut(String) -> Fut,
-        Fut: std::future::Future<Output = ()>,
-    {
-        self.complete_stream_limited(system, user, model, None, on_delta)
-            .await
     }
 
     pub async fn complete_stream_limited<F, Fut>(

@@ -63,6 +63,7 @@ chapter_planner → lore_librarian → writer
 | foreshadow_tracker | 未收束伏笔 |
 | literary_editor | **非 MVP**。规则建议（近章审校失败率偏高）或 Studio `activate_agents`；用户点名润色时持久激活，勿每章必跑 |
 | master_planner / arc_planner | 尚无总纲/卷纲 |
+| expectation_reviewer | **不进章流水线**。由 Studio `review_expected_events` 在硬条件满足时调用；用户决策纳入/跳过 |
 
 ## 人工门控
 

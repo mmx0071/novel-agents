@@ -4,6 +4,7 @@ pub mod body_state;
 pub mod cards;
 pub mod chapter_gate;
 pub mod context;
+pub mod expected_events;
 pub mod impact;
 pub mod lore;
 pub mod memory;
@@ -26,6 +27,14 @@ pub use body_state::{format_body_state_board, format_body_state_board_for_charac
 pub use chapter_gate::{check_chapter_order, check_revise_target, ChapterOrderBlock};
 pub use context::{build_chapter_context, read_world_doc, ChapterContextPack, ContextProfile};
 pub use lore::{lore_assert_from_summary, lore_query};
+pub use expected_events::{
+    agent_fit_actionable, build_eval_context, conditions_from_value, count_by_status,
+    enqueue_expected_event, eval_hard_ok, format_conditions_line, format_events_summary,
+    format_expected_for_context, format_expected_for_lore, list_events_for_preview,
+    list_gate_candidates, list_hard_ok_candidates, load_expected_events, needs_fresh_review,
+    resolve_expected_event, save_expected_events, set_event_review, update_expected_event,
+    ExpectedConditions, ExpectedEvent, ExpectedEventStore, ExpectedReview,
+};
 pub use memory::{
     apply_summary_json, load_memory, recall_archived_summaries, save_memory, ProjectMemory,
 };

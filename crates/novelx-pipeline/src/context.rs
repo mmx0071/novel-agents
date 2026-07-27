@@ -73,8 +73,29 @@ pub fn build_chapter_context(
         ));
     }
 
+    // --- 预处理预期（已批准约束 + 等待列表；勿擅自兑现）---
+    let expected_block = crate::expected_events::format_expected_for_context(
+        project_dir,
+        chapter,
+        profile == ContextProfile::Pacing,
+    );
+    if !expected_block.is_empty() {
+        hits.push("expected_events".into());
+        sections.push((
+            "预处理预期".into(),
+            truncate_chars(
+                &expected_block,
+                if profile == ContextProfile::Pacing {
+                    600
+                } else {
+                    1200
+                },
+            ),
+        ));
+    }
+
     if profile == ContextProfile::Pacing {
-        // Pacing: only act + memory/threads.
+        // Pacing: only act + memory/threads + approved expected.
         return assemble(sections, hits);
     }
 

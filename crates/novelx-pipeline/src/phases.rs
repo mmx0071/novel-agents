@@ -130,11 +130,6 @@ impl VolumePhase {
             _ => None,
         }
     }
-
-    /// Writing is only allowed while drafting a volume.
-    pub fn allows_writing(self) -> bool {
-        matches!(self, Self::DraftingVolume)
-    }
 }
 
 fn path_nonempty(path: &Path) -> bool {

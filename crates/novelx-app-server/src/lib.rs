@@ -805,6 +805,7 @@ fn build_preview(repo_root: &std::path::Path, name: &str) -> serde_json::Value {
 
     let entity_gaps_list = novelx_pipeline::collect_entity_gaps(&dir);
     let entity_gaps_display = display_entity_gaps(&entity_gaps_list);
+    let expected_events = novelx_pipeline::list_events_for_preview(&dir, next.max(1));
     // Same chapter index the next writer run would lock against.
     let body_state_board = format_body_state_board(&dir, next.max(1));
     // Progress authority: published_count + on-disk chapters — ignore stale state.extra.chapters.
@@ -844,6 +845,7 @@ fn build_preview(repo_root: &std::path::Path, name: &str) -> serde_json::Value {
         "arc_outlines": arc_outlines,
         "entity_gaps": entity_gaps_list,
         "entity_gaps_display": entity_gaps_display,
+        "expected_events": expected_events,
         "body_state_board": body_state_board,
         "published_count": published,
         "next_chapter": next,
