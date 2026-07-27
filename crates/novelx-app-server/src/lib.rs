@@ -3,14 +3,17 @@
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
-use axum::response::{Html, IntoResponse, Json};
-use axum::http::StatusCode;
+use axum::response::{Html, IntoResponse, Json, Response};
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::routing::{delete, get, post, put};
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
 use novelx_core::NovelxCore;
 use novelx_harness::{ContentRulesConfig, NamingRules, StudioPolicies};
-use novelx_llm::{load_llm_config, LlmClient};
+use novelx_llm::{
+    apply_llm_form_to_yaml, load_llm_config, load_llm_form_settings, upsert_dotenv_key,
+    validate_llm_form_put, LlmClient, LlmFormPut,
+};
 use novelx_skills::SkillScope;
 use novelx_pipeline::cards::load_markdown_cards;
 use novelx_pipeline::plots::{load_plot_cards_by_progress, rebuild_plot_index};
@@ -132,6 +135,10 @@ pub async fn serve(repo_root: PathBuf, addr: SocketAddr) -> Result<()> {
             get(content_rules_get).put(content_rules_put),
         )
         .route(
+            "/api/config/content_rules/flags",
+            put(content_rules_flags_put),
+        )
+        .route(
             "/api/config/naming_rules",
             get(naming_rules_get).put(naming_rules_put),
         )
@@ -139,6 +146,7 @@ pub async fn serve(repo_root: PathBuf, addr: SocketAddr) -> Result<()> {
             "/api/config/policies",
             get(policies_get).put(policies_put),
         )
+        .route("/api/config/llm", get(llm_get).put(llm_put))
         .route("/api/library", get(library))
         .route("/api/library/{name}", get(library_one).delete(library_delete))
         .route("/api/projects/{name}/preview", get(preview))
@@ -404,6 +412,16 @@ fn write_config_text(config_root: &std::path::Path, relative: &str, content: &st
     std::fs::write(&path, content).map_err(|e| format!("写入失败：{e}"))
 }
 
+/// JSON with explicit UTF-8 charset (avoids rare browser mis-decode of CJK).
+fn json_utf8(status: StatusCode, value: serde_json::Value) -> Response {
+    let mut res = (status, Json(value)).into_response();
+    res.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    res
+}
+
 async fn content_rules_get(State(state): State<AppState>) -> impl IntoResponse {
     let cfg_root = state.core.config_root();
     let cfg = ContentRulesConfig::load_from_config_root(cfg_root);
@@ -412,12 +430,15 @@ async fn content_rules_get(State(state): State<AppState>) -> impl IntoResponse {
     } else {
         cfg.raw_yaml.clone()
     };
-    Json(serde_json::json!({
-        "ok": true,
-        "path": "config/content_rules.yaml",
-        "yaml": yaml,
-        "rules": cfg.catalog(),
-    }))
+    json_utf8(
+        StatusCode::OK,
+        serde_json::json!({
+            "ok": true,
+            "path": "config/content_rules.yaml",
+            "yaml": yaml,
+            "rules": cfg.catalog(),
+        }),
+    )
 }
 
 async fn content_rules_put(
@@ -427,25 +448,73 @@ async fn content_rules_put(
     match ContentRulesConfig::parse_yaml(&req.content) {
         Ok(cfg) => match write_config_text(state.core.config_root(), "content_rules.yaml", &req.content)
         {
-            Ok(()) => (
+            Ok(()) => json_utf8(
                 StatusCode::OK,
-                Json(serde_json::json!({
+                serde_json::json!({
                     "ok": true,
                     "rules": cfg.catalog(),
-                })),
-            )
-                .into_response(),
-            Err(e) => (
+                    "yaml": req.content,
+                }),
+            ),
+            Err(e) => json_utf8(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"ok": false, "error": e})),
-            )
-                .into_response(),
+                serde_json::json!({"ok": false, "error": e}),
+            ),
         },
-        Err(e) => (
+        Err(e) => json_utf8(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"ok": false, "error": e})),
-        )
-            .into_response(),
+            serde_json::json!({"ok": false, "error": e}),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ContentRuleFlagsPut {
+    id: String,
+    enabled: Option<bool>,
+    blocking: Option<bool>,
+}
+
+/// Toggle a single rule's enabled/blocking without rewriting the whole YAML editor buffer.
+async fn content_rules_flags_put(
+    State(state): State<AppState>,
+    Json(req): Json<ContentRuleFlagsPut>,
+) -> impl IntoResponse {
+    let existing = read_config_text(state.core.config_root(), "content_rules.yaml").unwrap_or_default();
+    match ContentRulesConfig::patch_rule_flags(
+        &existing,
+        req.id.trim(),
+        req.enabled,
+        req.blocking,
+    ) {
+        Ok(patched) => match ContentRulesConfig::parse_yaml(&patched) {
+            Ok(cfg) => match write_config_text(
+                state.core.config_root(),
+                "content_rules.yaml",
+                &patched,
+            ) {
+                Ok(()) => json_utf8(
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "ok": true,
+                        "yaml": patched,
+                        "rules": cfg.catalog(),
+                    }),
+                ),
+                Err(e) => json_utf8(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"ok": false, "error": e}),
+                ),
+            },
+            Err(e) => json_utf8(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"ok": false, "error": e}),
+            ),
+        },
+        Err(e) => json_utf8(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"ok": false, "error": e}),
+        ),
     }
 }
 
@@ -524,6 +593,170 @@ async fn policies_put(
             Json(serde_json::json!({"ok": false, "error": e})),
         )
             .into_response(),
+    }
+}
+
+/// GET never returns plaintext API keys — only has_api_key + optional suffix.
+async fn llm_get(State(state): State<AppState>) -> impl IntoResponse {
+    let path = state.core.config_root().join("llm.yaml");
+    match load_llm_form_settings(&path) {
+        Ok(settings) => {
+            // Defense-in-depth: serialize via typed settings (no api_key field).
+            let body = serde_json::json!({
+                "ok": true,
+                "path": "config/llm.yaml",
+                "settings": settings,
+                "runtime": {
+                    "has_api_key": state.core.llm().has_api_key(),
+                    "api_key_suffix": state.core.llm().api_key_suffix(),
+                    "api_key_env": state.core.llm().api_key_env(),
+                    "default_model": state.core.llm().snapshot_config().default_model,
+                },
+            });
+            if llm_json_leaks_secret(&body) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": "拒绝返回含密钥的响应",
+                    })),
+                )
+                    .into_response();
+            }
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("读取 LLM 配置失败：{e}"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn llm_put(State(state): State<AppState>, Json(req): Json<LlmFormPut>) -> impl IntoResponse {
+    if let Err(e) = validate_llm_form_put(&req) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": e})),
+        )
+            .into_response();
+    }
+
+    let new_key = req
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    // Strip key from the copy used for yaml patch (never persist into llm.yaml).
+    let mut put = req;
+    put.api_key = None;
+
+    let active_env = put
+        .providers
+        .iter()
+        .find(|p| p.name == put.default_provider)
+        .map(|p| p.api_key_env.trim().to_string())
+        .unwrap_or_default();
+
+    if let Some(key) = new_key {
+        let env_path = state.repo_root.join(".env");
+        if let Err(e) = upsert_dotenv_key(&env_path, &active_env, &key) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok": false, "error": e})),
+            )
+                .into_response();
+        }
+        info!(env = %active_env, "LLM API key updated via Web (value not logged)");
+    }
+
+    let existing = read_config_text(state.core.config_root(), "llm.yaml").unwrap_or_default();
+    let yaml = match apply_llm_form_to_yaml(&existing, &put) {
+        Ok(y) => y,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok": false, "error": e})),
+            )
+                .into_response();
+        }
+    };
+    if let Err(e) = write_config_text(state.core.config_root(), "llm.yaml", &yaml) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": e})),
+        )
+            .into_response();
+    }
+    if let Err(e) = state.core.reload_llm() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": e})),
+        )
+            .into_response();
+    }
+
+    match load_llm_form_settings(&state.core.config_root().join("llm.yaml")) {
+        Ok(settings) => {
+            let body = serde_json::json!({
+                "ok": true,
+                "settings": settings,
+                "runtime": {
+                    "has_api_key": state.core.llm().has_api_key(),
+                    "api_key_suffix": state.core.llm().api_key_suffix(),
+                    "api_key_env": state.core.llm().api_key_env(),
+                    "default_model": state.core.llm().snapshot_config().default_model,
+                },
+            });
+            if llm_json_leaks_secret(&body) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": "拒绝返回含密钥的响应",
+                    })),
+                )
+                    .into_response();
+            }
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Err(e) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "warning": format!("已保存并热重载，但回读表单失败：{e}"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Reject responses that accidentally embed a long secret-like token under api_key keys.
+fn llm_json_leaks_secret(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Object(map) => {
+            for (k, child) in map {
+                let key = k.to_ascii_lowercase();
+                if key == "api_key" || key == "authorization" {
+                    if let Some(s) = child.as_str() {
+                        if s.trim().len() >= 8 {
+                            return true;
+                        }
+                    }
+                }
+                if llm_json_leaks_secret(child) {
+                    return true;
+                }
+            }
+            false
+        }
+        serde_json::Value::Array(arr) => arr.iter().any(llm_json_leaks_secret),
+        _ => false,
     }
 }
 
@@ -1347,5 +1580,31 @@ mod tests {
         assert!(!is_framework_skill_path(&dir, &projects));
         let _ = outside;
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn llm_get_shape_does_not_flag_suffix_fields() {
+        let safe = serde_json::json!({
+            "ok": true,
+            "settings": {
+                "providers": [{
+                    "name": "deepseek",
+                    "api_key_env": "DEEPSEEK_API_KEY",
+                    "has_api_key": true,
+                    "api_key_suffix": "abcd"
+                }]
+            },
+            "runtime": {
+                "has_api_key": true,
+                "api_key_suffix": "abcd",
+                "api_key_env": "DEEPSEEK_API_KEY"
+            }
+        });
+        assert!(!llm_json_leaks_secret(&safe));
+
+        let leaked = serde_json::json!({
+            "settings": { "api_key": "sk-leaked-secret-value" }
+        });
+        assert!(llm_json_leaks_secret(&leaked));
     }
 }

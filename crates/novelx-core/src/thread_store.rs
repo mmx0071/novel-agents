@@ -33,9 +33,19 @@ pub struct PersistedThread {
     #[serde(default)]
     pub pending_expected_event: Option<crate::PendingExpectedEvent>,
     #[serde(default)]
+    pub pending_setting_blocker: Option<crate::PendingSettingBlocker>,
+    #[serde(default)]
     pub skipped_expected_ids: Vec<String>,
     #[serde(default)]
     pub pending_mutation: Option<crate::PendingMutation>,
+    #[serde(default)]
+    pub pending_mutation_followup: Option<crate::PendingMutationFollowup>,
+    #[serde(default)]
+    pub pending_studio_next: Option<crate::studio_next::PendingStudioNext>,
+    #[serde(default)]
+    pub awaiting_studio_next: Option<crate::studio_next::AwaitingStudioNext>,
+    #[serde(default)]
+    pub outline_rewrite_active: bool,
     #[serde(default)]
     pub pending_impact: Option<crate::PendingImpact>,
 }
@@ -89,8 +99,13 @@ pub fn from_state(thread_id: &str, state: &ThreadState) -> PersistedThread {
         pending_chapter_order: state.pending_chapter_order.clone(),
         pending_plot_write: state.pending_plot_write.clone(),
         pending_expected_event: state.pending_expected_event.clone(),
+        pending_setting_blocker: state.pending_setting_blocker.clone(),
         skipped_expected_ids: state.skipped_expected_ids.clone(),
         pending_mutation: state.pending_mutation.clone(),
+        pending_mutation_followup: state.pending_mutation_followup.clone(),
+        pending_studio_next: state.pending_studio_next.clone(),
+        awaiting_studio_next: state.awaiting_studio_next.clone(),
+        outline_rewrite_active: state.outline_rewrite_active,
         pending_impact: state.pending_impact.clone(),
     }
 }
@@ -113,15 +128,23 @@ pub fn into_state(p: PersistedThread) -> (String, ThreadState) {
             ui_turns: p.ui_turns,
             pending_audit: p.pending_audit,
             pending_volume_sync: p.pending_volume_sync,
-            pending_volume_audit: p.pending_volume_audit,
+            // Deprecated situational gates no longer render cards — drop on load.
+            pending_volume_audit: None,
             pending_setup: p.pending_setup,
             pending_volume_handoff: p.pending_volume_handoff,
-            pending_chapter_next: p.pending_chapter_next,
+            pending_chapter_next: p
+                .pending_chapter_next
+                .filter(|c| c.suggest_next.is_none()),
             pending_chapter_order: p.pending_chapter_order,
-            pending_plot_write: p.pending_plot_write,
-            pending_expected_event: p.pending_expected_event,
+            pending_plot_write: None,
+            pending_expected_event: None,
+            pending_setting_blocker: None,
             skipped_expected_ids: p.skipped_expected_ids,
             pending_mutation: p.pending_mutation,
+            pending_mutation_followup: None,
+            pending_studio_next: p.pending_studio_next,
+            awaiting_studio_next: p.awaiting_studio_next,
+            outline_rewrite_active: p.outline_rewrite_active,
             pending_impact: p.pending_impact,
             session_source: SessionSource::Root,
             lifecycle: AgentLifecycle::Running,

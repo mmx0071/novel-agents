@@ -560,6 +560,8 @@ fn apply_sync_json(
                 .unwrap_or("");
             let _ = write_arc_progress(project_dir, volume, progress, revision);
         }
+        // Volume rollup is written only via confirm_volume_memory / sync with
+        // confirm_memory=true (human-gated), not silently here.
     }
 
     let stub_hint = if incomplete_entities.is_empty() {

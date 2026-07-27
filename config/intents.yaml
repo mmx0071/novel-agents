@@ -156,6 +156,48 @@ intents:
       - 进度
       - 对照
 
+  # 「重建总纲 / 生成总纲」→ design_master_outline（ready 项目也可确定性重入）
+  - id: design_master_outline
+    tool: design_master_outline
+    priority: 85
+    require_project: true
+    extract: none
+    any_keywords:
+      - 重建总纲
+      - 生成总纲
+      - 写总纲
+      - 更新总纲
+      - design_master_outline
+    all_keyword_groups:
+      - [重写, 总纲]
+      - [修订, 总纲]
+    none_keywords:
+      - 卷纲
+      - 章纲
+      - 剧情卡
+
+  # 「生成卷纲 / 重建卷纲 / 更新卷纲」→ design_arc_outline
+  - id: design_arc_outline
+    tool: design_arc_outline
+    priority: 84
+    require_project: true
+    extract: none
+    any_keywords:
+      - 重建卷纲
+      - 生成卷纲
+      - 写卷纲
+      - 更新卷纲
+      - design_arc_outline
+    all_keyword_groups:
+      - [重写, 卷纲]
+      - [修订, 卷纲]
+    none_keywords:
+      - 总纲
+      - 章纲
+      - 剧情卡
+      - 审这一卷
+      - 卷末复盘
+
   # 「改第N章章纲 / 修正章纲 / 重写章纲」→ revise_outline（优先于改正文）
   - id: revise_outline
     tool: revise_outline

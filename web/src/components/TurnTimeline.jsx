@@ -33,10 +33,12 @@ export default function TurnTimeline({
     <div className="nx-turns">
       {turns.map((turn, idx) => {
         // Prefer sticky liveTurnId so mid-stream status flaps don't blink「进行中」.
-        const isLiveTurn = liveTurnId
+        // Never keep「进行中」on a finished turn even if loading/liveTurnId lag.
+        const turnFinished = turn.status === 'complete' || turn.status === 'aborted'
+        const isLiveTurn = !turnFinished && (liveTurnId
           ? turn.id === liveTurnId
           : (idx === turns.length - 1
-            && (turn.status === 'running' || turn.status === 'awaiting'))
+            && (turn.status === 'running' || turn.status === 'awaiting')))
         const running = isLiveTurn
           && (turn.status === 'running' || turn.status === 'awaiting' || loading)
         const hasToolOrSkill = (turn.items || []).some(

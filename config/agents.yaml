@@ -138,14 +138,14 @@ agents:
     name: 伏笔追踪
     layer: qa
     tier: extended
-    description: 追踪伏笔埋收
+    description: 追踪伏笔埋收（读 lore/foreshadow_index，禁止静默丢历史未收线）
     activation:
       - condition: active_foreshadows_gt
-        threshold: 5
-        reason: 活跃伏笔超过 5 条
+        threshold: 0
+        reason: 已有未收伏笔，须每章核销/延期
       - condition: chapter_count_gt
-        threshold: 10
-        reason: 超过 10 章需系统化伏笔管理
+        threshold: 2
+        reason: 第 3 章起系统化伏笔管理，降低长程丢失
 
   pacing_reviewer:
     name: 节奏审查

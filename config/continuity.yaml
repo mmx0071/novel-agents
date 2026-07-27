@@ -1,0 +1,30 @@
+# Long-horizon continuity budgets (CanonContext / memory recall).
+# Tiers apply by published_count (已发布章数). First matching max_published wins;
+# the last tier is the fallback for larger novels.
+version: 1
+
+tiers:
+  - max_published: 30
+    memory_section: 2000
+    dangling_show: 8
+    archive_thread_recall: 2
+    summary_recall: 2
+    asserted_facts: 6
+    volume_rollups: 2
+    bridge_chars: 900
+  - max_published: 120
+    memory_section: 2400
+    dangling_show: 10
+    archive_thread_recall: 3
+    summary_recall: 4
+    asserted_facts: 8
+    volume_rollups: 3
+    bridge_chars: 1000
+  - max_published: 0   # 0 = unlimited / default for 120+
+    memory_section: 2800
+    dangling_show: 12
+    archive_thread_recall: 4
+    summary_recall: 6
+    asserted_facts: 10
+    volume_rollups: 4
+    bridge_chars: 1100

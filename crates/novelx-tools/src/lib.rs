@@ -37,7 +37,8 @@ use novelx_pipeline::{
     maybe_advance_setup_after_outlines, normalize_plot_card_best_effort,
     parse_chapter_outline_text, plot_design_blocked_reason, read_arc_outline_excerpt,
     read_chapter_draft, rebuild_plot_index, resolve_setup_next_step, resolve_setup_phase,
-    resolve_volume_phase, run_setting_audit, run_volume_audit, run_volume_sync, set_volume_phase,
+    confirm_volume_memory, resolve_volume_phase, run_setting_audit,
+    run_volume_audit, run_volume_sync, set_volume_phase,
     steer_revision_options, update_plot_card, validate_arc_outline, validate_bible,
     validate_entity_card, validate_master_outline, volume_chapter_span, ContextProfile, EntityKind,
     PhaseEnforceFlags, PlotWriteGate, PlotWriteMode, RevisionOptions, RunMode, SettingAuditPackOpts,
@@ -150,6 +151,7 @@ pub struct UpsertSetting;
 pub struct DesignMasterOutline;
 pub struct DesignArcOutline;
 pub struct SyncVolume;
+pub struct ConfirmVolumeMemory;
 pub struct CreateNovel;
 pub struct SupplementSetting;
 pub struct AuditSetting;
@@ -393,6 +395,10 @@ impl ToolHandler for ReviseChapter {
                 "project":{"type":"string"},
                 "chapter":{"type":"integer"},
                 "instructions":{"type":"string","description":"修订要求，如：扩写到3000字、重写本章、改第3段"},
+                "audit_issues":{
+                    "type":"array",
+                    "description":"结构化审校问题（含 id/quote/location）；局部补丁优先按此定位"
+                },
                 "apply":{"type":"boolean","description":"true=确认落盘；默认预览"},
                 "mutation_id":{"type":"string"},
                 "cached_patches":{"description":"局部修订确认时携带的 before/after 补丁数组"}
@@ -404,6 +410,11 @@ impl ToolHandler for ReviseChapter {
         let project = args["project"].as_str().unwrap_or("").to_string();
         let chapter = args["chapter"].as_u64().unwrap_or(1) as u32;
         let instructions = args["instructions"].as_str().unwrap_or("").to_string();
+        let audit_issues: Vec<Value> = args
+            .get("audit_issues")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
         let dir = project_dir(&ctx.projects_root, &project);
         if let Some(msg) = check_revise_target(&dir, chapter) {
             return Ok(ToolResult {
@@ -419,6 +430,9 @@ impl ToolHandler for ReviseChapter {
         // Expansion / rewrite → full Writer; segment edits → local patch.
         let mut rev = steer_revision_options(&instructions);
         rev.revision_mode = true;
+        if !audit_issues.is_empty() {
+            rev.audit_issues = audit_issues.clone();
+        }
         let prefer_local = rev.prefer_local_patch;
 
         if apply_without_mutation_id(&ctx.config_root, &args) {
@@ -470,6 +484,7 @@ impl ToolHandler for ReviseChapter {
                             "project": project,
                             "chapter": chapter,
                             "instructions": instructions,
+                            "audit_issues": audit_issues,
                             "cached_patches": preview.patches,
                         }),
                     ));
@@ -523,6 +538,7 @@ impl ToolHandler for ReviseChapter {
                 "project": project,
                 "chapter": chapter,
                 "instructions": instructions,
+                "audit_issues": audit_issues,
             }),
         ) {
             return Ok(prev);
@@ -756,7 +772,15 @@ impl ToolHandler for AuditChapter {
             "type":"object",
             "properties":{
                 "project":{"type":"string"},
-                "chapter":{"type":"integer"}
+                "chapter":{"type":"integer"},
+                "verify_previous":{
+                    "type":"boolean",
+                    "description":"true=复审模式：核实上一轮 issues 是否已修（有未关闭问题时默认开启）"
+                },
+                "full_rescan":{
+                    "type":"boolean",
+                    "description":"true=强制全量重扫；默认在有上一轮未关闭问题时走复审，避免越审越多"
+                }
             },
             "required":["project","chapter"]
         })
@@ -764,14 +788,25 @@ impl ToolHandler for AuditChapter {
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
         let project = args["project"].as_str().unwrap_or("").to_string();
         let chapter = args["chapter"].as_u64().unwrap_or(1) as u32;
+        let verify_previous = args
+            .get("verify_previous")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let full_rescan = args
+            .get("full_rescan")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         // Audit must not use spawn/wait_agent — that path has stranded studio turns
         // after consistency_auditor finished while the parent stayed in wait_agent.
+        let mut rev = RevisionOptions::default();
+        rev.verify_previous = verify_previous;
+        rev.full_rescan = full_rescan;
         let run = run_pipeline_streaming(
             ctx,
             &project,
             chapter,
             RunMode::AuditOnly,
-            RevisionOptions::default(),
+            rev,
         )
         .await?;
         // When progress is live, the report already streamed via LlmDelta / step lines.
@@ -2172,14 +2207,19 @@ impl ToolHandler for DesignMasterOutline {
             Some(cached) => cached,
             None => {
                 let skill = load_agent_skill(ctx, "master-planner");
+                let target = parse_target_chapters_hint(brief)
+                    .unwrap_or(state.target_chapters)
+                    .max(1);
+                let scale = longform_scale_hint(target, brief);
                 let prompt = format!(
-                    "为小说《{}》（题材：{}）撰写/更新总纲 Markdown。\n\
+                    "为小说《{}》（题材：{}；目标体量约 {target} 章）撰写/更新总纲 Markdown。\n\
                      硬性输出要求：\n\
                      - 只输出 Markdown 正文本身，第一行必须是 `# 总纲`（可带副标题）\n\
-                     - 必须含 H2：一句话卖点、三幕结构（或分卷）、主角弧、主线冲突；可含中后期升级台阶\n\
+                     - 必须含 H2：一句话卖点、分卷（超长篇优先 ## 分卷，勿用短篇三幕敷衍）、主角弧、主线冲突；可含中后期升级台阶\n\
                      - 禁止寒暄、禁止自我介绍、禁止用 ``` 代码块包裹、禁止提及文件路径 / story_outline.json / JSON\n\
-                     - 禁止规划「第N章」列表或全书目标章数\n\
-                     用户补充：{brief}\n\n现有总纲（可空，可在其上修订）：\n{existing}",
+                     - 禁止逐章列表（第1章/第2章…）；但必须按目标体量给出清晰分卷骨架与每卷目标/终止条件\n\
+                     {scale}\n\
+                     用户补充：{brief}\n\n现有总纲（可空，可在其上修订；命名以用户补充与 Bible 为准）：\n{existing}",
                     state.name, state.genre
                 );
                 ctx.llm
@@ -2204,9 +2244,10 @@ impl ToolHandler for DesignMasterOutline {
         };
         let structure_pack = build_structure_audit_candidate(&dir, "总纲", &text);
         let audit = tool_setting_audit(ctx, project, "拟更新总纲", &structure_pack).await?;
-        let setup_soft = resolve_setup_phase(&dir) != SetupPhase::Ready;
+        // Outline rewrite mid-serial almost always conflicts with stale names in Bible/正文.
+        // Soft-escape so preview/apply still work; BLOCKER surfaces as warning, not silent no-op.
         if let Some(blocked) =
-            mutation_gate::require_audit_pass_with(&audit, force, setup_soft)
+            mutation_gate::require_audit_pass_with(&audit, force, /* soft_escape */ true)
         {
             return Ok(blocked);
         }
@@ -2235,6 +2276,9 @@ impl ToolHandler for DesignMasterOutline {
         if !brief.is_empty() {
             let _ = lock_brief(&dir, brief);
         }
+        if let Some(n) = parse_target_chapters_hint(brief) {
+            let _ = novelx_pipeline::update_target_chapters(&dir, n);
+        }
         // Merge into story_outline.json; preserve acts and attach chapter bounds when parseable.
         let outline_path = art.join("story_outline.json");
         let mut outline: Value = if outline_path.exists() {
@@ -2254,16 +2298,21 @@ impl ToolHandler for DesignMasterOutline {
         }
         let setup = maybe_advance_setup_after_outlines(&dir).unwrap_or(SetupPhase::Collecting);
         let offer_setup = setup == SetupPhase::AwaitingConfirm;
+        let mut output = format!(
+            "已写入总纲 {}（并同步 story_outline.json）；setup_phase={}",
+            path.display(),
+            setup.as_str()
+        );
+        if audit.blocker {
+            output.push_str("\n⚠ 结构/设定审计仍有 BLOCKER（已落盘，建议随后统一命名并同步卷纲/正文）。");
+        }
         Ok(ToolResult {
-            output: format!(
-                "已写入总纲 {}（并同步 story_outline.json）；setup_phase={}",
-                path.display(),
-                setup.as_str()
-            ),
+            output,
             data: json!({
                 "path": path,
                 "setup_phase": setup.as_str(),
                 "offer_setup_confirm": offer_setup,
+                "outline_rewrite": true,
                 "audit": mutation_gate::audit_preview_value(&audit),
                 "impact_source": impact_source_master(&existing, &text),
             }),
@@ -2346,14 +2395,22 @@ impl ToolHandler for DesignArcOutline {
                     )
                 };
                 let skill = load_agent_skill(ctx, "arc-planner");
+                let bible_snip = std::fs::read_to_string(art.join("bible.md"))
+                    .unwrap_or_default()
+                    .chars()
+                    .take(1800)
+                    .collect::<String>();
                 let prompt = format!(
                     "为《{}》第{arc}卷写/修订卷纲 Markdown：卷目标、冲突阶梯、关键节点、人物弧。\
                      标题必须是 `# 第{arc}卷 · …`（只写本卷，不要覆盖或改写其他卷）。\
                      **必须**含「## 卷末终止条件」条列（≥2条可核验条件）；不定章数，禁止写第A–B章硬区间。\
                      若已有本卷卷纲：只按用户补充改冲突点，禁止整卷无故重写。\
-                     用户补充：{brief}\n\n总纲节选：\n{}\n\n{current_block}\n\n{prior}",
+                     **命名硬约束**：组织/阵营/主角名必须以用户补充、总纲与世界观 Bible 为准；\
+                     禁止把外勤代号或内部分支写成独立阵营；禁止沿用已被 brief 废止的旧组织名。\
+                     用户补充：{brief}\n\n总纲节选：\n{}\n\n世界观节选：\n{}\n\n{current_block}\n\n{prior}",
                     state.name,
                     master.chars().take(2500).collect::<String>(),
+                    bible_snip,
                 );
                 ctx.llm
                     .complete(
@@ -2379,9 +2436,9 @@ impl ToolHandler for DesignArcOutline {
         let structure_pack =
             build_structure_audit_candidate(&dir, &format!("第{arc}卷卷纲"), &text);
         let audit = tool_setting_audit(ctx, project, "拟更新卷纲", &structure_pack).await?;
-        let setup_soft = resolve_setup_phase(&dir) != SetupPhase::Ready;
+        // Same as master outline: allow mid-serial rewrite despite naming drift BLOCKERs.
         if let Some(blocked) =
-            mutation_gate::require_audit_pass_with(&audit, force, setup_soft)
+            mutation_gate::require_audit_pass_with(&audit, force, /* soft_escape */ true)
         {
             return Ok(blocked);
         }
@@ -2438,19 +2495,23 @@ impl ToolHandler for DesignArcOutline {
             .map(|s| s.next_chapter.max(1))
             .unwrap_or(1);
         let ee_hard = novelx_pipeline::list_hard_ok_candidates(&dir, next_ch).len();
+        let mut output = format!(
+            "已写入第{arc}卷卷纲 {}（终止条件 {} 条）；setup_phase={}；volume_phase={}{}",
+            path.display(),
+            cond_n,
+            setup.as_str(),
+            vol_phase.as_str(),
+            if ee_hard > 0 {
+                format!("；有 {ee_hard} 条预期硬条件已满足，建议 review_expected_events(scope=volume)")
+            } else {
+                String::new()
+            }
+        );
+        if audit.blocker {
+            output.push_str("\n⚠ 结构/设定审计仍有 BLOCKER（已落盘，建议随后统一命名并与总纲/Bible 对齐）。");
+        }
         Ok(ToolResult {
-            output: format!(
-                "已写入第{arc}卷卷纲 {}（终止条件 {} 条）；setup_phase={}；volume_phase={}{}",
-                path.display(),
-                cond_n,
-                setup.as_str(),
-                vol_phase.as_str(),
-                if ee_hard > 0 {
-                    format!("；有 {ee_hard} 条预期硬条件已满足，建议 review_expected_events(scope=volume)")
-                } else {
-                    String::new()
-                }
-            ),
+            output,
             data: json!({
                 "path": path,
                 "arc": arc,
@@ -2461,6 +2522,7 @@ impl ToolHandler for DesignArcOutline {
                 "offer_volume_handoff": vol_phase == VolumePhase::AwaitingNextPlot,
                 "offer_expected_review": ee_hard > 0,
                 "expected_hard_ok": ee_hard,
+                "outline_rewrite": true,
                 "project": project,
                 "audit": mutation_gate::audit_preview_value(&audit),
                 "impact_source": impact_source_arc(arc, &before_arc, &text),
@@ -2482,7 +2544,8 @@ impl ToolHandler for SyncVolume {
             "type":"object",
             "properties":{
                 "project":{"type":"string"},
-                "volume":{"type":"integer","description":"卷第，默认按 published_count 推断刚结束的卷"}
+                "volume":{"type":"integer","description":"卷第，默认按 published_count 推断刚结束的卷"},
+                "confirm_memory":{"type":"boolean","description":"true=同步后写入卷级记忆 rollup（默认 true）"}
             },
             "required":["project"]
         })
@@ -2511,6 +2574,15 @@ impl ToolHandler for SyncVolume {
         if volume.end_chapter == 0 {
             volume.end_chapter = pc;
         }
+        let confirm_memory = args
+            .get("confirm_memory")
+            .and_then(|v| v.as_bool())
+            .or_else(|| {
+                args.get("confirm_memory")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s == "true" || s == "1")
+            })
+            .unwrap_or(true);
 
         let progress = ctx.progress.clone();
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -2546,13 +2618,33 @@ impl ToolHandler for SyncVolume {
 
         let report = run_volume_sync(&dir, &volume, ctx.llm.clone(), Some(tx)).await?;
         let _ = forward.await;
+        let (span_start, span_end) =
+            novelx_pipeline::volume_chapter_span(&volume, volume.end_chapter.max(1));
+        let mut memory_chars = 0usize;
+        if confirm_memory {
+            if let Ok(rollup) = confirm_volume_memory(
+                &dir,
+                volume.volume_index,
+                &volume.name,
+                span_start,
+                span_end,
+                "",
+            ) {
+                memory_chars = rollup.summary.chars().count();
+            }
+        }
         let _ = mark_volume_sync_skipped(&dir, false);
         let _ = set_volume_phase(&dir, VolumePhase::AwaitingNextArc);
 
         Ok(ToolResult {
             output: format!(
-                "卷末同步完成：{}。volume_phase=awaiting_next_arc — 请 design_arc_outline 细化下卷。",
-                report.message
+                "卷末同步完成：{}{}。volume_phase=awaiting_next_arc — 请 design_arc_outline 细化下卷。",
+                report.message,
+                if confirm_memory {
+                    format!("；卷记忆已确认（{memory_chars} 字）")
+                } else {
+                    String::new()
+                }
             ),
             data: json!({
                 "ok": true,
@@ -2564,8 +2656,82 @@ impl ToolHandler for SyncVolume {
                 "bible_patches": report.bible_patches,
                 "incomplete_entities": report.incomplete_entities,
                 "message": report.message,
+                "memory_confirmed": confirm_memory,
                 "volume_phase": VolumePhase::AwaitingNextArc.as_str(),
                 "offer_volume_handoff": true,
+            }),
+        })
+    }
+}
+
+#[async_trait]
+impl ToolHandler for ConfirmVolumeMemory {
+    fn name(&self) -> &'static str {
+        "confirm_volume_memory"
+    }
+    fn description(&self) -> &'static str {
+        "卷末确认并写入卷级记忆 rollup（L1）+ 刷新伏笔索引；不改设定卡。可与 sync_volume 分开做。"
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "project":{"type":"string"},
+                "volume":{"type":"integer"},
+                "note":{"type":"string","description":"可选进度备注"}
+            },
+            "required":["project"]
+        })
+    }
+    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
+        let project = args["project"].as_str().unwrap_or("");
+        if project.is_empty() {
+            anyhow::bail!("project 必填");
+        }
+        let dir = project_dir(&ctx.projects_root, project);
+        let state = load_project_state(&dir)?;
+        let bounds = load_volume_bounds(&dir);
+        let pc = state.published_count.max(1);
+        let mut volume = if let Some(vi) = args["volume"].as_u64() {
+            bound_for_volume(&bounds, vi as u32)
+                .ok_or_else(|| anyhow::anyhow!("无法解析第{}卷", vi))?
+        } else if let Some(b) = bounds.iter().rev().find(|b| b.completed).cloned() {
+            b
+        } else if let Some(b) = novelx_pipeline::active_volume_for_chapter(&dir, pc) {
+            b
+        } else {
+            bound_for_volume(&bounds, 1)
+                .ok_or_else(|| anyhow::anyhow!("无法推断卷，请指定 volume"))?
+        };
+        if volume.end_chapter == 0 {
+            volume.end_chapter = pc;
+        }
+        let (span_start, span_end) =
+            novelx_pipeline::volume_chapter_span(&volume, volume.end_chapter.max(1));
+        let note = args.get("note").and_then(|v| v.as_str()).unwrap_or("");
+        let rollup = confirm_volume_memory(
+            &dir,
+            volume.volume_index,
+            &volume.name,
+            span_start,
+            span_end,
+            note,
+        )?;
+        Ok(ToolResult {
+            output: format!(
+                "已确认第{}卷卷记忆（至第{}章，{} 字）。未改设定库；若仍待 sync_volume 请继续选择。",
+                rollup.volume_index,
+                rollup.chapter_end,
+                rollup.summary.chars().count()
+            ),
+            data: json!({
+                "ok": true,
+                "project": project,
+                "volume_index": rollup.volume_index,
+                "chapter_end": rollup.chapter_end,
+                "summary_chars": rollup.summary.chars().count(),
+                "memory_confirmed": true,
+                "reoffer_volume_sync": true,
             }),
         })
     }
@@ -2732,6 +2898,122 @@ async fn generate_full_bible(
         )
         .await
         .map(|s| s.trim().to_string())
+}
+
+/// Parse「800-1000章」「约900章」style hints from brief text.
+fn parse_target_chapters_hint(brief: &str) -> Option<u32> {
+    let bytes = brief.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            let a: u32 = std::str::from_utf8(&bytes[start..i]).ok()?.parse().ok()?;
+            let mut j = i;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let rest = &brief[j..];
+            let sep = rest
+                .chars()
+                .next()
+                .filter(|c| matches!(c, '-' | '–' | '—' | '~' | '～' | '到' | '至'));
+            if let Some(c) = sep {
+                let after = &rest[c.len_utf8()..];
+                let after = after.trim_start();
+                if let Some((b_str, tail)) = split_leading_digits(after) {
+                    if let Ok(b) = b_str.parse::<u32>() {
+                        if tail.trim_start().starts_with('章') {
+                            let lo = a.min(b);
+                            let hi = a.max(b);
+                            if hi >= 10 {
+                                return Some(((lo as u64 + hi as u64) / 2) as u32);
+                            }
+                        }
+                    }
+                }
+            }
+            if brief[i..].trim_start().starts_with('章') && a >= 10 {
+                return Some(a);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+fn split_leading_digits(s: &str) -> Option<(&str, &str)> {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() || !bytes[0].is_ascii_digit() {
+        return None;
+    }
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    Some((&s[..i], &s[i..]))
+}
+
+fn parse_volume_range_hint(brief: &str) -> Option<(u32, u32)> {
+    let bytes = brief.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            let a: u32 = std::str::from_utf8(&bytes[start..i]).ok()?.parse().ok()?;
+            let mut j = i;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let rest = &brief[j..];
+            let sep = rest
+                .chars()
+                .next()
+                .filter(|c| matches!(c, '-' | '–' | '—' | '~' | '～' | '到' | '至'));
+            if let Some(c) = sep {
+                let after = rest[c.len_utf8()..].trim_start();
+                if let Some((b_str, tail)) = split_leading_digits(after) {
+                    if let Ok(b) = b_str.parse::<u32>() {
+                        if tail.trim_start().starts_with('卷') && a >= 1 && b >= a && b <= 30 {
+                            return Some((a, b));
+                        }
+                    }
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+fn longform_scale_hint(target: u32, brief: &str) -> String {
+    if let Some((a, b)) = parse_volume_range_hint(brief) {
+        return format!(
+            "- 规模：用户要求约 {a}-{b} 卷、体量约 {target} 章；请用 `## 分卷` 列出每一卷的目标/核心事件/终止条件（可略写，但卷数必须覆盖）"
+        );
+    }
+    if target >= 500 {
+        let lo = ((target as f64 / 120.0).ceil() as u32).clamp(8, 12);
+        let hi = (lo + 2).min(14);
+        format!(
+            "- 规模：超长篇（约 {target} 章）→ 使用 `## 分卷`，规划约 {lo}-{hi} 卷；每卷写清目标/核心事件/终止条件；禁止压成短篇三幕敷衍"
+        )
+    } else if target >= 200 {
+        format!(
+            "- 规模：中长篇（约 {target} 章）→ 优先 `## 分卷`（约 4-8 卷），也可将三幕映射为多卷"
+        )
+    } else {
+        format!(
+            "- 规模：约 {target} 章 → `## 三幕结构` 或 `## 分卷` 均可，卷/幕目标需可核验"
+        )
+    }
 }
 
 fn load_agent_skill(ctx: &ToolContext, name: &str) -> String {
@@ -3397,10 +3679,12 @@ impl ToolHandler for SteerRun {
             "按最近一致性审计意见局部修订".to_string()
         };
         // Reuse revise_chapter so local patches go through diff confirm + cached apply.
+        // Pass structured issues so collect_revision_targets can locate quotes/spans.
         let revise_args = json!({
             "project": project,
             "chapter": chapter,
             "instructions": instructions,
+            "audit_issues": issues,
         });
         let mut result = ReviseChapter.call(ctx, revise_args).await?;
         if let Some(obj) = result.data.as_object_mut() {
@@ -3417,15 +3701,18 @@ impl ToolHandler for OfferDecisions {
         "offer_decisions"
     }
     fn description(&self) -> &'static str {
-        "审校未通过后给出决策项（修某条 issue / 修全部阻断 / 接受等）。\
-         每项须含 id、label、action=revise|accept|skip_queue|cancel_queue，revise 时带 issue_ids。"
+        "向用户出示审批卡。kind=audit（默认）：审校未通过后给出修某条/修全部阻断/接受等（须 action）。\
+         kind=studio_next：情境下一步（设定落盘后、BLOCKER、剧情拦写等），\
+         每项须含 id、label，以及 tool+args 或 resolve=dismiss_gate|continue_studio|activate_plot_write|skip_volume；\
+         tool 白名单含 design_* / upsert_setting / audit_setting / list_* / continue_writing / design_plot 等。"
     }
     fn parameters(&self) -> Value {
         json!({
             "type":"object",
             "properties":{
+                "kind":{"type":"string","description":"audit（默认）| studio_next"},
                 "project":{"type":"string"},
-                "chapter":{"type":"integer"},
+                "chapter":{"type":"integer","description":"audit 必填；studio_next 可选"},
                 "prompt":{"type":"string","description":"短提示，可选"},
                 "options":{
                     "type":"array",
@@ -3434,20 +3721,28 @@ impl ToolHandler for OfferDecisions {
                         "properties":{
                             "id":{"type":"string"},
                             "label":{"type":"string"},
-                            "action":{"type":"string","description":"revise|accept|skip_queue|cancel_queue"},
+                            "action":{"type":"string","description":"audit: revise|accept|skip_queue|cancel_queue"},
                             "issue_ids":{"type":"array","items":{"type":"string"}},
-                            "instructions":{"type":"string"}
+                            "instructions":{"type":"string"},
+                            "tool":{"type":"string","description":"studio_next: 白名单工具名"},
+                            "args":{"type":"object","description":"studio_next: 工具参数"},
+                            "resolve":{"type":"string","description":"studio_next: dismiss_gate|continue_studio|activate_plot_write|skip_volume"}
                         },
-                        "required":["label","action"]
+                        "required":["label"]
                     }
                 }
             },
-            "required":["project","chapter","options"]
+            "required":["project","options"]
         })
     }
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
         let project = args["project"].as_str().unwrap_or("");
-        let chapter = args["chapter"].as_u64().unwrap_or(1) as u32;
+        let kind = args
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("audit")
+            .trim()
+            .to_string();
         let options = args
             .get("options")
             .and_then(|v| v.as_array())
@@ -3458,6 +3753,30 @@ impl ToolHandler for OfferDecisions {
         }
         if options.is_empty() {
             anyhow::bail!("options 不能为空");
+        }
+        let labels: Vec<String> = options
+            .iter()
+            .filter_map(|o| o.get("label").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .collect();
+        if kind == "studio_next" {
+            return Ok(ToolResult {
+                output: format!(
+                    "已提交 {} 项下一步决策供用户选择：{}",
+                    options.len(),
+                    labels.join(" · ")
+                ),
+                data: json!({
+                    "offer_decisions": true,
+                    "kind": "studio_next",
+                    "project": project,
+                    "options": options,
+                    "prompt": args.get("prompt").and_then(|v| v.as_str()).unwrap_or(""),
+                }),
+            });
+        }
+        let chapter = args["chapter"].as_u64().unwrap_or(1) as u32;
+        if args.get("chapter").is_none() {
+            anyhow::bail!("kind=audit 时 chapter 必填");
         }
         // Load issue ids from disk so the model can be validated server-side.
         let audit_path = project_dir(&ctx.projects_root, project)
@@ -3470,10 +3789,6 @@ impl ToolHandler for OfferDecisions {
             .and_then(|v| v.get("issues").and_then(|x| x.as_array()).cloned())
             .unwrap_or_default();
         let issues = novelx_harness::with_issue_ids(issues);
-        let labels: Vec<String> = options
-            .iter()
-            .filter_map(|o| o.get("label").and_then(|v| v.as_str()).map(|s| s.to_string()))
-            .collect();
         Ok(ToolResult {
             output: format!(
                 "已提交 {} 项决策供用户选择：{}",
@@ -3482,6 +3797,7 @@ impl ToolHandler for OfferDecisions {
             ),
             data: json!({
                 "offer_decisions": true,
+                "kind": "audit",
                 "project": project,
                 "chapter": chapter,
                 "options": options,
@@ -3802,6 +4118,7 @@ pub fn all_tools() -> Vec<Arc<dyn ToolHandler>> {
         Arc::new(DesignMasterOutline),
         Arc::new(DesignArcOutline),
         Arc::new(SyncVolume),
+        Arc::new(ConfirmVolumeMemory),
         Arc::new(SteerRun),
         Arc::new(OfferDecisions),
         Arc::new(ActivateAgents),
@@ -4094,6 +4411,33 @@ fn classify_llm_progress_delta(delta: &str) -> LlmProgressKind {
     // often begins a parenthetical (e.g. 「（BLOOD-001）」) and would leak bare「（」
     // lines into the tool card. Harness status lines are already matched above.
     LlmProgressKind::Prose
+}
+
+#[cfg(test)]
+mod outline_scale_tests {
+    use super::{longform_scale_hint, parse_target_chapters_hint, parse_volume_range_hint};
+
+    #[test]
+    fn parses_chapter_ranges() {
+        assert_eq!(
+            parse_target_chapters_hint("都市悬疑长篇，800-1000章。"),
+            Some(900)
+        );
+        assert_eq!(parse_target_chapters_hint("约500章"), Some(500));
+        assert_eq!(parse_target_chapters_hint("无章数"), None);
+    }
+
+    #[test]
+    fn parses_volume_ranges() {
+        assert_eq!(parse_volume_range_hint("覆盖8-10卷"), Some((8, 10)));
+    }
+
+    #[test]
+    fn longform_hint_mentions_fenjuan() {
+        let h = longform_scale_hint(900, "800-1000章，8-10卷");
+        assert!(h.contains("分卷"), "{h}");
+        assert!(h.contains("8-10"), "{h}");
+    }
 }
 
 fn parse_wait_first_secs(t: &str) -> Option<u32> {

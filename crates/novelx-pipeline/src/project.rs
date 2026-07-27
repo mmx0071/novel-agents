@@ -210,6 +210,29 @@ pub fn sync_records_novel_json(project_dir: &Path, state: &ProjectState) -> Resu
     Ok(())
 }
 
+/// Update `target_chapters` in state.json + meta.json when brief/outline implies a new scale.
+pub fn update_target_chapters(project_dir: &Path, chapters: u32) -> Result<()> {
+    if chapters < 10 {
+        return Ok(());
+    }
+    let mut state = load_project_state(project_dir)?;
+    if state.target_chapters == chapters {
+        return Ok(());
+    }
+    state.target_chapters = chapters;
+    save_project_state(project_dir, &state)?;
+    let meta_path = project_dir.join("meta.json");
+    if meta_path.exists() {
+        let mut meta: Value = serde_json::from_str(&fs::read_to_string(&meta_path)?)
+            .unwrap_or_else(|_| json!({}));
+        if let Some(obj) = meta.as_object_mut() {
+            obj.insert("target_chapters".into(), json!(chapters));
+            fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn save_project_state(project_dir: &Path, state: &ProjectState) -> Result<()> {
     let path = project_dir.join("state.json");
     // Merge into existing JSON to avoid wiping Python fields when possible
@@ -478,5 +501,27 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(proj.join("state.json")).unwrap()).unwrap();
         assert_eq!(raw["chapters"].as_array().unwrap().len(), 1);
         let _ = fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn update_target_chapters_writes_state_and_meta() {
+        let root = std::env::temp_dir().join(format!("nx_tgt_{}", uuid_like()));
+        let _ = fs::remove_dir_all(&root);
+        let proj = init_project(&root, "demo", "悬疑", 120).unwrap();
+        update_target_chapters(&proj, 900).unwrap();
+        let state = load_project_state(&proj).unwrap();
+        assert_eq!(state.target_chapters, 900);
+        let meta: Value =
+            serde_json::from_str(&fs::read_to_string(proj.join("meta.json")).unwrap()).unwrap();
+        assert_eq!(meta["target_chapters"], 900);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn uuid_like() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(1)
     }
 }

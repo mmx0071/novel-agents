@@ -1625,6 +1625,89 @@ pre.nx-msg-text {
   line-height: 1.45;
 }
 
+.config-llm {
+  overflow-y: auto;
+}
+
+.config-llm-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 10px 12px;
+  flex-shrink: 0;
+}
+
+.config-llm-retry {
+  margin-top: 4px;
+}
+
+.config-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.config-field-wide {
+  grid-column: 1 / -1;
+}
+
+.config-field input,
+.config-field select,
+.config-task-row input {
+  width: 100%;
+  background: #0c0e14;
+  color: #e6e4e1;
+  border: 1px solid #2a3040;
+  border-radius: 6px;
+  padding: 7px 10px;
+  font-size: 0.8rem;
+}
+
+.config-muted-inline {
+  color: #6b7280;
+  font-weight: 400;
+}
+
+.config-llm-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.config-task-table {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid #232836;
+  border-radius: 8px;
+  padding: 8px;
+  background: #0c0e14;
+}
+
+.config-task-head,
+.config-task-row {
+  display: grid;
+  grid-template-columns: 110px 1fr 120px;
+  gap: 8px;
+  align-items: center;
+}
+
+.config-task-head {
+  font-size: 0.7rem;
+  color: #9ca3af;
+  padding: 0 2px 4px;
+  border-bottom: 1px solid #232836;
+}
+
+.config-task-name {
+  font-size: 0.78rem;
+  color: #d1d5db;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .config-actions {
   display: flex;
   gap: 8px;
@@ -1670,6 +1753,49 @@ pre.nx-msg-text {
   border: 1px solid #232836;
   border-radius: 8px;
   padding: 8px 10px;
+}
+
+.config-rule-flags {
+  display: inline-flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.config-flag-btn {
+  padding: 2px 8px;
+  font-size: 0.68rem;
+  border-radius: 4px;
+  border: 1px solid #2a3040;
+  background: #151922;
+  color: #9ca3af;
+  cursor: pointer;
+}
+
+.config-flag-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.config-flag-btn.on {
+  border-color: #2f6b45;
+  color: #6fd89a;
+  background: #13261a;
+}
+
+.config-flag-btn.off {
+  border-color: #4a3030;
+  color: #c4a0a0;
+}
+
+.config-flag-btn.block {
+  border-color: #8a4a2a;
+  color: #f0b27a;
+  background: #2a1a12;
+}
+
+.config-flag-btn.warn {
+  border-color: #3a4a60;
+  color: #9ab4d4;
 }
 
 .config-rule-title {

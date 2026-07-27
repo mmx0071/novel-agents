@@ -645,6 +645,15 @@ pub fn format_conditions_line(c: &ExpectedConditions) -> String {
     }
 }
 
+fn foreshadow_hint_for_kind(kind: &str) -> String {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "add_character" | "add_entity" | "introduce" => " → 章纲可标「埋设」".into(),
+        "kill" | "death" | "remove" | "reveal" | "resolve" => " → 章纲可标「回收/兑现」".into(),
+        "resurrect" | "return" => " → 章纲可标「回收旧线/再埋」".into(),
+        _ => " → 章纲可标「埋设或兑现」".into(),
+    }
+}
+
 /// Canon injection: approved constraints + short waiting list.
 pub fn format_expected_for_context(project_dir: &Path, chapter: u32, pacing: bool) -> String {
     let store = load_expected_events(project_dir);
@@ -664,15 +673,17 @@ pub fn format_expected_for_context(project_dir: &Path, chapter: u32, pacing: boo
         let lines: Vec<String> = approved
             .iter()
             .map(|e| {
+                let hint = foreshadow_hint_for_kind(&e.kind);
                 format!(
-                    "- [{}] {}{}",
+                    "- [{}] {}{}{}",
                     e.kind,
                     truncate_chars(&e.text, 120),
                     if e.entity_ref.is_empty() {
                         String::new()
                     } else {
                         format!("（实体：{}）", e.entity_ref)
-                    }
+                    },
+                    hint
                 )
             })
             .collect();
@@ -680,6 +691,13 @@ pub fn format_expected_for_context(project_dir: &Path, chapter: u32, pacing: boo
             "已批准预期（须纳入本章创作，勿擅自改设定落盘）：\n{}",
             lines.join("\n")
         ));
+        if !pacing {
+            parts.push(
+                "预期↔伏笔提示：章纲可标注「埋设/回收」对应上列已批准项；\
+                 正文兑现后由伏笔追踪或用户 resolve_expected_event，禁止静默改设定。"
+                    .into(),
+            );
+        }
     }
 
     if pacing {
@@ -904,9 +922,20 @@ mod tests {
         resolve_expected_event(&dir, &ev.id, "approved", 0).unwrap();
         let ctx2 = format_expected_for_context(&dir, 2, false);
         assert!(ctx2.contains("已批准预期"));
+        assert!(
+            ctx2.contains("埋设") || ctx2.contains("兑现") || ctx2.contains("伏笔"),
+            "approved expected should carry foreshadow weak hint: {ctx2}"
+        );
         resolve_expected_event(&dir, &ev.id, "incorporated", 2).unwrap();
         assert!(list_hard_ok_candidates(&dir, 2).is_empty());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn foreshadow_hint_maps_kinds() {
+        assert!(foreshadow_hint_for_kind("add_character").contains("埋设"));
+        assert!(foreshadow_hint_for_kind("kill").contains("回收"));
+        assert!(foreshadow_hint_for_kind("resurrect").contains("再埋") || foreshadow_hint_for_kind("resurrect").contains("回收"));
     }
 
     #[test]

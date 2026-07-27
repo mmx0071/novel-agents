@@ -1,6 +1,7 @@
 # 正文硬规则（确定性扫描）— 发布门控
 # Rust 只保留通用引擎；开关 / 词表 / 阈值 / 文案模板在此编辑。
-# Web「配置 → 硬规则」可查看与保存；保存后下次写章/审校即生效。
+# Web「配置 → 硬规则」可点选启用/阻断；保存后下次写章/审校即生效。
+# enabled=false → 不扫描；blocking=false → 仅警告，不阻断发布。
 
 rules:
   banned_name:
@@ -15,12 +16,13 @@ rules:
     description: 正文不得残留管道内部标记。
     blocking: true
     marker: "[CONTRADICTION]"
-    message: "正文残留 {marker} 标记"
+    # {marker} 运行时替换为上面的 marker 原文，例如 [CONTRADICTION]
+    message: "正文残留管道内部标记：{marker}"
 
   too_many_new_facts:
     enabled: true
     title: 新事实标记过多
-    description: 单章 [NEW_FACT:…] 标记数量上限。
+    description: 单章 [NEW_FACT:...] 标记数量上限。
     blocking: true
     max_count: 8
     pattern: "\\[NEW_FACT:[^\\]]+\\]"

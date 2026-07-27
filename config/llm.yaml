@@ -1,118 +1,76 @@
-# LLM 配置 — DeepSeek 按任务分模型
-#
-# API Key：项目根 .env 中的 DEEPSEEK_API_KEY（见 .env.example）
-# DeepSeek 兼容 OpenAI 接口，base_url 默认 https://api.deepseek.com
-#
-# profile:
-#   dev  — 测试/开发：全部任务强制用最快最便宜模型（见 below）
-#   prod — 生产：按 tasks 分模型（pro 写作/规划，flash 润色/分析）
-# 也可用环境变量覆盖：NOVELX_LLM_PROFILE=dev|prod
-profile: dev
-
-# 瞬时故障重试（网络抖动 / 429 / 5xx / 首包超时）。
-# 仅在尚未向 UI 推送任何 token 时重试，避免流式内容重复。
-# 环境变量 NOVELX_LLM_MAX_RETRIES 可覆盖 max_retries。
+profile: prod
 retry:
   max_retries: 3
   base_delay_ms: 800
   max_delay_ms: 10000
-
-# dev 模式下统一使用的模型（性价比优先）
 dev_model: deepseek-v4-flash
-
 providers:
   deepseek:
     api_key_env: DEEPSEEK_API_KEY
     base_url: https://api.deepseek.com
-
-  # 备用（未使用时无需配置 Key）
   openai:
     api_key_env: OPENAI_API_KEY
     base_url: null
   anthropic:
     api_key_env: ANTHROPIC_API_KEY
     base_url: null
-
-# 任务类型 → DeepSeek 模型
-#   deepseek-v4-pro   强能力，适合规划与正文
-#   deepseek-v4-flash 高性价比，适合润色与分析
-# 旧名 deepseek-reasoner / deepseek-chat 将于 2026-07-24 停用，请优先用 v4 系列
-
 tasks:
   planning:
     description: 强推理 — 章纲、总纲、卷纲、世界观
     provider: deepseek
     model: deepseek-v4-pro
     temperature: 0.7
-    # DeepSeek V4 最大输出 384K；此处给足上限（按实际输出计费，不强制写满）
     max_tokens: 131072
-
   creative:
     description: 强创作 — 正文撰写
     provider: deepseek
     model: deepseek-v4-pro
     temperature: 0.85
-    # 与 V4 输出上限对齐；按实际输出计费，不强制写满
     max_tokens: 131072
-
   editing:
     description: 润色修改 — 对话、场景、文学编辑
     provider: deepseek
     model: deepseek-v4-flash
     temperature: 0.6
-    # <64k → 关闭 thinking（见 novelx-llm）；整章润色够用
     max_tokens: 32768
-
-  # 局部段落补丁：小输出、必须关 thinking，否则 8 段串行会极慢
   patch:
     description: 局部修订 — 单段/时间锚点批量补丁
     provider: deepseek
     model: deepseek-v4-flash
     temperature: 0.4
-    max_tokens: 8192
-
+    max_tokens: 32768
   analysis:
     description: 快速分析 — 一致性审计、节奏、伏笔、摘要
     provider: deepseek
     model: deepseek-v4-flash
     temperature: 0.2
-    # ≤64k → 关闭 thinking，避免审计把额度耗在 CoT 上
     max_tokens: 32768
-
   naming:
     description: 名词设计 — 人物/物品/设定取名，名与能力语义绑定
     provider: deepseek
     model: deepseek-v4-pro
     temperature: 0.75
     max_tokens: 65536
-
   studio:
     description: NovelX 调度 — 意图解析与工具调用
     provider: deepseek
     model: deepseek-v4-flash
     temperature: 0.3
     max_tokens: 16384
-
-# Agent → 任务映射
 agents:
   studio_agent: studio
-
   nomenclature_curator: naming
-
   world_architect: planning
   master_planner: planning
   arc_planner: planning
   chapter_planner: planning
   entity_designer: planning
   plot_designer: planning
-
   writer: creative
   local_reviser: patch
-
   dialogue_specialist: editing
   scene_specialist: editing
   literary_editor: editing
-
   consistency_auditor: analysis
   volume_auditor: analysis
   setting_auditor: analysis
@@ -122,5 +80,4 @@ agents:
   plot_acceptor: analysis
   lore_librarian: analysis
   expectation_reviewer: analysis
-
-# orchestrator：未实现（原 Harness Phase B LLM 规划）；勿注册 agents.yaml / 勿 spawn。
+default_provider: deepseek

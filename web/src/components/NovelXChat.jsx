@@ -462,6 +462,8 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
   const readyRef = useRef(false)
   const loadingRef = useRef(false)
   loadingRef.current = loading
+  /** Heartbeat for idle unlock — chapter writes often exceed 25s with live WS ticks. */
+  const lastEventAtRef = useRef(Date.now())
   const turnsRef = useRef(turns)
   turnsRef.current = turns
   const previewRefreshAtRef = useRef(0)
@@ -472,6 +474,8 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
   /** Latest handlers for WS — keep connectWs / mount effect identity stable. */
   const handleEventRef = useRef(() => {})
   const wsPendingRef = useRef([])
+  /** Bumped on「新开任务」so in-flight cache/POST cannot revive cleared history. */
+  const chatGenRef = useRef(0)
 
   useEffect(() => () => {
     if (previewRefreshTimerRef.current) clearTimeout(previewRefreshTimerRef.current)
@@ -588,10 +592,12 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
 
   const applyToolOutputDelta = useCallback((ev) => {
     upsertTurn(ev.turn_id, (t) => {
+      // Late WS deltas after turn_complete must not revive「生成中 / 进行中」.
+      if (t.status === 'complete' || t.status === 'aborted') {
+        return t
+      }
       // Late/spurious complete must not leave the live turn unlabeled mid-tool.
-      const nextStatus = t.status === 'aborted'
-        ? 'aborted'
-        : (t.status === 'awaiting' ? 'awaiting' : 'running')
+      const nextStatus = t.status === 'awaiting' ? 'awaiting' : 'running'
       const items = [...(t.items || [])]
       let i = items.findIndex((x) => x.id === ev.item_id)
       // Missed item_started / id mismatch — still show live progress.
@@ -649,11 +655,24 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
       }
       return { ...t, status: nextStatus, items }
     })
-    if (ev.turn_id) {
+    const turn = turnsRef.current?.find((t) => t.id === ev.turn_id)
+    if (
+      ev.turn_id
+      && turn?.status !== 'complete'
+      && turn?.status !== 'aborted'
+    ) {
       activeTurnRef.current = ev.turn_id
       setLiveTurnId(ev.turn_id)
     }
   }, [project, upsertTurn])
+
+  const dropToolDeltaBufForTurn = useCallback((turnId) => {
+    if (!turnId) return
+    const prefix = `${turnId}:`
+    for (const key of [...toolDeltaBufRef.current.keys()]) {
+      if (key.startsWith(prefix)) toolDeltaBufRef.current.delete(key)
+    }
+  }, [])
 
   const flushToolDeltaBuf = useCallback(() => {
     if (toolDeltaTimerRef.current) {
@@ -685,9 +704,22 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
     }
   }, [flushToolDeltaBuf])
 
+  const markTurnLive = useCallback((turnId, activityText) => {
+    if (turnId) {
+      const turn = turnsRef.current?.find((t) => t.id === turnId)
+      if (turn?.status === 'complete' || turn?.status === 'aborted') return
+      activeTurnRef.current = turnId
+      setLiveTurnId(turnId)
+    }
+    loadingRef.current = true
+    setLoading(true)
+    if (activityText) setActivity(activityText)
+  }, [])
+
   const handleEvent = useCallback(
     (ev) => {
       if (!ev || !ev.type) return
+      lastEventAtRef.current = Date.now()
       switch (ev.type) {
         case 'session_configured':
           setThreadId(ev.thread_id)
@@ -746,6 +778,9 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
           break
         }
         case 'turn_complete':
+          // Drop this turn's buffered deltas first — flushing them would revive
+          // status=running / activity「生成中…」after the turn already ended.
+          dropToolDeltaBufForTurn(ev.turn_id)
           flushToolDeltaBuf()
           // Only finish the matched turn — completing every running turn made「进行中」闪灭.
           setTurns((prev) => prev.map((t) => {
@@ -758,11 +793,13 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
             }
           }))
           setLiveTurnId((id) => (id === ev.turn_id ? '' : id))
+          loadingRef.current = false
           setLoading(false)
           setActivity('')
           syncPreview({ keepSelection: false, immediate: true })
           break
         case 'turn_aborted':
+          dropToolDeltaBufForTurn(ev.turn_id)
           flushToolDeltaBuf()
           upsertTurn(ev.turn_id, (t) => ({
             ...t,
@@ -770,6 +807,7 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
             items: finishOpenItems(t.items),
           }))
           setLiveTurnId((id) => (id === ev.turn_id ? '' : id))
+          loadingRef.current = false
           setLoading(false)
           setActivity('已中断')
           break
@@ -815,17 +853,23 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
             const label = isBulkContextTool(item.name) && compact.output
               ? compact.output
               : zhName
-            setActivity(
-              item.status === 'completed'
-                ? (isBulkContextTool(item.name) ? label : `✓ ${zhName}`)
-                : (isBulkContextTool(item.name)
-                  ? '查阅中…'
-                  : (item.name === 'revise_chapter' || item.name === 'steer_run')
-                    ? '修订中…'
-                    : (item.name === 'continue_writing')
-                      ? '写作中…'
-                      : `运行中 · ${zhName}…`),
-            )
+            if (item.status === 'completed') {
+              const turnDone = (() => {
+                const turn = turnsRef.current?.find((t) => t.id === ev.turn_id)
+                return turn?.status === 'complete' || turn?.status === 'aborted'
+              })()
+              if (!turnDone) {
+                setActivity(isBulkContextTool(item.name) ? label : `✓ ${zhName}`)
+              }
+            } else if (isBulkContextTool(item.name)) {
+              setActivity('查阅中…')
+            } else if (item.name === 'revise_chapter' || item.name === 'steer_run') {
+              markTurnLive(ev.turn_id, '修订中…')
+            } else if (item.name === 'continue_writing') {
+              markTurnLive(ev.turn_id, '写作中…')
+            } else {
+              markTurnLive(ev.turn_id, `运行中 · ${zhName}…`)
+            }
           } else if (item.type === 'skill_load') {
             setActivity(
               item.status === 'completed' ? `已加载 $${item.name}` : `加载 $${item.name}…`,
@@ -1004,6 +1048,12 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
         }
         case 'tool_call_output_delta':
           // Buffer into React ~8fps — per-token setTurns was flashing「回合 N · 进行中」.
+          {
+            const turnMeta = turnsRef.current?.find((t) => t.id === ev.turn_id)
+            if (turnMeta?.status === 'complete' || turnMeta?.status === 'aborted') {
+              break
+            }
+          }
           queueToolOutputDelta(ev)
           {
             const d = String(ev.delta || '')
@@ -1031,6 +1081,15 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
             const stepName = (step?.[1] || done?.[1] || '').trim()
             const stepZh = stepLabelZh(stepName)
             const localRev = /local_reviser|局部修订/i.test(stepName) || /局部修订/.test(d)
+            // Pipeline ticks mean the turn is still live — re-lock if a short
+            // watchdog previously unlocked the composer mid-write.
+            if (writingNew || revising || step || draftChars || genChars || wait
+              || /生成中|流式生成中|正文已写入|↻\s*draft|调用模型|等待首包/i.test(d)) {
+              markTurnLive(
+                ev.turn_id,
+                writingNew ? '写作中…' : (revising ? '修订中…' : undefined),
+              )
+            }
             if (draftChars) {
               setActivity(
                 writingNew
@@ -1051,15 +1110,13 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
               )
             } else if (done) {
               setActivity(localRev ? '✓ 局部修订' : `✓ ${stepZh}`)
-            }
-            else if (wait) setActivity((prev) => prev || '生成中…')
-            else if (/生成中|流式生成中|正文已写入|↻\s*draft/i.test(d)) {
+            } else if (wait) {
+              setActivity((prev) => prev || '生成中…')
+            } else if (/生成中|流式生成中|正文已写入|↻\s*draft/i.test(d)) {
               setActivity((prev) => prev || (revising ? '修订中…' : (writingNew ? '写作中…' : '生成中…')))
-            } else {
-              setActivity((prev) => (prev && /^(运行中|写作中|修订|生成中)/.test(prev)
-                ? prev
-                : '生成中…'))
             }
+            // Do NOT default every tool delta to「生成中…」— upsert_setting / list_*
+            // completion text used to leave the bar stuck after the turn ended.
           }
           // Mid-pipeline: chapter/card files land before the whole tool finishes.
           // Jump reader to latest chapter + 章纲/正文 so creation is visible live.
@@ -1107,8 +1164,8 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
           const summary = ev.summary || '对话历史已清理。'
           const keepId = ev.keep_turn_id || ''
           if (keepId) {
-            activeTurnRef.current = keepId
-            setLiveTurnId(keepId)
+            // New chapter write is still running — do not look like the turn ended.
+            markTurnLive(keepId, '写作中…')
           }
           setTurns((prev) => {
             let next
@@ -1117,12 +1174,28 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
               const kept = prev.filter((t) => (
                 t.id === keepId || isOptimisticTurnId(t.id)
               ))
+              const liveNote = `${summary}\n\n正在撰写中，进度见下方「继续创作」工具卡…`
               next = kept.length
-                ? kept.map((t) => (
-                  t.id === keepId || isOptimisticTurnId(t.id)
-                    ? { ...t, approval: null, status: t.status === 'complete' ? 'complete' : 'running' }
-                    : t
-                ))
+                ? kept.map((t) => {
+                  if (!(t.id === keepId || isOptimisticTurnId(t.id))) return t
+                  const items = [...(t.items || [])]
+                  const hasAgent = items.some((it) => it.type === 'agent_message')
+                  if (!hasAgent) {
+                    items.push({
+                      id: newLocalId('item_reset'),
+                      type: 'agent_message',
+                      text: liveNote,
+                      status: 'in_progress',
+                      _key: newLocalId('key'),
+                    })
+                  }
+                  return {
+                    ...t,
+                    approval: null,
+                    status: 'running',
+                    items,
+                  }
+                })
                 : [{
                   id: keepId,
                   status: 'running',
@@ -1130,8 +1203,8 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
                   items: [{
                     id: newLocalId('item_reset'),
                     type: 'agent_message',
-                    text: summary,
-                    status: 'completed',
+                    text: liveNote,
+                    status: 'in_progress',
                     _key: newLocalId('key'),
                   }],
                 }]
@@ -1153,7 +1226,7 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
             if (tid) saveChatCache(project, tid, next)
             return next
           })
-          setActivity(keepId ? '新章开写 · 已清理旧对话' : '历史已清理')
+          if (!keepId) setActivity('历史已清理')
           break
         }
         case 'request_user_input': {
@@ -1250,7 +1323,7 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
           break
       }
     },
-    [flushToolDeltaBuf, project, queueToolOutputDelta, syncPreview, upsertTurn],
+    [dropToolDeltaBufForTurn, flushToolDeltaBuf, markTurnLive, project, queueToolOutputDelta, syncPreview, upsertTurn],
   )
 
   handleEventRef.current = handleEvent
@@ -1356,11 +1429,9 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
         .catch(() => ({ skills: [] }))
       if (!cancelled) setSkills(skillsRes.skills || [])
 
-      // Local cache first (survives refresh even if server restarted mid-turn).
+      // Local cache may help mid-turn crash recovery, but never override an empty
+      // server thread (e.g. after「新开任务」cleared disk — stale cache used to revive).
       const cached = loadChatCache(project)
-      if (cached?.turns?.length && !cancelled) {
-        setTurns(cached.turns)
-      }
 
       const started = await fetch(`${API}/thread/start`, {
         method: 'POST',
@@ -1375,6 +1446,18 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
         const fromMessages = Array.isArray(started.messages) && started.messages.length
           ? messagesToTurns(started.messages)
           : []
+        const serverEmpty = !serverTurns.length && !fromMessages.length
+        // Stale cache from a previous thread must not paint or re-POST.
+        const cacheUsable = !!(
+          cached?.turns?.length
+          && cached.threadId
+          && cached.threadId === tid
+          && !serverEmpty
+        )
+        if (serverEmpty && cached?.turns?.length) {
+          clearChatCache(project)
+          saveChatCache(project, tid, [])
+        }
         let nextTurns = null
         if (serverTurns.length && fromMessages.length > serverTurns.length) {
           // ui_turns lagged behind (e.g. revise finished but client overwrote with old audit card).
@@ -1382,9 +1465,9 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
         } else if (serverTurns.length) {
           // Tool cards alone with empty NovelX bubbles → fill prose from messages.
           nextTurns = mergeAgentProseFromMessages(serverTurns, fromMessages)
-        } else if (fromMessages.length && !cached?.turns?.length) {
+        } else if (fromMessages.length && !cacheUsable) {
           nextTurns = fromMessages
-        } else if (cached?.turns?.length) {
+        } else if (cacheUsable) {
           nextTurns = mergeAgentProseFromMessages(cached.turns, fromMessages)
         }
         const hasQueue = !!(started.pending_audit_queue?.chapters?.length)
@@ -1405,7 +1488,9 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
           || started.pending_chapter_next
           || started.pending_volume_audit
           || started.pending_mutation
+          || started.pending_mutation_followup
           || started.pending_chapter_order
+          || started.pending_setting_blocker
         )
         setSetupGateOpen(!!started.pending_setup && !turnActive)
         if (nextTurns?.length && restoredGate) {
@@ -1457,14 +1542,9 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
             saveChatCache(project, tid, chosen)
             return chosen
           })
-          // Never push stale Running timelines back while a gate is open.
-          if (!serverTurns.length && cached?.turns?.length && !hasHumanGate) {
-            fetch(`${API}/thread/turns`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ thread_id: tid, turns: nextTurns }),
-            }).catch(() => {})
-          }
+        } else {
+          setTurns([])
+          saveChatCache(project, tid, [])
         }
         try {
           await connectWs(tid)
@@ -1485,10 +1565,12 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
   // Never POST while a turn is loading — that revived Running audit cards after the server finished.
   useEffect(() => {
     if (!threadId || !turns.length) return
+    const gen = chatGenRef.current
     saveChatCache(project, threadId, turns)
     if (loadingRef.current) return undefined
     const t = setTimeout(() => {
       if (loadingRef.current) return
+      if (gen !== chatGenRef.current) return
       fetch(`${API}/thread/turns`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1694,33 +1776,41 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
     setActivity(turnId ? '已中断' : '')
   }
 
-  // Stuck「working…」after a missed turn_complete / hung API: unlock quickly.
+  // Unlock only when the turn goes silent (no WS ticks). Chapter writes often
+  // take minutes with continuous tool_call_output_delta — a fixed 25s unlock
+  // made the chat look finished while activity still said「写作中」.
   useEffect(() => {
     if (!loading) return undefined
-    const t = window.setTimeout(() => {
+    const t = window.setInterval(() => {
       if (!loadingRef.current) return
+      if (Date.now() - lastEventAtRef.current < 120_000) return
       forceUnlockComposer()
-      setActivity('上一回合超时未结束 — 已解锁，可重发')
-    }, 25_000)
-    return () => window.clearTimeout(t)
+      setActivity('上一回合长时间无响应 — 已解锁；若仍在跑请点「中断」')
+    }, 15_000)
+    return () => window.clearInterval(t)
   }, [loading])
 
   const handleNewTask = async () => {
     const label = project || '当前会话'
     if (!window.confirm(
-      `清理「${label}」的对话并新开任务？\n\n不影响已写大纲、正文与项目文件。`,
+      `清理「${label}」的对话并新开任务？\n\n会清空聊天与待处理审校队列/门控；不影响已写大纲、正文与项目文件。`,
     )) {
       return
     }
+    // Invalidate any debounced /thread/turns POST still holding old turns.
+    chatGenRef.current += 1
+    const gen = chatGenRef.current
     if (loading && threadId && activeTurnRef.current) {
       await handleStop()
     }
     clearChatCache(project)
     setTurns([])
+    setTodos([])
     setInput('')
     setOtherText('')
     setShowOther(false)
     setSkillOpen(false)
+    setSetupGateOpen(false)
     setActivity('新开任务…')
     setLoading(false)
     activeTurnRef.current = ''
@@ -1735,8 +1825,9 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ project: project || null }),
     }).then((r) => r.json()).catch((e) => ({ error: e.message }))
-    if (started?.error) {
-      setActivity(`新开失败：${started.error}`)
+    if (gen !== chatGenRef.current) return
+    if (started?.error || started?.ok === false) {
+      setActivity(`新开失败：${started.error || '未知错误'}`)
       return
     }
     const tid = started.threadId || started.thread_id
@@ -1745,12 +1836,14 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
       return
     }
     setThreadId(tid)
+    clearChatCache(project)
     saveChatCache(project, tid, [])
+    setTurns([])
     try {
       await connectWs(tid)
-      setActivity('已新开任务')
+      if (gen === chatGenRef.current) setActivity('已新开任务')
     } catch {
-      setActivity('已新开任务（HTTP）')
+      if (gen === chatGenRef.current) setActivity('已新开任务（HTTP）')
     }
   }
 

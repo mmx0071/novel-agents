@@ -50,10 +50,20 @@ pub fn lore_query(project_dir: &Path, chapter: u32, outline: &str, draft: &str) 
         .iter()
         .filter(|t| t.status == "open")
         .take(8)
-        .map(|t| format!("- {}", t.text))
+        .map(|t| {
+            if t.planted_chapter > 0 {
+                format!("- {}（埋于第{}章）", t.text, t.planted_chapter)
+            } else {
+                format!("- {}", t.text)
+            }
+        })
         .collect();
     if !open.is_empty() {
         parts.push(format!("## Lore·未收线\n{}", open.join("\n")));
+    }
+    let dangling = crate::foreshadow::format_dangling_for_context(project_dir, 6);
+    if !dangling.is_empty() && open.is_empty() {
+        parts.push(format!("## Lore·未回收伏笔\n{dangling}"));
     }
 
     let expected = crate::expected_events::format_expected_for_lore(project_dir, chapter);

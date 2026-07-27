@@ -11,8 +11,12 @@ use uuid::Uuid;
 pub const RECENT_DIGEST_LIMIT: usize = 12;
 /// Rolling summary char budget (prefer recent chapters).
 pub const ROLLING_SUMMARY_LIMIT: usize = 2500;
-/// Cap open foreshadow threads.
+/// Cap open foreshadow threads in the hot list (overflow → archived_threads).
 pub const OPEN_THREAD_LIMIT: usize = 24;
+/// Cap archived (still-open) foreshadow threads kept for recall.
+pub const ARCHIVED_THREAD_LIMIT: usize = 120;
+/// Cap volume rollups retained in memory.
+pub const VOLUME_ROLLUP_LIMIT: usize = 40;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProjectMemory {
@@ -24,6 +28,12 @@ pub struct ProjectMemory {
     pub recent_digests: Vec<ChapterDigest>,
     #[serde(default)]
     pub open_threads: Vec<OpenThread>,
+    /// Open threads pruned from the hot list — still dangling, recallable by keyword.
+    #[serde(default)]
+    pub archived_threads: Vec<OpenThread>,
+    /// Per-volume continuity rollups (written on human-gated volume sync).
+    #[serde(default)]
+    pub volume_rollups: Vec<VolumeRollup>,
     #[serde(default)]
     pub asserted_facts: Vec<AssertedFact>,
     /// Highest chapter covered by `recent_digests` / last apply_summary_json.
@@ -32,6 +42,19 @@ pub struct ProjectMemory {
     /// Preserve unknown fields from older Python dumps.
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VolumeRollup {
+    pub volume_index: u32,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub open_thread_ids: Vec<String>,
+    #[serde(default)]
+    pub chapter_end: u32,
 }
 
 fn default_version() -> u32 {
@@ -282,29 +305,273 @@ pub fn apply_summary_json(project_dir: &Path, chapter: u32, summary_raw: &str) -
         }
     }
 
-    // Cap open threads — keep most recently planted.
+    prune_open_threads_into_archive(&mut mem);
+    // Resolve matches in archive too.
+    if let Some(arr) = v.get("foreshadow_updates").and_then(|x| x.as_array()) {
+        for item in arr {
+            let text = item.as_str().unwrap_or("").to_string();
+            if text.is_empty() || !(text.contains("回收") || text.contains("已收")) {
+                continue;
+            }
+            for t in mem.archived_threads.iter_mut() {
+                if t.status == "open"
+                    && text.contains(&t.text.chars().take(12).collect::<String>())
+                {
+                    t.status = "resolved".into();
+                    t.resolved_chapter = chapter;
+                }
+            }
+        }
+    }
+
+    let fact_count = key_facts.len();
+    save_memory(project_dir, &mem)?;
+    let _ = crate::foreshadow::rebuild_foreshadow_index(project_dir);
+    Ok(fact_count)
+}
+
+/// Move oldest open threads into `archived_threads` instead of dropping them.
+pub fn prune_open_threads_into_archive(mem: &mut ProjectMemory) {
     let mut open: Vec<_> = mem
         .open_threads
         .iter()
-        .filter(|t| t.status == "open")
+        .filter(|t| t.status == "open" || t.status.is_empty())
         .cloned()
         .collect();
     open.sort_by_key(|t| t.planted_chapter);
     let mut closed: Vec<_> = mem
         .open_threads
         .iter()
-        .filter(|t| t.status != "open")
+        .filter(|t| t.status != "open" && !t.status.is_empty())
         .cloned()
         .collect();
     if open.len() > OPEN_THREAD_LIMIT {
-        open = open.split_off(open.len() - OPEN_THREAD_LIMIT);
+        let overflow = open.len() - OPEN_THREAD_LIMIT;
+        let oldest: Vec<_> = open.drain(..overflow).collect();
+        for mut t in oldest {
+            t.status = "open".into();
+            if !mem
+                .archived_threads
+                .iter()
+                .any(|a| a.id == t.id || a.text == t.text)
+            {
+                mem.archived_threads.push(t);
+            }
+        }
     }
     closed.extend(open);
     mem.open_threads = closed;
 
-    let fact_count = key_facts.len();
+    // Cap archive: keep newest open entries.
+    mem.archived_threads
+        .retain(|t| t.status == "open" || t.status.is_empty());
+    if mem.archived_threads.len() > ARCHIVED_THREAD_LIMIT {
+        mem.archived_threads.sort_by_key(|t| t.planted_chapter);
+        let skip = mem.archived_threads.len() - ARCHIVED_THREAD_LIMIT;
+        mem.archived_threads = mem.archived_threads.split_off(skip);
+    }
+}
+
+/// Human-gated: build + persist volume rollup and refresh foreshadow index.
+pub fn confirm_volume_memory(
+    project_dir: &Path,
+    volume_index: u32,
+    name: &str,
+    start_chapter: u32,
+    end_chapter: u32,
+    progress_note: &str,
+) -> Result<VolumeRollup> {
+    let mut rollup = build_volume_rollup_from_summaries(
+        project_dir,
+        volume_index,
+        name,
+        start_chapter,
+        end_chapter,
+    );
+    if !progress_note.trim().is_empty() {
+        rollup.summary = format!(
+            "{}\n进度：{}",
+            truncate_chars(&rollup.summary, 700),
+            truncate_chars(progress_note.trim(), 200)
+        );
+    }
+    upsert_volume_rollup(project_dir, rollup.clone())?;
+    let _ = crate::foreshadow::rebuild_foreshadow_index(project_dir);
+    Ok(rollup)
+}
+
+/// Format a short preview for volume-end memory gate prompts.
+pub fn format_volume_memory_preview(
+    project_dir: &Path,
+    volume_index: u32,
+    name: &str,
+    start_chapter: u32,
+    end_chapter: u32,
+) -> String {
+    let rollup = build_volume_rollup_from_summaries(
+        project_dir,
+        volume_index,
+        name,
+        start_chapter,
+        end_chapter,
+    );
+    let dangling = crate::foreshadow::format_dangling_for_context(project_dir, 8);
+    let title = if name.is_empty() {
+        format!("第{volume_index}卷")
+    } else {
+        format!("第{volume_index}卷「{name}」")
+    };
+    let mut out = format!(
+        "{title}记忆草案（第{}–{}章）：\n{}",
+        start_chapter.max(1),
+        end_chapter.max(1),
+        if rollup.summary.is_empty() {
+            "（尚无章摘要可汇总）"
+        } else {
+            rollup.summary.as_str()
+        }
+    );
+    if !dangling.is_empty() {
+        out.push_str("\n\n仍开放伏笔（Top）：\n");
+        out.push_str(&dangling);
+    }
+    out
+}
+
+/// Upsert a volume rollup (human-gated volume sync).
+pub fn upsert_volume_rollup(project_dir: &Path, rollup: VolumeRollup) -> Result<()> {
+    let mut mem = load_memory(project_dir);
+    mem.volume_rollups
+        .retain(|r| r.volume_index != rollup.volume_index);
+    mem.volume_rollups.push(rollup);
+    mem.volume_rollups.sort_by_key(|r| r.volume_index);
+    if mem.volume_rollups.len() > VOLUME_ROLLUP_LIMIT {
+        let skip = mem.volume_rollups.len() - VOLUME_ROLLUP_LIMIT;
+        mem.volume_rollups = mem.volume_rollups.split_off(skip);
+    }
     save_memory(project_dir, &mem)?;
-    Ok(fact_count)
+    Ok(())
+}
+
+/// Build a deterministic volume rollup from on-disk chapter summaries.
+pub fn build_volume_rollup_from_summaries(
+    project_dir: &Path,
+    volume_index: u32,
+    name: &str,
+    start_chapter: u32,
+    end_chapter: u32,
+) -> VolumeRollup {
+    let mut lines = Vec::new();
+    let start = start_chapter.max(1);
+    let end = end_chapter.max(start);
+    for ch in start..=end {
+        let path = project_dir
+            .join("chapters")
+            .join(format!("{ch:03}"))
+            .join("summary.json");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let v = extract_summary_value(&text);
+        let event = v
+            .get("event_summary")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .trim();
+        if event.is_empty() {
+            continue;
+        }
+        lines.push(format!("第{ch}章：{}", truncate_chars(event, 120)));
+    }
+    let mem = load_memory(project_dir);
+    let open_ids: Vec<String> = mem
+        .open_threads
+        .iter()
+        .chain(mem.archived_threads.iter())
+        .filter(|t| t.status == "open" || t.status.is_empty())
+        .filter(|t| t.planted_chapter >= start && t.planted_chapter <= end)
+        .map(|t| t.id.clone())
+        .take(24)
+        .collect();
+    let joined = lines.join("\n");
+    VolumeRollup {
+        volume_index,
+        name: name.to_string(),
+        summary: truncate_chars(&joined, 900),
+        open_thread_ids: open_ids,
+        chapter_end: end,
+    }
+}
+
+/// Keyword-recall archived dangling threads (not in the hot open list).
+pub fn recall_archived_threads(mem: &ProjectMemory, haystack: &str, limit: usize) -> Vec<OpenThread> {
+    if limit == 0 || haystack.trim().is_empty() {
+        return Vec::new();
+    }
+    let tokens = recall_tokens(haystack);
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    let hot_ids: std::collections::HashSet<&str> = mem
+        .open_threads
+        .iter()
+        .map(|t| t.id.as_str())
+        .collect();
+    let mut scored: Vec<(usize, &OpenThread)> = Vec::new();
+    for t in &mem.archived_threads {
+        if !(t.status == "open" || t.status.is_empty()) {
+            continue;
+        }
+        if hot_ids.contains(t.id.as_str()) {
+            continue;
+        }
+        let blob = t.text.as_str();
+        let score = tokens.iter().filter(|tok| blob.contains(tok.as_str())).count();
+        if score > 0 {
+            scored.push((score, t));
+        }
+    }
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.planted_chapter.cmp(&a.1.planted_chapter)));
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, t)| t.clone())
+        .collect()
+}
+
+/// Asserted facts whose text overlaps haystack / roster names.
+pub fn select_asserted_facts_for_context(
+    mem: &ProjectMemory,
+    haystack: &str,
+    roster_names: &[String],
+    limit: usize,
+) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut scored: Vec<(usize, &AssertedFact)> = Vec::new();
+    for f in &mem.asserted_facts {
+        let mut score = 0usize;
+        for name in roster_names {
+            if !name.is_empty() && f.text.contains(name) {
+                score += 3;
+            }
+        }
+        for tok in recall_tokens(haystack).into_iter().take(16) {
+            if f.text.contains(&tok) {
+                score += 1;
+            }
+        }
+        if score > 0 {
+            scored.push((score, f));
+        }
+    }
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.chapter.cmp(&a.1.chapter)));
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, f)| format!("[第{}章] {}", f.chapter, truncate_chars(&f.text, 100)))
+        .collect()
 }
 
 /// Load archived `chapters/NNN/summary.json` digests not in the hot window,
@@ -315,7 +582,18 @@ pub fn recall_archived_summaries(
     exclude_chapters: &[u32],
     limit: usize,
 ) -> Vec<ChapterDigest> {
-    if limit == 0 || haystack.trim().is_empty() {
+    recall_archived_summaries_with(project_dir, haystack, &[], exclude_chapters, limit)
+}
+
+/// Entity-name–driven recall: roster / outline names score higher than token overlap.
+pub fn recall_archived_summaries_with(
+    project_dir: &Path,
+    haystack: &str,
+    entity_names: &[String],
+    exclude_chapters: &[u32],
+    limit: usize,
+) -> Vec<ChapterDigest> {
+    if limit == 0 {
         return Vec::new();
     }
     let chapters_dir = project_dir.join("chapters");
@@ -323,7 +601,12 @@ pub fn recall_archived_summaries(
         return Vec::new();
     };
     let tokens = recall_tokens(haystack);
-    if tokens.is_empty() {
+    let names: Vec<&str> = entity_names
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| s.chars().count() >= 2)
+        .collect();
+    if tokens.is_empty() && names.is_empty() {
         return Vec::new();
     }
 
@@ -365,11 +648,26 @@ pub fn recall_archived_summaries(
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string();
-        let blob = format!("{event} {hook} {plot_progress}");
+        let facts: Vec<String> = v
+            .get("new_facts")
+            .and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let blob = format!("{event} {hook} {plot_progress} {}", facts.join(" "));
         if blob.trim().is_empty() {
             continue;
         }
-        let score = tokens.iter().filter(|t| blob.contains(t.as_str())).count();
+        let mut score = 0usize;
+        for n in &names {
+            if blob.contains(n) {
+                score += 5;
+            }
+        }
+        score += tokens.iter().filter(|t| blob.contains(t.as_str())).count();
         if score == 0 {
             continue;
         }
@@ -379,15 +677,7 @@ pub fn recall_archived_summaries(
                 chapter: ch,
                 event_summary: event,
                 hook,
-                key_facts: v
-                    .get("new_facts")
-                    .and_then(|x| x.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                key_facts: facts,
                 relationship_deltas: Vec::new(),
                 plot_progress,
             },
@@ -545,6 +835,111 @@ mod tests {
         assert_eq!(hit[0].chapter, 3);
         let miss = recall_archived_summaries(&dir, "无关话题", &[3], 3);
         assert!(miss.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recall_archived_prefers_entity_names() {
+        let dir = std::env::temp_dir().join("novelx-memory-entity-recall");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("chapters/004")).unwrap();
+        fs::create_dir_all(dir.join("chapters/005")).unwrap();
+        fs::write(
+            dir.join("chapters/004/summary.json"),
+            r#"{"event_summary":"主角路过集市。","ending_hook":"天色将晚。","new_facts":[]}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("chapters/005/summary.json"),
+            r#"{"event_summary":"阿洛在矿脉留下记号。","ending_hook":"回声未绝。","new_facts":[]}"#,
+        )
+        .unwrap();
+        // Haystack alone may miss; entity name boosts chapter 5.
+        let hit = recall_archived_summaries_with(
+            &dir,
+            "继续追查记号",
+            &["阿洛".into()],
+            &[],
+            2,
+        );
+        assert!(!hit.is_empty());
+        assert_eq!(hit[0].chapter, 5);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_volume_memory_writes_rollup() {
+        let dir = std::env::temp_dir().join("novelx-memory-confirm-vol");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("chapters/001")).unwrap();
+        fs::write(
+            dir.join("chapters/001/summary.json"),
+            r#"{"event_summary":"主角进入试炼场。","ending_hook":"门缝透光。","new_facts":[]}"#,
+        )
+        .unwrap();
+        let rollup = confirm_volume_memory(&dir, 1, "试炼卷", 1, 1, "卷末确认").unwrap();
+        assert_eq!(rollup.volume_index, 1);
+        assert!(rollup.summary.contains("试炼") || rollup.summary.contains("进度"));
+        let mem = load_memory(&dir);
+        assert_eq!(mem.volume_rollups.len(), 1);
+        let preview = format_volume_memory_preview(&dir, 1, "试炼卷", 1, 1);
+        assert!(preview.contains("记忆草案"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_thread_overflow_archives_instead_of_drop() {
+        let mut mem = ProjectMemory::default();
+        for i in 1..=30 {
+            mem.open_threads.push(OpenThread {
+                id: format!("t{i}"),
+                text: format!("伏笔线索{i}矿井"),
+                status: "open".into(),
+                planted_chapter: i,
+                resolved_chapter: 0,
+            });
+        }
+        prune_open_threads_into_archive(&mut mem);
+        let open_n = mem
+            .open_threads
+            .iter()
+            .filter(|t| t.status == "open")
+            .count();
+        assert_eq!(open_n, OPEN_THREAD_LIMIT);
+        assert!(
+            !mem.archived_threads.is_empty(),
+            "oldest open threads must be archived"
+        );
+        assert!(
+            mem.archived_threads.iter().any(|t| t.text.contains("线索1")),
+            "oldest planted must survive in archive"
+        );
+        let recalled = recall_archived_threads(&mem, "矿井 线索", 5);
+        assert!(!recalled.is_empty());
+    }
+
+    #[test]
+    fn volume_rollup_from_summaries() {
+        let dir = std::env::temp_dir().join("novelx-memory-rollup");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("chapters/001")).unwrap();
+        fs::create_dir_all(dir.join("chapters/002")).unwrap();
+        fs::write(
+            dir.join("chapters/001/summary.json"),
+            r#"{"event_summary":"主角抵达边境。","ending_hook":"门外有声"}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("chapters/002/summary.json"),
+            r#"{"event_summary":"边境冲突升级。","ending_hook":"援军将至"}"#,
+        )
+        .unwrap();
+        let rollup = build_volume_rollup_from_summaries(&dir, 1, "试炼卷", 1, 2);
+        assert_eq!(rollup.volume_index, 1);
+        assert!(rollup.summary.contains("边境"));
+        upsert_volume_rollup(&dir, rollup).unwrap();
+        let mem = load_memory(&dir);
+        assert_eq!(mem.volume_rollups.len(), 1);
         let _ = fs::remove_dir_all(&dir);
     }
 }

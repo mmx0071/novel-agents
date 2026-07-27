@@ -41,6 +41,7 @@ const TOOL_LABELS_ZH = {
   design_master_outline: '设计总纲',
   design_arc_outline: '设计卷纲',
   sync_volume: '同步设定库',
+  confirm_volume_memory: '确认卷记忆',
   create_novel: '创建小说',
   init_novel: '创建小说',
   lock_brief: '锁定灵感',

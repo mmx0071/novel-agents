@@ -398,8 +398,54 @@ pub fn normalize_consistency_issues(issues: Vec<Value>) -> (bool, Vec<Value>) {
     (has_p0, out)
 }
 
-/// Assign stable `id` fields (`p0-meta-1`) for per-issue revise gates.
+/// Content fingerprint for sticky matching across re-audits (type + quote + location).
+pub fn issue_fingerprint(issue: &Value) -> String {
+    let ty = issue_type(issue).to_ascii_lowercase();
+    let quote = issue
+        .get("quote")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .take(48)
+        .collect::<String>()
+        .to_lowercase();
+    let loc = issue
+        .get("location")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .take(24)
+        .collect::<String>()
+        .to_lowercase();
+    let msg = issue
+        .get("message")
+        .or_else(|| issue.get("description"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .take(32)
+        .collect::<String>()
+        .to_lowercase();
+    let key = if !quote.is_empty() {
+        format!("{ty}|{quote}|{loc}")
+    } else {
+        format!("{ty}|{msg}|{loc}")
+    };
+    // Short stable hex-ish id from bytes (no external hash crate).
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in key.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("fp-{:016x}", h)
+}
+
+/// Assign stable `id` fields. Prefer existing id, else content fingerprint (sticky across audits).
 pub fn with_issue_ids(issues: Vec<Value>) -> Vec<Value> {
+    let mut seen = HashSet::new();
     issues
         .into_iter()
         .enumerate()
@@ -410,7 +456,10 @@ pub fn with_issue_ids(issues: Vec<Value>) -> Vec<Value> {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
-            let id = existing.unwrap_or_else(|| {
+            let fp = issue_fingerprint(&issue);
+            let mut id = existing.unwrap_or_else(|| fp.clone());
+            if !seen.insert(id.clone()) {
+                // Collision / duplicate → fall back to ordinal id.
                 let pri = issue_priority(&issue).to_ascii_lowercase();
                 let ty = {
                     let t = issue_type(&issue).to_ascii_lowercase();
@@ -420,14 +469,145 @@ pub fn with_issue_ids(issues: Vec<Value>) -> Vec<Value> {
                         t.replace('_', "-")
                     }
                 };
-                format!("{pri}-{ty}-{}", i + 1)
-            });
+                id = format!("{pri}-{ty}-{}", i + 1);
+                seen.insert(id.clone());
+            }
             if let Some(obj) = issue.as_object_mut() {
                 obj.insert("id".into(), json!(id));
+                obj.insert("fingerprint".into(), json!(fp));
             }
             issue
         })
         .collect()
+}
+
+fn quote_still_in_draft(draft: &str, quote: &str) -> bool {
+    let q: String = quote.chars().filter(|c| !c.is_whitespace()).collect();
+    if q.chars().count() < 4 {
+        return true; // no usable quote → cannot prove fixed by absence
+    }
+    let d: String = draft.chars().filter(|c| !c.is_whitespace()).collect();
+    d.contains(&q)
+}
+
+/// Merge verify-mode auditor output with previous issues.
+/// - Keep previous items marked `still_open` (by id)
+/// - Drop `fixed`; quote gone from draft also counts as fixed
+/// - Only admit **new hard P0** (soft rediscovery is discarded — stops 越审越多)
+pub fn merge_verify_audit(
+    previous: &[Value],
+    verdicts: &[Value],
+    new_issues: Vec<Value>,
+    draft: Option<&str>,
+) -> (bool, Vec<Value>, usize, usize) {
+    let previous = with_issue_ids(previous.to_vec());
+    let mut status_by_id: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for v in verdicts {
+        let id = v
+            .get("id")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if id.is_empty() {
+            continue;
+        }
+        let st = v
+            .get("status")
+            .and_then(|x| x.as_str())
+            .unwrap_or("still_open")
+            .trim()
+            .to_ascii_lowercase();
+        let norm = if st.contains("fix") || st.contains("已修") || st == "ok" {
+            "fixed"
+        } else {
+            "still_open"
+        };
+        status_by_id.insert(id, norm.into());
+    }
+
+    let mut still_open = Vec::new();
+    let mut fixed_n = 0usize;
+    for issue in &previous {
+        let id = issue
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let quote = issue
+            .get("quote")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let mut st = status_by_id
+            .get(&id)
+            .map(|s| s.as_str())
+            .unwrap_or("still_open");
+        // Quote excised from draft → treat as fixed even if model is conservative.
+        if st != "fixed" {
+            if let Some(d) = draft {
+                if !quote_still_in_draft(d, quote) {
+                    st = "fixed";
+                }
+            }
+        }
+        // Soft prior issues with missing verdict: drop on verify (don't keep accumulating P1).
+        if st != "fixed"
+            && status_by_id.get(&id).is_none()
+            && issue_priority(issue) != "P0"
+        {
+            st = "fixed";
+        }
+        if st == "fixed" {
+            fixed_n += 1;
+        } else {
+            still_open.push(issue.clone());
+        }
+    }
+
+    let prev_p0_open = still_open
+        .iter()
+        .any(|i| issue_priority(i) == "P0");
+
+    let (_new_has_p0_raw, mut new_norm) = normalize_consistency_issues(new_issues);
+    // Verify: only hard P0 may enter the open set; soft rediscovery is noise.
+    new_norm.retain(|i| issue_priority(i) == "P0");
+    new_norm.truncate(2);
+
+    // Dedup new against still_open by fingerprint/id.
+    let open_keys: HashSet<String> = still_open
+        .iter()
+        .filter_map(|i| {
+            i.get("fingerprint")
+                .or_else(|| i.get("id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+    new_norm.retain(|i| {
+        let fp = i
+            .get("fingerprint")
+            .or_else(|| i.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        !open_keys.contains(fp)
+    });
+
+    let new_p0_n = new_norm.len();
+
+    // Convergence: previous P0s cleared → no new hard P0 → pass (drop leftover soft).
+    let mut merged = if !prev_p0_open && new_p0_n == 0 {
+        // Clear soft leftovers so the checklist shrinks after a successful fix pass.
+        Vec::new()
+    } else {
+        still_open
+    };
+    let new_n = new_norm.len();
+    merged.extend(new_norm);
+    let merged = with_issue_ids(merged);
+    let has_p0 = merged.iter().any(|i| issue_priority(i) == "P0");
+    let passed = !has_p0;
+    (passed, merged, fixed_n, new_n)
 }
 
 /// Keep only issues whose `id` is in `ids` (order preserved). Empty `ids` → no filter.
@@ -516,6 +696,96 @@ mod tests {
         })]);
         assert!(!has_p0);
         assert_eq!(issues[0]["priority"], "P2");
+    }
+
+    #[test]
+    fn fingerprint_stable_for_same_quote() {
+        let a = json!({
+            "type": "TIMELINE",
+            "priority": "P0",
+            "message": "倒计时回跳",
+            "location": "第3段",
+            "quote": "还剩十一小时",
+        });
+        let b = json!({
+            "type": "TIMELINE",
+            "priority": "P0",
+            "message": "另一说法",
+            "location": "第3段",
+            "quote": "还剩十一小时",
+        });
+        assert_eq!(issue_fingerprint(&a), issue_fingerprint(&b));
+    }
+
+    #[test]
+    fn merge_verify_drops_fixed_and_converges() {
+        let prev = vec![
+            json!({
+                "id": "p0-timeline-1",
+                "type": "TIMELINE",
+                "priority": "P0",
+                "message": "倒计时回跳",
+                "quote": "还剩十一小时",
+            }),
+            json!({
+                "id": "p1-lore-1",
+                "type": "LORE",
+                "priority": "P1",
+                "message": "动机略跳",
+            }),
+        ];
+        let verdicts = vec![
+            json!({"id": "p0-timeline-1", "status": "fixed"}),
+            json!({"id": "p1-lore-1", "status": "fixed"}),
+        ];
+        let (passed, merged, fixed_n, new_n) = merge_verify_audit(
+            &prev,
+            &verdicts,
+            vec![json!({
+                "type": "PLOT",
+                "priority": "P1",
+                "message": "可补交代落点",
+            })],
+            None,
+        );
+        assert!(passed, "旧 P0 已修且新发现无硬 P0 应收敛通过");
+        assert_eq!(fixed_n, 2);
+        assert_eq!(new_n, 0, "软性新发现不得进入复审清单");
+        assert!(merged.is_empty(), "收敛后应清空清单");
+    }
+
+    #[test]
+    fn merge_verify_keeps_still_open_p0() {
+        let prev = vec![json!({
+            "id": "p0-injury-1",
+            "type": "INJURY",
+            "priority": "P0",
+            "message": "受伤部位矛盾",
+            "quote": "左肩中弹包扎",
+        })];
+        let verdicts = vec![json!({"id": "p0-injury-1", "status": "still_open"})];
+        let draft = "他摸了摸左肩中弹包扎，血又渗出来。";
+        let (passed, merged, _, _) =
+            merge_verify_audit(&prev, &verdicts, vec![], Some(draft));
+        assert!(!passed);
+        assert_eq!(merged.len(), 1);
+    }
+
+    #[test]
+    fn merge_verify_quote_gone_counts_fixed() {
+        let prev = vec![json!({
+            "id": "p0-timeline-1",
+            "type": "TIMELINE",
+            "priority": "P0",
+            "message": "倒计时回跳",
+            "quote": "还剩十一小时",
+        })];
+        let draft = "表盘指向还剩九小时，他加快了脚步。";
+        let (passed, merged, fixed_n, _) =
+            merge_verify_audit(&prev, &[], vec![], Some(draft));
+        assert!(passed);
+        assert_eq!(fixed_n, 1);
+        assert!(merged.is_empty());
     }
 
     #[test]

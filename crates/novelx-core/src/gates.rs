@@ -50,6 +50,8 @@ pub enum GateResolve {
     ActivatePlotWrite,
     /// Close the current decision card without a tool call.
     DismissGate,
+    /// Resume Studio LLM to continue an unfinished multi-step plan.
+    ContinueStudio,
     /// Free-text instructions while an audit gate is open.
     SteerInstructions { instructions: String },
 }
@@ -242,6 +244,7 @@ impl GateCatalog {
                 "skip_impact" => Some(GateResolve::SkipImpact),
                 "activate_plot_write" => Some(GateResolve::ActivatePlotWrite),
                 "dismiss_gate" => Some(GateResolve::DismissGate),
+                "continue_studio" => Some(GateResolve::ContinueStudio),
                 other => {
                     tracing::warn!(resolve = other, "unknown gate resolve");
                     None
@@ -360,18 +363,48 @@ impl GateCatalog {
         Self::materialize(self.find_option("volume_sync", text)?, &vars)
     }
 
-    pub fn resolve_volume_audit(
+    /// Map typed「1」「2」「3」to display order (ids are `vs_sync` / `vs_memory` / `vs_skip`).
+    pub fn resolve_volume_visible(
         &self,
         text: &str,
         project: &str,
-        chapters: &[u32],
+        volume: u32,
     ) -> Option<GateResolve> {
+        if let Some(r) = self.resolve_volume(text, project, volume) {
+            return Some(r);
+        }
+        let idx = parse_one_based_index(text)?;
+        let opts = self.options("volume_sync");
+        let id = opts.get(idx.checked_sub(1)?)?.id.clone();
+        self.resolve_volume(&id, project, volume)
+    }
+
+    #[allow(dead_code)]
+    pub fn resolve_studio_next_fallback(&self, text: &str, project: &str) -> Option<GateResolve> {
         let vars = TemplateVars {
             project: project.to_string(),
-            chapters: Some(chapters.to_vec()),
             ..Default::default()
         };
-        Self::materialize(self.find_option("volume_audit", text)?, &vars)
+        Self::materialize(self.find_option("studio_next_fallback", text)?, &vars)
+    }
+
+    #[allow(dead_code)]
+    pub fn resolve_studio_next_fallback_visible(
+        &self,
+        text: &str,
+        project: &str,
+    ) -> Option<GateResolve> {
+        if let Some(r) = self.resolve_studio_next_fallback(text, project) {
+            return Some(r);
+        }
+        let idx = parse_one_based_index(text)?;
+        let opts = self.studio_next_fallback_options();
+        let id = opts.get(idx.checked_sub(1)?)?.id.clone();
+        self.resolve_studio_next_fallback(&id, project)
+    }
+
+    pub fn studio_next_fallback_options(&self) -> Vec<UserInputOption> {
+        self.options("studio_next_fallback")
     }
 
     pub fn resolve_setup_progress(
@@ -461,184 +494,6 @@ impl GateCatalog {
         Self::materialize(self.find_option("chapter_next", text)?, &vars)
     }
 
-    pub fn resolve_draft_exists(
-        &self,
-        text: &str,
-        project: &str,
-        chapter: u32,
-        suggest_chapter: u32,
-    ) -> Option<GateResolve> {
-        let vars = TemplateVars {
-            project: project.to_string(),
-            chapter: Some(chapter),
-            suggest_chapter: Some(suggest_chapter),
-            ..Default::default()
-        };
-        Self::materialize(self.find_option("draft_exists", text)?, &vars)
-    }
-
-    pub fn planned_plot_options(&self, title: &str) -> Vec<UserInputOption> {
-        self.options("planned_plot")
-            .into_iter()
-            .map(|mut o| {
-                o.label = o.label.replace("{{title}}", title);
-                o
-            })
-            .collect()
-    }
-
-    pub fn resolve_planned_plot(&self, text: &str, project: &str, title: &str) -> Option<GateResolve> {
-        let vars = TemplateVars {
-            project: project.to_string(),
-            title: Some(title.to_string()),
-            ..Default::default()
-        };
-        Self::materialize(self.find_option("planned_plot", text)?, &vars)
-    }
-
-    pub fn resolve_planned_plot_visible(
-        &self,
-        text: &str,
-        project: &str,
-        title: &str,
-    ) -> Option<GateResolve> {
-        if let Some(r) = self.resolve_planned_plot(text, project, title) {
-            return Some(r);
-        }
-        let idx = parse_one_based_index(text)?;
-        let opts = self.planned_plot_options(title);
-        let id = opts.get(idx.checked_sub(1)?)?.id.clone();
-        self.resolve_planned_plot(&id, project, title)
-    }
-
-    pub fn need_plot_options(&self) -> Vec<UserInputOption> {
-        self.options("need_plot")
-    }
-
-    pub fn need_expected_review_options(&self) -> Vec<UserInputOption> {
-        self.options("need_expected_review")
-    }
-
-    pub fn expected_event_options(&self, event_text: &str) -> Vec<UserInputOption> {
-        self.options("expected_event")
-            .into_iter()
-            .map(|mut o| {
-                let short: String = event_text.chars().take(24).collect();
-                if !short.is_empty() && o.id == "ee_approve" {
-                    o.label = format!("纳入「{short}」");
-                }
-                o
-            })
-            .collect()
-    }
-
-    pub fn resolve_need_expected_review(
-        &self,
-        text: &str,
-        project: &str,
-        chapter: u32,
-    ) -> Option<GateResolve> {
-        let vars = TemplateVars {
-            project: project.to_string(),
-            chapter: Some(chapter),
-            ..Default::default()
-        };
-        Self::materialize(self.find_option("need_expected_review", text)?, &vars)
-    }
-
-    pub fn resolve_need_expected_review_visible(
-        &self,
-        text: &str,
-        project: &str,
-        chapter: u32,
-    ) -> Option<GateResolve> {
-        if let Some(r) = self.resolve_need_expected_review(text, project, chapter) {
-            return Some(r);
-        }
-        let idx = parse_one_based_index(text)?;
-        let opts = self.need_expected_review_options();
-        let id = opts.get(idx.checked_sub(1)?)?.id.clone();
-        self.resolve_need_expected_review(&id, project, chapter)
-    }
-
-    pub fn resolve_expected_event_gate(
-        &self,
-        text: &str,
-        project: &str,
-        event_id: &str,
-    ) -> Option<GateResolve> {
-        let vars = TemplateVars {
-            project: project.to_string(),
-            event_id: Some(event_id.to_string()),
-            ..Default::default()
-        };
-        Self::materialize(self.find_option("expected_event", text)?, &vars)
-    }
-
-    pub fn resolve_expected_event_gate_visible(
-        &self,
-        text: &str,
-        project: &str,
-        event_id: &str,
-        event_text: &str,
-    ) -> Option<GateResolve> {
-        if let Some(r) = self.resolve_expected_event_gate(text, project, event_id) {
-            return Some(r);
-        }
-        let idx = parse_one_based_index(text)?;
-        let opts = self.expected_event_options(event_text);
-        let id = opts.get(idx.checked_sub(1)?)?.id.clone();
-        self.resolve_expected_event_gate(&id, project, event_id)
-    }
-
-    pub fn resolve_need_plot(
-        &self,
-        text: &str,
-        project: &str,
-        volume: u32,
-        title: &str,
-    ) -> Option<GateResolve> {
-        let vars = TemplateVars {
-            project: project.to_string(),
-            volume: Some(volume),
-            title: Some(title.to_string()),
-            ..Default::default()
-        };
-        Self::materialize(self.find_option("need_plot", text)?, &vars)
-    }
-
-    pub fn resolve_need_plot_visible(
-        &self,
-        text: &str,
-        project: &str,
-        volume: u32,
-        title: &str,
-    ) -> Option<GateResolve> {
-        if let Some(r) = self.resolve_need_plot(text, project, volume, title) {
-            return Some(r);
-        }
-        let idx = parse_one_based_index(text)?;
-        let opts = self.need_plot_options();
-        let id = opts.get(idx.checked_sub(1)?)?.id.clone();
-        self.resolve_need_plot(&id, project, volume, title)
-    }
-
-    pub fn resolve_draft_exists_visible(
-        &self,
-        text: &str,
-        project: &str,
-        chapter: u32,
-        suggest_chapter: u32,
-    ) -> Option<GateResolve> {
-        if let Some(r) = self.resolve_draft_exists(text, project, chapter, suggest_chapter) {
-            return Some(r);
-        }
-        let idx = parse_one_based_index(text)?;
-        let opts = self.options("draft_exists");
-        let id = opts.get(idx.checked_sub(1)?)?.id.clone();
-        self.resolve_draft_exists(&id, project, chapter, suggest_chapter)
-    }
-
     /// Map typed「1」「2」… to the Nth *visible* option (ApprovalOptions shows 1-based index,
     /// but ids may be `cn_revise` / `sc_approve` / `va_deep`, not bare digits).
     pub fn resolve_chapter_next_visible(
@@ -656,21 +511,6 @@ impl GateCatalog {
         let opts = self.chapter_next_options(published, plot_accept_open);
         let id = opts.get(idx.checked_sub(1)?)?.id.clone();
         self.resolve_chapter_next(&id, project, chapter)
-    }
-
-    pub fn resolve_volume_audit_visible(
-        &self,
-        text: &str,
-        project: &str,
-        chapters: &[u32],
-    ) -> Option<GateResolve> {
-        if let Some(r) = self.resolve_volume_audit(text, project, chapters) {
-            return Some(r);
-        }
-        let idx = parse_one_based_index(text)?;
-        let opts = self.options("volume_audit");
-        let id = opts.get(idx.checked_sub(1)?)?.id.clone();
-        self.resolve_volume_audit(&id, project, chapters)
     }
 }
 
@@ -800,19 +640,6 @@ mod tests {
         assert!(!g.is_stale_audit_choice_token("继续创作"));
         assert!(!g.is_stale_audit_choice_token("写第10章"));
         let r = g
-            .resolve_volume_audit("va_deep", "demo", &[1, 3, 8])
-            .unwrap();
-        match r {
-            GateResolve::Tool { name, args } => {
-                assert_eq!(name, "audit_chapters");
-                assert_eq!(args["action"], "start");
-                assert_eq!(args["chapters"], json!([1, 3, 8]));
-            }
-            _ => panic!("expected deep audit tool"),
-        }
-        // Must not steal audit_queue option id "1".
-        assert!(g.resolve_volume_audit("1", "demo", &[1]).is_none());
-        let r = g
             .resolve_setup_progress("sc_approve", "demo", "setup_confirm")
             .unwrap();
         match r {
@@ -837,38 +664,6 @@ mod tests {
             GateResolve::Tool { name, .. } => assert_eq!(name, "continue_writing"),
             _ => panic!("expected continue_writing"),
         }
-        let r = g
-            .resolve_draft_exists_visible("de_next", "demo", 11, 12)
-            .unwrap();
-        match r {
-            GateResolve::Tool { name, args } => {
-                assert_eq!(name, "continue_writing");
-                assert_eq!(args["chapter"], 12);
-            }
-            _ => panic!("expected continue_writing ch12"),
-        }
-        let r = g.resolve_draft_exists("审校本章", "demo", 11, 12).unwrap();
-        match r {
-            GateResolve::Tool { name, args } => {
-                assert_eq!(name, "audit_chapter");
-                assert_eq!(args["chapter"], 11);
-            }
-            _ => panic!("expected audit_chapter"),
-        }
-        let opts = g.planned_plot_options("样例卡");
-        assert!(opts.iter().any(|o| o.label.contains("样例卡")));
-        assert!(matches!(
-            g.resolve_planned_plot("激活并写章", "demo", "样例卡"),
-            Some(GateResolve::ActivatePlotWrite)
-        ));
-        assert!(matches!(
-            g.resolve_planned_plot("暂不写作", "demo", "样例卡"),
-            Some(GateResolve::DismissGate)
-        ));
-        assert!(matches!(
-            g.resolve_need_plot("设计并激活剧情卡", "demo", 2, "下一段"),
-            Some(GateResolve::Tool { name, .. }) if name == "design_plot"
-        ));
         let cont = g.chapter_next_options(true, false);
         assert_eq!(cont.len(), 1);
         assert_eq!(cont[0].id, "cn_continue");
@@ -937,8 +732,17 @@ mod tests {
                 .unwrap(),
             GateResolve::DismissGate
         ));
-        let r = g.resolve_volume("2", "demo", 3).unwrap();
+        let r = g.resolve_volume("vs_skip", "demo", 3).unwrap();
         assert!(matches!(r, GateResolve::SkipVolume));
+        // Display index: 1=sync, 2=memory, 3=skip (aliases also accept bare digits).
+        match g.resolve_volume_visible("2", "demo", 2).unwrap() {
+            GateResolve::Tool { name, .. } => assert_eq!(name, "confirm_volume_memory"),
+            _ => panic!("display index 2 must be confirm_volume_memory"),
+        }
+        assert!(matches!(
+            g.resolve_volume_visible("3", "demo", 2).unwrap(),
+            GateResolve::SkipVolume
+        ));
         let r = g.resolve_chapter_order("写第{{next_chapter}}章".replace("{{next_chapter}}", "4").as_str(), "demo", 4)
             .or_else(|| g.resolve_chapter_order("写下一章", "demo", 4))
             .unwrap();
@@ -974,20 +778,33 @@ mod tests {
             g.resolve_impact_confirm("暂不同步").unwrap(),
             GateResolve::SkipImpact
         ));
-        let r = g
-            .resolve_expected_event_gate("纳入本次创作", "demo", "ee_abc")
-            .unwrap();
-        match r {
-            GateResolve::Tool { name, args } => {
-                assert_eq!(name, "resolve_expected_event");
-                assert_eq!(args["id"], "ee_abc");
-                assert_eq!(args["status"], "approved");
-            }
-            _ => panic!("expected resolve_expected_event tool"),
-        }
         assert!(matches!(
-            g.resolve_need_expected_review("稍后", "demo", 3).unwrap(),
+            g.resolve_studio_next_fallback("继续推进", "demo")
+                .unwrap(),
+            GateResolve::ContinueStudio
+        ));
+        assert!(matches!(
+            g.resolve_studio_next_fallback_visible("2", "demo").unwrap(),
             GateResolve::DismissGate
         ));
+        assert!(matches!(
+            g.resolve_studio_next_fallback("稍后", "demo").unwrap(),
+            GateResolve::DismissGate
+        ));
+        let r = g.resolve_volume("vs_memory", "demo", 2).unwrap();
+        match r {
+            GateResolve::Tool { name, args } => {
+                assert_eq!(name, "confirm_volume_memory");
+                assert_eq!(args["volume"], 2);
+            }
+            _ => panic!("expected confirm_volume_memory"),
+        }
+        match g.resolve_volume_visible("1", "demo", 2).unwrap() {
+            GateResolve::Tool { name, args } => {
+                assert_eq!(name, "sync_volume");
+                assert_eq!(args["confirm_memory"], "true");
+            }
+            _ => panic!("display index 1 must sync + confirm memory"),
+        }
     }
 }

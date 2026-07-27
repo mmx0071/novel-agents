@@ -3,6 +3,7 @@
 pub mod activation;
 pub mod chapter_budget;
 pub mod content_rules;
+pub mod continuity;
 pub mod gates;
 pub mod naming_rules;
 pub mod pipeline_config;
@@ -14,8 +15,9 @@ pub use activation::{
     ActivationSuggestion,
 };
 pub use chapter_budget::ChapterBudget;
+pub use continuity::{ContinuityBudget, ContinuityTier};
 pub use content_rules::{
-    check_draft, check_draft_with, rewrite_meta_chapter_refs_in_body,
+    check_draft, check_draft_with, has_blocking_violation, rewrite_meta_chapter_refs_in_body,
     rewrite_meta_chapter_refs_with, ContentRulesConfig,
 };
 pub use gates::{
@@ -26,9 +28,9 @@ pub use naming_rules::NamingRules;
 pub use pipeline_config::{HandlerKind, HandlerSpec, PipelineConfig};
 pub use policies::StudioPolicies;
 pub use review_priority::{
-    filter_issues_by_ids, has_timeline_p0, issue_priority, issue_type,
-    normalize_consistency_issues, normalize_priority, partition_issues, with_issue_ids,
-    AUTO_FIX_PRIORITIES,
+    filter_issues_by_ids, has_timeline_p0, issue_fingerprint, issue_priority, issue_type,
+    merge_verify_audit, normalize_consistency_issues, normalize_priority, partition_issues,
+    with_issue_ids, AUTO_FIX_PRIORITIES,
 };
 
 /// Full-rewrite detection from `config/policies.yaml` (embedded defaults).

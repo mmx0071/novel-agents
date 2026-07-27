@@ -5,6 +5,7 @@ pub mod cards;
 pub mod chapter_gate;
 pub mod context;
 pub mod expected_events;
+pub mod foreshadow;
 pub mod impact;
 pub mod lore;
 pub mod memory;
@@ -25,7 +26,9 @@ pub use cards::{
 };
 pub use body_state::{format_body_state_board, format_body_state_board_for_character};
 pub use chapter_gate::{check_chapter_order, check_revise_target, ChapterOrderBlock};
-pub use context::{build_chapter_context, read_world_doc, ChapterContextPack, ContextProfile};
+pub use context::{
+    build_chapter_context, format_chapter_bridge, read_world_doc, ChapterContextPack, ContextProfile,
+};
 pub use lore::{lore_assert_from_summary, lore_query};
 pub use expected_events::{
     agent_fit_actionable, build_eval_context, conditions_from_value, count_by_status,
@@ -35,8 +38,15 @@ pub use expected_events::{
     resolve_expected_event, save_expected_events, set_event_review, update_expected_event,
     ExpectedConditions, ExpectedEvent, ExpectedEventStore, ExpectedReview,
 };
+pub use foreshadow::{
+    format_dangling_for_context, format_dangling_for_tracker, load_foreshadow_index,
+    rebuild_foreshadow_index, ForeshadowIndex,
+};
 pub use memory::{
-    apply_summary_json, load_memory, recall_archived_summaries, save_memory, ProjectMemory,
+    apply_summary_json, build_volume_rollup_from_summaries, confirm_volume_memory,
+    format_volume_memory_preview, load_memory, prune_open_threads_into_archive,
+    recall_archived_summaries, recall_archived_summaries_with, recall_archived_threads, save_memory,
+    select_asserted_facts_for_context, upsert_volume_rollup, ProjectMemory, VolumeRollup,
 };
 pub use plots::{
     accept_verdict_is_pass, accept_verdict_is_pass_against, active_plot_exit_context,
@@ -62,8 +72,8 @@ pub use phases::{
 pub use project::{
     chapter_dir, delete_chapter, init_project, list_chapter_numbers, list_projects,
     load_project_state, project_dir, read_chapter_draft, read_chapter_outline, refresh_meta_flags,
-    save_project_state, sync_records_novel_json, write_chapter_draft, write_chapter_outline,
-    DeleteChapterResult, ProjectState,
+    save_project_state, sync_records_novel_json, update_target_chapters, write_chapter_draft,
+    write_chapter_outline, DeleteChapterResult, ProjectState,
 };
 pub use schemas::{
     display_arc_outline, display_bible, display_chapter_outline, display_draft, display_entity_card,

@@ -74,46 +74,40 @@ gates:
 
   volume_sync:
     options:
-      - id: "1"
-        label: 同步设定库
+      # Non-numeric ids so typed「1/2/3」map via display order (resolve_volume_visible).
+      - id: vs_sync
+        label: 同步设定并确认卷记忆
         tool: sync_volume
         args:
           project: "{{project}}"
           volume: "{{volume}}"
-        aliases: [同步设定库, 同步]
-      - id: "2"
-        label: 跳过
-        resolve: skip_volume
-        aliases: [跳过, 不同步, 稍后]
-
-  # continue_writing blocked: planned plot exists but not activated.
-  planned_plot:
-    options:
-      - id: pp_activate_write
-        label: 激活「{{title}}」并写章
-        resolve: activate_plot_write
-        aliases: [激活并写章, 激活剧情卡并写章, 激活剧情卡, 激活]
-      - id: pp_dismiss
-        label: 暂不写作
-        resolve: dismiss_gate
-        aliases: [暂不写作, 取消, 稍后]
-
-  # continue_writing blocked: no active plot — design+activate next card.
-  need_plot:
-    options:
-      - id: np_design
-        label: 设计并激活剧情卡
-        tool: design_plot
+          confirm_memory: "true"
+        aliases: [同步设定库, 同步, 同步设定并确认卷记忆, "1"]
+      - id: vs_memory
+        label: 仅确认卷记忆
+        tool: confirm_volume_memory
         args:
           project: "{{project}}"
-          title: "{{title}}"
-          act: "{{volume}}"
-          activate: true
-        aliases: [设计并激活剧情卡, 设计剧情卡, 开剧情卡, design_plot]
-      - id: np_dismiss
-        label: 暂不写作
+          volume: "{{volume}}"
+        aliases: [仅确认卷记忆, 确认卷记忆, 写入卷摘要, "2"]
+      - id: vs_skip
+        label: 跳过
+        resolve: skip_volume
+        aliases: [跳过, 不同步, 稍后, "3"]
+
+  # Soft fallback when Studio fails to call offer_decisions(kind=studio_next).
+  # Situational next steps (mutation follow-up, setting BLOCKER, plot/draft/expected/volume_audit)
+  # must come from the model — not hardcoded menus here.
+  studio_next_fallback:
+    options:
+      - id: snf_continue
+        label: 继续推进
+        resolve: continue_studio
+        aliases: [继续推进, 继续未完成步骤, 接着做]
+      - id: snf_later
+        label: 稍后
         resolve: dismiss_gate
-        aliases: [暂不写作, 取消, 稍后]
+        aliases: [稍后, 暂不处理, 结束]
 
   # Skip-ahead chapter write blocked → offer the correct next chapter.
   chapter_order:
@@ -249,32 +243,6 @@ gates:
         resolve: dismiss_gate
         aliases: [暂不处理, 取消, 稍后]
 
-  # continue_writing omitted chapter while next_chapter already has an unpublished draft.
-  draft_exists:
-    options:
-      - id: de_audit
-        label: 审校本章
-        tool: audit_chapter
-        args:
-          project: "{{project}}"
-          chapter: "{{chapter}}"
-        aliases: [审校本章, 审校, 先审校]
-      - id: de_revise
-        label: 修订本章
-        tool: revise_chapter
-        args:
-          project: "{{project}}"
-          chapter: "{{chapter}}"
-          instructions: "在现有正文基础上修订本章：保持情节与设定一致，修补明显问题，便于审校发布。"
-        aliases: [修订本章, 修订, 修改本章]
-      - id: de_next
-        label: 写下一章
-        tool: continue_writing
-        args:
-          project: "{{project}}"
-          chapter: "{{suggest_chapter}}"
-        aliases: [写下一章, 新写下一章, 跳过并写下一章]
-
   # After chapter write/revise: server filters by publish result.
   # published → cn_continue only; content-rule blocked → cn_revise only;
   # published + plot_accept fail → both (继续推进 / 修正收束).
@@ -299,69 +267,3 @@ gates:
           instructions: "消除正文硬规则违规：除标题行外禁止出现「第N章」元叙述，并替换禁名；只改违规句，勿整章重写。"
         aliases: [修正本章, 修正, 修改本章, 修订]
 
-  # continue_writing: hard-ok expected events need review first.
-  need_expected_review:
-    options:
-      - id: eer_review
-        label: 检阅预期
-        tool: review_expected_events
-        args:
-          project: "{{project}}"
-          chapter: "{{chapter}}"
-        aliases: [检阅预期, 检阅, 审预期]
-      - id: eer_skip_write
-        label: 跳过检阅继续写
-        tool: continue_writing
-        args:
-          project: "{{project}}"
-          chapter: "{{chapter}}"
-          confirm_skip_expected: true
-          confirm_skip: true
-        aliases: [跳过检阅继续写, 跳过检阅, 先写章]
-      - id: eer_later
-        label: 稍后
-        resolve: dismiss_gate
-        aliases: [稍后, 取消, 暂不处理]
-
-  # Expected-event candidate ready — user decides whether to incorporate.
-  expected_event:
-    options:
-      - id: ee_approve
-        label: 纳入本次创作
-        tool: resolve_expected_event
-        args:
-          project: "{{project}}"
-          id: "{{event_id}}"
-          status: approved
-          apply: true
-          confirm_skip: true
-        aliases: [纳入本次创作, 纳入, 批准]
-      - id: ee_skip
-        label: 本次跳过
-        tool: resolve_expected_event
-        args:
-          project: "{{project}}"
-          id: "{{event_id}}"
-          action: skip_once
-          confirm_skip: true
-        aliases: [本次跳过, 跳过]
-      - id: ee_later
-        label: 稍后处理
-        resolve: dismiss_gate
-        aliases: [稍后处理, 稍后, 取消]
-
-  # IDs must NOT collide with audit/audit_queue ("1"/"2"/"3") — bare id match is global per gate.
-  volume_audit:
-    options:
-      - id: va_deep
-        label: 按建议深审
-        tool: audit_chapters
-        args:
-          project: "{{project}}"
-          action: start
-          chapters: "{{chapters}}"
-        aliases: [按建议深审, 深审建议章, 逐章审建议章]
-      - id: va_dismiss
-        label: 结束复盘
-        resolve: skip_volume
-        aliases: [结束复盘, 结束卷复盘]

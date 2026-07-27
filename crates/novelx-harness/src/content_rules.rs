@@ -4,10 +4,36 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContentRuleViolation {
     pub rule: String,
     pub message: String,
+    /// From `rules.<id>.blocking`. False = report-only (does not block publish).
+    #[serde(default = "default_true")]
+    pub blocking: bool,
+}
+
+impl Default for ContentRuleViolation {
+    fn default() -> Self {
+        Self {
+            rule: String::new(),
+            message: String::new(),
+            blocking: true,
+        }
+    }
+}
+
+/// True when any violation is configured as blocking.
+pub fn has_blocking_violation(violations: &[ContentRuleViolation]) -> bool {
+    violations.iter().any(|v| v.blocking)
+}
+
+fn violation(rule: &str, message: String, blocking: bool) -> ContentRuleViolation {
+    ContentRuleViolation {
+        rule: rule.into(),
+        message,
+        blocking,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,7 +83,7 @@ fn default_contradiction_marker() -> String {
     "[CONTRADICTION]".into()
 }
 fn default_contradiction_msg() -> String {
-    "正文残留 {marker} 标记".into()
+    "正文残留管道内部标记：{marker}".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -379,6 +405,104 @@ impl ContentRulesConfig {
         })
     }
 
+    /// Patch `enabled` / `blocking` for one rule id inside YAML text.
+    /// Line-oriented so comments / ordering outside those keys are preserved.
+    pub fn patch_rule_flags(
+        yaml: &str,
+        rule_id: &str,
+        enabled: Option<bool>,
+        blocking: Option<bool>,
+    ) -> Result<String, String> {
+        if enabled.is_none() && blocking.is_none() {
+            return Err("未指定要修改的标志".into());
+        }
+        let known = [
+            "banned_name",
+            "contradiction_marker",
+            "too_many_new_facts",
+            "meta_chapter_ref",
+            "timeline_countdown_jump",
+            "timeline_daypart_regression",
+        ];
+        if !known.contains(&rule_id) {
+            return Err(format!("未知规则 id：{rule_id}"));
+        }
+        let text = if yaml.trim().is_empty() {
+            Self::defaults().raw_yaml
+        } else {
+            yaml.to_string()
+        };
+        let header = format!("  {rule_id}:");
+        let lines: Vec<&str> = text.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.trim_end() == header || *l == header)
+            .ok_or_else(|| format!("YAML 中未找到规则「{rule_id}」"))?;
+        let mut end = lines.len();
+        for (i, line) in lines.iter().enumerate().skip(start + 1) {
+            // Next top-level key under `rules:` (two-space indent + name + ':')
+            if line.starts_with("  ")
+                && !line.starts_with("    ")
+                && line.trim_end().ends_with(':')
+                && !line.trim_start().starts_with('#')
+            {
+                end = i;
+                break;
+            }
+            if !line.starts_with(' ') && !line.trim().is_empty() && !line.trim_start().starts_with('#')
+            {
+                end = i;
+                break;
+            }
+        }
+
+        let mut out: Vec<String> = lines.iter().take(start).map(|s| (*s).to_string()).collect();
+        let mut block: Vec<String> = lines[start..end].iter().map(|s| (*s).to_string()).collect();
+        let mut saw_enabled = false;
+        let mut saw_blocking = false;
+        for row in &mut block {
+            let trim_len = row.len() - row.trim_start().len();
+            let key = row.trim_start().to_string();
+            if let Some(v) = enabled {
+                if key.starts_with("enabled:") {
+                    let indent = " ".repeat(trim_len);
+                    *row = format!("{indent}enabled: {}", if v { "true" } else { "false" });
+                    saw_enabled = true;
+                    continue;
+                }
+            }
+            if let Some(v) = blocking {
+                if key.starts_with("blocking:") {
+                    let indent = " ".repeat(trim_len);
+                    *row = format!("{indent}blocking: {}", if v { "true" } else { "false" });
+                    saw_blocking = true;
+                }
+            }
+        }
+        // Insert missing keys right after the rule header.
+        if enabled.is_some() && !saw_enabled {
+            block.insert(1, format!("    enabled: {}", if enabled.unwrap() { "true" } else { "false" }));
+        }
+        if blocking.is_some() && !saw_blocking {
+            let insert_at = if block.len() > 1 { 2.min(block.len()) } else { 1 };
+            block.insert(
+                insert_at,
+                format!(
+                    "    blocking: {}",
+                    if blocking.unwrap() { "true" } else { "false" }
+                ),
+            );
+        }
+        out.extend(block);
+        out.extend(lines[end..].iter().map(|s| (*s).to_string()));
+        let mut patched = out.join("\n");
+        if text.ends_with('\n') && !patched.ends_with('\n') {
+            patched.push('\n');
+        }
+        Self::parse_yaml(&patched)?;
+        Ok(patched)
+    }
+
     /// Catalog for Web UI (id / title / description / enabled / blocking).
     pub fn catalog(&self) -> Vec<serde_json::Value> {
         use serde_json::json;
@@ -446,10 +570,11 @@ pub fn check_draft_with(
     if r.banned_name.meta.enabled {
         for name in banned_names {
             if !name.is_empty() && draft.contains(name) {
-                out.push(ContentRuleViolation {
-                    rule: "banned_name".into(),
-                    message: format!("正文出现禁名「{name}」"),
-                });
+                out.push(violation(
+                    "banned_name",
+                    format!("正文出现禁名「{name}」"),
+                    r.banned_name.meta.blocking,
+                ));
             }
         }
     }
@@ -461,10 +586,11 @@ pub fn check_draft_with(
                 .contradiction_marker
                 .message
                 .replace("{marker}", marker);
-            out.push(ContentRuleViolation {
-                rule: "contradiction_marker".into(),
-                message: msg,
-            });
+            out.push(violation(
+                "contradiction_marker",
+                msg,
+                r.contradiction_marker.meta.blocking,
+            ));
         }
     }
 
@@ -476,10 +602,11 @@ pub fn check_draft_with(
                     .too_many_new_facts
                     .message
                     .replace("{count}", &count.to_string());
-                out.push(ContentRuleViolation {
-                    rule: "too_many_new_facts".into(),
-                    message: msg,
-                });
+                out.push(violation(
+                    "too_many_new_facts",
+                    msg,
+                    r.too_many_new_facts.meta.blocking,
+                ));
             }
         }
     }
@@ -512,10 +639,11 @@ fn check_meta_chapter_refs(cfg: &ContentRulesConfig, draft: &str) -> Vec<Content
                 .message
                 .replace("{match}", m.as_str())
                 .replace("{line}", &(idx + 1).to_string());
-            out.push(ContentRuleViolation {
-                rule: "meta_chapter_ref".into(),
-                message: msg,
-            });
+            out.push(violation(
+                "meta_chapter_ref",
+                msg,
+                rule.meta.blocking,
+            ));
         }
     }
     out
@@ -638,10 +766,11 @@ fn check_countdown_monotonicity(
                 .replace("{secs}", &cur.1.to_string())
                 .replace("{prev_snippet}", &prev.2)
                 .replace("{snippet}", &cur.2);
-            out.push(ContentRuleViolation {
-                rule: "timeline_countdown_jump".into(),
-                message: msg,
-            });
+            out.push(violation(
+                "timeline_countdown_jump",
+                msg,
+                cfg.rules.timeline_countdown_jump.meta.blocking,
+            ));
         }
         prev = cur;
     }
@@ -729,10 +858,11 @@ fn check_daypart_regression(
                     .replace("{prev_word}", p_word)
                     .replace("{line}", &line_no.to_string())
                     .replace("{word}", word);
-                out.push(ContentRuleViolation {
-                    rule: "timeline_daypart_regression".into(),
-                    message: msg,
-                });
+                out.push(violation(
+                    "timeline_daypart_regression",
+                    msg,
+                    rule.meta.blocking,
+                ));
             }
         }
         prev = Some((line_no, word.to_string(), rank));
@@ -874,6 +1004,38 @@ mod tests {
             !v.iter().any(|x| x.rule == "meta_chapter_ref"),
             "got {v:?}"
         );
+    }
+
+    #[test]
+    fn non_blocking_violation_does_not_gate() {
+        let mut cfg = ContentRulesConfig::defaults();
+        cfg.rules.meta_chapter_ref.meta.blocking = false;
+        let draft = "# 第10章\n\n第八章跟对方联系时，他感到不安。\n";
+        let v = check_draft_with(&cfg, draft, &[]);
+        assert!(v.iter().any(|x| x.rule == "meta_chapter_ref"));
+        assert!(v.iter().all(|x| !x.blocking || x.rule != "meta_chapter_ref"));
+        assert!(!has_blocking_violation(&v));
+    }
+
+    #[test]
+    fn blocking_violation_gates() {
+        let cfg = ContentRulesConfig::defaults();
+        let draft = "# 第10章\n\n第八章跟对方联系时，他感到不安。\n";
+        let v = check_draft_with(&cfg, draft, &[]);
+        assert!(has_blocking_violation(&v));
+        assert!(v.iter().any(|x| x.rule == "meta_chapter_ref" && x.blocking));
+    }
+
+    #[test]
+    fn patch_rule_flags_toggles_enabled_and_blocking() {
+        let yaml = ContentRulesConfig::defaults().raw_yaml;
+        let patched =
+            ContentRulesConfig::patch_rule_flags(&yaml, "meta_chapter_ref", Some(false), Some(false))
+                .unwrap();
+        let cfg = ContentRulesConfig::parse_yaml(&patched).unwrap();
+        assert!(!cfg.rules.meta_chapter_ref.meta.enabled);
+        assert!(!cfg.rules.meta_chapter_ref.meta.blocking);
+        assert!(cfg.rules.banned_name.meta.enabled);
     }
 
     #[test]

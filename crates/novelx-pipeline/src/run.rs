@@ -4,9 +4,10 @@ use novelx_draft_patch::{
     RevisionTarget,
 };
 use novelx_harness::{
-    check_draft_with, collect_signals, evaluate_activation, ContentRulesConfig, has_timeline_p0,
-    consistency_human_option_labels, normalize_consistency_issues, on_consistency_result,
-    on_pacing_result,
+    check_draft_with, collect_signals, evaluate_activation, has_blocking_violation,
+    ContentRulesConfig, has_timeline_p0,
+    consistency_human_option_labels, merge_verify_audit, normalize_consistency_issues,
+    on_consistency_result, on_pacing_result, with_issue_ids,
     resolve_pipeline_agents, should_publish,
     ChapterBudget, GateDecision, HandlerKind, NamingRules, PipelineConfig,
 };
@@ -45,6 +46,12 @@ pub struct RevisionOptions {
     pub pacing_suggestions: Vec<Value>,
     /// When steering an existing draft, always revise locally first
     pub revision_mode: bool,
+    /// Re-audit: verify previous issues (fixed/still_open) instead of full rediscovery.
+    #[serde(default)]
+    pub verify_previous: bool,
+    /// Force full rediscovery even when prior open issues exist.
+    #[serde(default)]
+    pub full_rescan: bool,
 }
 
 impl Default for RevisionOptions {
@@ -55,6 +62,8 @@ impl Default for RevisionOptions {
             audit_issues: vec![],
             pacing_suggestions: vec![],
             revision_mode: false,
+            verify_previous: false,
+            full_rescan: false,
         }
     }
 }
@@ -274,7 +283,7 @@ pub async fn execute_pipeline_with_steps(
     project: &str,
     chapter: u32,
     mode: RunMode,
-    revision: RevisionOptions,
+    mut revision: RevisionOptions,
     llm: Arc<LlmClient>,
     tx: Option<mpsc::UnboundedSender<PipelineEvent>>,
     steps: Vec<String>,
@@ -295,6 +304,18 @@ pub async fn execute_pipeline_with_steps(
     let existing_draft = read_chapter_draft(&project_dir, chapter).unwrap_or_default();
     if matches!(mode, RunMode::AuditOnly) && existing_draft.trim().is_empty() {
         anyhow::bail!("第{chapter}章尚无正文（draft.md），无法审校");
+    }
+    // Any re-audit with prior open issues defaults to verify (stops rediscovery growth),
+    // unless caller forces full_rescan.
+    if matches!(mode, RunMode::AuditOnly) && !revision.full_rescan {
+        let audit_path = project_dir
+            .join("chapters")
+            .join(format!("{chapter:03}"))
+            .join("audit.json");
+        let prior = load_previous_audit_issues(&audit_path);
+        if !prior.is_empty() {
+            revision.verify_previous = true;
+        }
     }
     let prefer_local = revision.prefer_local_patch
         && (revision.revision_mode
@@ -642,33 +663,77 @@ pub async fn execute_pipeline_with_steps(
             Some(HandlerKind::Consistency) => {
                 tracing::info!(chapter, "audit: consistency_auditor start");
                 let canon = rebuild_canon(&draft, &outline, ContextProfile::Full);
-                let (passed_raw, issues_raw, report) = run_consistency_auditor(
-                    &llm,
-                    skill_body,
-                    &draft,
-                    &tx,
-                    &canon.markdown,
-                    &naming_block,
-                )
-                .await?;
-                let (has_p0, issues) = normalize_consistency_issues(issues_raw);
-                // Publish gate follows hard P0 only. Soft/fake P0s are demoted/dropped
-                // in normalize; model `passed=false` on P1-only must not block forever.
-                let passed = !has_p0;
-                if passed_raw != passed {
+                let audit_path = project_dir
+                    .join("chapters")
+                    .join(format!("{chapter:03}"))
+                    .join("audit.json");
+                let previous_issues = if revision.verify_previous {
+                    load_previous_audit_issues(&audit_path)
+                } else {
+                    vec![]
+                };
+                let (passed, issues, report) = if revision.verify_previous
+                    && !previous_issues.is_empty()
+                {
+                    let (verdicts, new_raw, report) = run_consistency_verify(
+                        &llm,
+                        skill_body,
+                        &draft,
+                        &tx,
+                        &canon.markdown,
+                        &naming_block,
+                        &previous_issues,
+                    )
+                    .await?;
+                    let (passed, merged, fixed_n, new_n) =
+                        merge_verify_audit(&previous_issues, &verdicts, new_raw, Some(&draft));
                     tracing::info!(
                         chapter,
-                        passed_raw,
                         passed,
-                        has_p0,
-                        issues = issues.len(),
-                        "consistency passed recomputed after priority normalize"
+                        fixed_n,
+                        new_n,
+                        open = merged.len(),
+                        "audit: verify_previous merged"
                     );
-                }
+                    let report = format!(
+                        "{report}\n\n（复审：已核实上一轮问题；已修复 {fixed_n}，新发现 {new_n}，仍未关闭 {}）",
+                        merged.len()
+                    );
+                    (passed, merged, report)
+                } else {
+                    let (passed_raw, issues_raw, report) = run_consistency_auditor(
+                        &llm,
+                        skill_body,
+                        &draft,
+                        &tx,
+                        &canon.markdown,
+                        &naming_block,
+                    )
+                    .await?;
+                    let (has_p0, issues) = normalize_consistency_issues(issues_raw);
+                    // Publish gate follows hard P0 only. Soft/fake P0s are demoted/dropped
+                    // in normalize; model `passed=false` on P1-only must not block forever.
+                    let passed = !has_p0;
+                    if passed_raw != passed {
+                        tracing::info!(
+                            chapter,
+                            passed_raw,
+                            passed,
+                            has_p0,
+                            issues = issues.len(),
+                            "consistency passed recomputed after priority normalize"
+                        );
+                    }
+                    (passed, with_issue_ids(issues), report)
+                };
+                let has_p0 = issues.iter().any(|i| {
+                    i.get("priority").and_then(|v| v.as_str()) == Some("P0")
+                });
                 tracing::info!(
                     chapter,
                     passed,
                     has_p0,
+                    verify = revision.verify_previous,
                     report_chars = report.chars().count(),
                     "audit: consistency_auditor done"
                 );
@@ -677,10 +742,6 @@ pub async fn execute_pipeline_with_steps(
                 run.issues = issues.clone();
                 has_blocking = !passed || has_p0;
                 // Persist for steer_run / fail-rate activation.
-                let audit_path = project_dir
-                    .join("chapters")
-                    .join(format!("{chapter:03}"))
-                    .join("audit.json");
                 if let Some(parent) = audit_path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
@@ -690,6 +751,7 @@ pub async fn execute_pipeline_with_steps(
                         "passed": passed,
                         "issues": issues,
                         "report": report,
+                        "verify_previous": revision.verify_previous,
                     }))
                     .unwrap_or_else(|_| "{}".into()),
                 );
@@ -731,6 +793,8 @@ pub async fn execute_pipeline_with_steps(
                                 user_instructions: Some("按一致性审计 P0/P1 局部修复".into()),
                                 audit_issues: gate.auto_fix_issues,
                                 pacing_suggestions: vec![],
+                                verify_previous: false,
+                                full_rescan: false,
                             };
                             let fix_canon =
                                 rebuild_canon(&draft, &outline, ContextProfile::Full);
@@ -797,6 +861,11 @@ pub async fn execute_pipeline_with_steps(
                 }
             }
             Some(HandlerKind::Pacing) => {
+                // Verify re-audits focus on prior consistency issues; pacing rediscovery
+                // makes the report look like "越审越多".
+                if revision.verify_previous && audit_only {
+                    "节奏审查跳过（复审模式）".into()
+                } else {
                 tracing::info!(chapter, "audit: pacing_reviewer start");
                 let canon = rebuild_canon(&draft, &outline, ContextProfile::Pacing);
                 let (suggestions, report) =
@@ -821,6 +890,8 @@ pub async fn execute_pipeline_with_steps(
                             user_instructions: Some("按节奏建议局部调整".into()),
                             audit_issues: vec![],
                             pacing_suggestions: gate.auto_fix_suggestions,
+                            verify_previous: false,
+                            full_rescan: false,
                         };
                         let fix_canon = rebuild_canon(&draft, &outline, ContextProfile::Full);
                         let (new_draft, via_patch) = run_writer(
@@ -848,9 +919,12 @@ pub async fn execute_pipeline_with_steps(
                 let block = format!("## 节奏审查（第{chapter}章）\n\n{report}");
                 report_parts.push(block);
                 "节奏审查完成".into()
+                }
             }
             Some(HandlerKind::Foreshadow) => {
-                let report = run_foreshadow_tracker(&llm, skill_body, &draft, &outline).await?;
+                let report =
+                    run_foreshadow_tracker(&llm, skill_body, &project_dir, chapter, &draft, &outline)
+                        .await?;
                 let n = apply_foreshadow_report(&project_dir, chapter, &report)?;
                 let dir = project_dir.join("chapters").join(format!("{chapter:03}"));
                 std::fs::create_dir_all(&dir)?;
@@ -936,41 +1010,65 @@ pub async fn execute_pipeline_with_steps(
         }
     }
 
-    // Always enforce banned-name / meta-chapter hard rules (audit + write).
-    if !draft.is_empty() {
-        let violations = check_draft_with(&content_rules, &draft, &naming.forbidden_names);
-        if !violations.is_empty() {
-            let listed = violations
-                .iter()
-                .enumerate()
-                .map(|(i, v)| format!("{}. {}", i + 1, v.message))
-                .collect::<Vec<_>>()
-                .join("\n");
-            tracing::warn!(chapter, detail = %listed, "content rule violations");
+    // Always scan enabled hard rules (audit + write). Only `blocking: true` blocks publish.
+    let violations = if !draft.is_empty() {
+        check_draft_with(&content_rules, &draft, &naming.forbidden_names)
+    } else {
+        Vec::new()
+    };
+    if !violations.is_empty() {
+        let blocking_n = violations.iter().filter(|v| v.blocking).count();
+        let warn_n = violations.len() - blocking_n;
+        let listed = violations
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let tag = if v.blocking { "阻断" } else { "警告" };
+                format!("{}. [{}] {}", i + 1, tag, v.message)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        tracing::warn!(
+            chapter,
+            blocking = blocking_n,
+            warnings = warn_n,
+            detail = %listed,
+            "content rule violations"
+        );
+        if blocking_n > 0 {
             report_parts.push(format!(
-                "## 硬规则（{} 条，本章未发布）\n{listed}\n\n\
+                "## 硬规则（{blocking_n} 条阻断{}，本章未发布）\n{listed}\n\n\
                  如何处理：选择「修正本章」，或说明要改的地方\
                  （去掉正文「第N章」、理顺倒计时/时段回跳、替换禁名等）。",
-                violations.len()
+                if warn_n > 0 {
+                    format!("、{warn_n} 条警告")
+                } else {
+                    String::new()
+                }
             ));
             let warn = format!(
-                "完成，但有 {} 条硬规则警告（本章未发布）\n{listed}\n\n\
-                 如何处理：选择「修正本章」，或说明要改的地方。",
-                violations.len()
+                "完成，但有 {blocking_n} 条硬规则阻断（本章未发布）\n{listed}\n\n\
+                 如何处理：选择「修正本章」，或说明要改的地方。"
             );
             if run.message.is_empty() {
                 run.message = warn;
             } else {
                 run.message = format!("{}\n\n{warn}", run.message);
             }
+        } else {
+            report_parts.push(format!(
+                "## 硬规则（{warn_n} 条警告，不阻断发布）\n{listed}"
+            ));
+            let note = format!("完成，另有 {warn_n} 条硬规则警告（不阻断发布）\n{listed}");
+            if run.message.is_empty() {
+                run.message = note;
+            } else {
+                run.message = format!("{}\n\n{note}", run.message);
+            }
         }
     }
 
-    let banned_blocking = if !draft.is_empty() {
-        !check_draft_with(&content_rules, &draft, &naming.forbidden_names).is_empty()
-    } else {
-        false
-    };
+    let banned_blocking = has_blocking_violation(&violations);
     run.content_rule_blocked = banned_blocking;
     let publish_ok = allow_publish
         && should_publish(consistency_passed, has_blocking || await_human)
@@ -1770,6 +1868,113 @@ async fn run_specialist_rewrite(
     Ok(out)
 }
 
+fn load_previous_audit_issues(audit_path: &Path) -> Vec<Value> {
+    let text = std::fs::read_to_string(audit_path).unwrap_or_default();
+    serde_json::from_str::<Value>(&text)
+        .ok()
+        .and_then(|v| v.get("issues").cloned())
+        .and_then(|x| x.as_array().cloned())
+        .map(with_issue_ids)
+        .unwrap_or_default()
+}
+
+/// Verify-mode auditor: judge previous issues fixed/still_open; allow few new hard finds.
+async fn run_consistency_verify(
+    llm: &LlmClient,
+    skill: &str,
+    draft: &str,
+    tx: &Option<mpsc::UnboundedSender<PipelineEvent>>,
+    canon: &str,
+    naming_block: &str,
+    previous: &[Value],
+) -> Result<(Vec<Value>, Vec<Value>, String)> {
+    let excerpt: String = draft.chars().take(24000).collect();
+    let skill_short = trim_skill(skill, 1800);
+    let prev_brief = previous
+        .iter()
+        .enumerate()
+        .map(|(i, issue)| {
+            let id = issue
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let pri = issue
+                .get("priority")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let ty = issue.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+            let msg = issue
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let quote = issue
+                .get("quote")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let loc = issue
+                .get("location")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            format!(
+                "{}. id={id} [{pri}/{ty}] {msg}\n   location={loc}\n   quote={quote}",
+                i + 1
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let user = format!(
+        "这是修订后的复审（verify previous），不是全章重新挑刺。\n\
+         任务：\n\
+         1) 逐条判定「上一轮问题」是否已修好：status=fixed 或 still_open（必须带原 id）。\n\
+         2) 仅当发现**新的硬冲突**（时间互斥/倒计时回跳、伤部位矛盾、能力位置矛盾、设定硬冲突、章号元叙述）才写入 new_issues，最多 3 条。\n\
+         3) 禁止把可补交代、动机略跳、风格/笔误写成 new_issues 的 P0；禁止重复罗列已在 previous 里的同一问题。\n\
+         只输出 JSON：{{\"verdicts\":[{{\"id\":\"\",\"status\":\"fixed|still_open\",\"note\":\"\"}}],\
+         \"new_issues\":[{{\"type\":\"TIMELINE|INJURY|ABILITY_LOC|LORE|CHARACTER|POV|CONTINUITY|OUTLINE|META|PLOT\",\
+         \"priority\":\"P0|P1|P2\",\"message\":\"\",\"location\":\"第N段\",\"quote\":\"\"}}],\
+         \"report\":\"简短复审说明\"}}\n\n\
+         {naming_block}\n\n{canon}\n\n# 上一轮问题\n{prev_brief}\n\n# 正文\n{excerpt}"
+    );
+    let agent = "consistency_auditor";
+    let model = llm.model_for_agent(agent);
+    let mut raw =
+        stream_agent_llm(llm, &skill_short, &user, &model, agent, tx, false, None).await?;
+    if raw.trim().is_empty() {
+        tracing::warn!(%model, "consistency verify empty; retrying once");
+        raw = stream_agent_llm(llm, &skill_short, &user, &model, agent, tx, false, None).await?;
+    }
+    if let Some(v) = extract_json(&raw) {
+        let verdicts = v
+            .get("verdicts")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let new_issues = v
+            .get("new_issues")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let report = v
+            .get("report")
+            .and_then(|x| x.as_str())
+            .unwrap_or("复审完成")
+            .to_string();
+        return Ok((verdicts, new_issues, report));
+    }
+    // Unparseable verify → keep previous open (conservative), no free pass / no flood.
+    let verdicts = previous
+        .iter()
+        .filter_map(|i| {
+            let id = i.get("id").and_then(|v| v.as_str())?;
+            Some(json!({"id": id, "status": "still_open", "note": "复审输出无法解析"}))
+        })
+        .collect();
+    Ok((
+        verdicts,
+        vec![],
+        "复审输出无法解析，保留上一轮未关闭问题".into(),
+    ))
+}
+
 async fn run_consistency_auditor(
     llm: &LlmClient,
     skill: &str,
@@ -2286,17 +2491,43 @@ async fn run_plot_acceptor(
 async fn run_foreshadow_tracker(
     llm: &LlmClient,
     skill: &str,
+    project_dir: &Path,
+    chapter: u32,
     draft: &str,
     outline: &str,
 ) -> Result<String> {
-    let excerpt: String = draft.chars().take(5000).collect();
+    let head: String = draft.chars().take(6000).collect();
+    let tail = {
+        let n = draft.chars().count();
+        if n > 9000 {
+            draft.chars().skip(n.saturating_sub(4000)).collect::<String>()
+        } else {
+            String::new()
+        }
+    };
+    let history = crate::foreshadow::format_dangling_for_tracker(project_dir, 20);
+    let bridge = crate::context::format_chapter_bridge(project_dir, chapter);
+    let mut body = format!("## 正文·开篇\n{head}");
+    if !tail.is_empty() {
+        body.push_str("\n\n## 正文·章末\n");
+        body.push_str(&tail);
+    }
     let raw = llm
         .complete_for_agent(
             "foreshadow_tracker",
             skill,
             &format!(
                 "对照章纲与正文追踪伏笔，只输出 JSON（buried/resolved/dangling/warnings）。\n\
-                 ## 章纲\n{outline}\n\n## 正文\n{excerpt}"
+                 必须先核「既有未收伏笔」：已兑现的写入 resolved（带原 id），仍未收的保留在 dangling；\
+                 新埋入的写入 buried。禁止无故清空历史未收线。\n\n\
+                 ## 既有未收伏笔\n{history}\n\n\
+                 ## 章间衔接\n{}\n\n\
+                 ## 章纲\n{outline}\n\n{body}",
+                if bridge.is_empty() {
+                    "（无）"
+                } else {
+                    bridge.as_str()
+                },
             ),
         )
         .await?;
@@ -2329,7 +2560,9 @@ fn apply_foreshadow_report(project_dir: &Path, chapter: u32, report: &str) -> Re
             if text.is_empty() {
                 continue;
             }
-            if mem.open_threads.iter().any(|t| t.text == text) {
+            if mem.open_threads.iter().any(|t| t.text == text)
+                || mem.archived_threads.iter().any(|t| t.text == text)
+            {
                 continue;
             }
             let id = item
@@ -2350,16 +2583,25 @@ fn apply_foreshadow_report(project_dir: &Path, chapter: u32, report: &str) -> Re
 
     if let Some(arr) = v.get("resolved").and_then(|x| x.as_array()) {
         for item in arr {
+            let id = item.get("id").and_then(|x| x.as_str()).unwrap_or("");
             let text = item
                 .get("description")
                 .or_else(|| item.get("plant_ref"))
                 .and_then(|x| x.as_str())
                 .unwrap_or("");
-            if text.is_empty() {
+            if id.is_empty() && text.is_empty() {
                 continue;
             }
-            for t in mem.open_threads.iter_mut() {
-                if t.status == "open" && (t.text.contains(text) || text.contains(&t.text)) {
+            for t in mem
+                .open_threads
+                .iter_mut()
+                .chain(mem.archived_threads.iter_mut())
+            {
+                let id_hit = !id.is_empty() && t.id == id;
+                let text_hit = !text.is_empty()
+                    && (t.status == "open" || t.status.is_empty())
+                    && (t.text.contains(text) || text.contains(&t.text));
+                if (t.status == "open" || t.status.is_empty()) && (id_hit || text_hit) {
                     t.status = "resolved".into();
                     t.resolved_chapter = chapter;
                     n += 1;
@@ -2375,7 +2617,10 @@ fn apply_foreshadow_report(project_dir: &Path, chapter: u32, report: &str) -> Re
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .to_string();
-            if text.is_empty() || mem.open_threads.iter().any(|t| t.text == text) {
+            if text.is_empty()
+                || mem.open_threads.iter().any(|t| t.text == text)
+                || mem.archived_threads.iter().any(|t| t.text == text)
+            {
                 continue;
             }
             mem.open_threads.push(OpenThread {
@@ -2389,7 +2634,9 @@ fn apply_foreshadow_report(project_dir: &Path, chapter: u32, report: &str) -> Re
         }
     }
 
+    crate::memory::prune_open_threads_into_archive(&mut mem);
     save_memory(project_dir, &mem)?;
+    let _ = crate::foreshadow::rebuild_foreshadow_index(project_dir);
     Ok(n)
 }
 
@@ -2429,6 +2676,8 @@ pub fn steer_revision_options(message: &str) -> RevisionOptions {
         user_instructions: Some(message.to_string()),
         audit_issues: vec![],
         pacing_suggestions: vec![],
+        verify_previous: false,
+        full_rescan: false,
     }
 }
 

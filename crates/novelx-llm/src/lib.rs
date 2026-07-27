@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -218,6 +218,476 @@ pub fn load_llm_config(path: &Path) -> Result<LlmConfig> {
     Ok(cfg)
 }
 
+/// Ordered task keys shown / edited in the Web form.
+pub const LLM_FORM_TASKS: &[&str] = &[
+    "planning",
+    "creative",
+    "editing",
+    "patch",
+    "analysis",
+    "naming",
+    "studio",
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmRetryForm {
+    pub max_retries: u32,
+    pub base_delay_ms: u64,
+    pub max_delay_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmProviderForm {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    pub api_key_env: String,
+    #[serde(default)]
+    pub has_api_key: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_suffix: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmTaskForm {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub model: String,
+    pub max_tokens: u32,
+}
+
+/// Structured LLM settings for the Web config form (no plaintext API keys).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmFormSettings {
+    pub profile: String,
+    pub dev_model: String,
+    pub default_provider: String,
+    pub providers: Vec<LlmProviderForm>,
+    pub tasks: Vec<LlmTaskForm>,
+    pub retry: LlmRetryForm,
+}
+
+/// PUT body: form fields + optional write-only API key for the active provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmFormPut {
+    pub profile: String,
+    pub dev_model: String,
+    pub default_provider: String,
+    pub providers: Vec<LlmProviderForm>,
+    pub tasks: Vec<LlmTaskForm>,
+    pub retry: LlmRetryForm,
+    /// Write-only. Empty / omitted = keep existing key.
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+fn yaml_str(v: &serde_yaml::Value, key: &str) -> Option<String> {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Load form-oriented settings from `llm.yaml` (file values, not profile-forced runtime).
+pub fn load_llm_form_settings(path: &Path) -> Result<LlmFormSettings> {
+    let defaults = LlmConfig::default();
+    let mut settings = LlmFormSettings {
+        profile: "dev".into(),
+        dev_model: "deepseek-v4-flash".into(),
+        default_provider: "deepseek".into(),
+        providers: vec![LlmProviderForm {
+            name: "deepseek".into(),
+            base_url: Some("https://api.deepseek.com".into()),
+            api_key_env: "DEEPSEEK_API_KEY".into(),
+            has_api_key: env_has_api_key("DEEPSEEK_API_KEY"),
+            api_key_suffix: env_api_key_suffix("DEEPSEEK_API_KEY"),
+        }],
+        tasks: LLM_FORM_TASKS
+            .iter()
+            .map(|name| LlmTaskForm {
+                name: (*name).into(),
+                description: String::new(),
+                model: defaults.default_model.clone(),
+                max_tokens: defaults.default_max_tokens,
+            })
+            .collect(),
+        retry: LlmRetryForm {
+            max_retries: defaults.max_retries,
+            base_delay_ms: defaults.retry_base_delay_ms,
+            max_delay_ms: defaults.retry_max_delay_ms,
+        },
+    };
+
+    if !path.exists() {
+        return Ok(settings);
+    }
+    let text = std::fs::read_to_string(path)?;
+    let v: serde_yaml::Value = serde_yaml::from_str(&text)?;
+
+    if let Some(p) = yaml_str(&v, "profile") {
+        settings.profile = p;
+    }
+    if let Some(m) = yaml_str(&v, "dev_model") {
+        settings.dev_model = m;
+    }
+    if let Some(p) = yaml_str(&v, "default_provider") {
+        settings.default_provider = p;
+    } else {
+        settings.default_provider = "deepseek".into();
+    }
+
+    if let Some(retry) = v.get("retry") {
+        if let Some(n) = retry.get("max_retries").and_then(|x| x.as_u64()) {
+            settings.retry.max_retries = n.min(8) as u32;
+        }
+        if let Some(n) = retry.get("base_delay_ms").and_then(|x| x.as_u64()) {
+            settings.retry.base_delay_ms = n.max(100);
+        }
+        if let Some(n) = retry.get("max_delay_ms").and_then(|x| x.as_u64()) {
+            settings.retry.max_delay_ms = n.max(settings.retry.base_delay_ms);
+        }
+    }
+
+    if let Some(providers) = v.get("providers").and_then(|x| x.as_mapping()) {
+        let mut list = Vec::new();
+        for (k, prov) in providers {
+            let Some(name) = k.as_str() else { continue };
+            let base_url = prov
+                .get("base_url")
+                .and_then(|x| {
+                    if x.is_null() {
+                        None
+                    } else {
+                        x.as_str().map(|s| s.to_string())
+                    }
+                });
+            let api_key_env = prov
+                .get("api_key_env")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let has_api_key = !api_key_env.is_empty() && env_has_api_key(&api_key_env);
+            let api_key_suffix = if has_api_key {
+                env_api_key_suffix(&api_key_env)
+            } else {
+                None
+            };
+            list.push(LlmProviderForm {
+                name: name.to_string(),
+                base_url,
+                api_key_env,
+                has_api_key,
+                api_key_suffix,
+            });
+        }
+        if !list.is_empty() {
+            settings.providers = list;
+        }
+    }
+
+    if let Some(tasks) = v.get("tasks").and_then(|x| x.as_mapping()) {
+        let mut by_name: HashMap<String, LlmTaskForm> = HashMap::new();
+        for (k, val) in tasks {
+            let Some(name) = k.as_str() else { continue };
+            let model = if let Some(m) = val.as_str() {
+                m.to_string()
+            } else {
+                val.get("model")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or(&defaults.default_model)
+                    .to_string()
+            };
+            let max_tokens = val
+                .get("max_tokens")
+                .and_then(|x| x.as_u64())
+                .map(|n| n as u32)
+                .unwrap_or(defaults.default_max_tokens);
+            let description = val
+                .get("description")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            by_name.insert(
+                name.to_string(),
+                LlmTaskForm {
+                    name: name.to_string(),
+                    description,
+                    model,
+                    max_tokens,
+                },
+            );
+        }
+        let mut ordered = Vec::new();
+        for name in LLM_FORM_TASKS {
+            if let Some(t) = by_name.remove(*name) {
+                ordered.push(t);
+            }
+        }
+        for (_, t) in by_name {
+            ordered.push(t);
+        }
+        if !ordered.is_empty() {
+            settings.tasks = ordered;
+        }
+    }
+
+    Ok(settings)
+}
+
+/// Validate form PUT payload. Never includes API key material in error messages.
+pub fn validate_llm_form_put(put: &LlmFormPut) -> Result<(), String> {
+    let profile = put.profile.trim().to_ascii_lowercase();
+    if profile != "dev" && profile != "prod" && profile != "development" && profile != "production" {
+        return Err("profile 须为 dev 或 prod".into());
+    }
+    if put.dev_model.trim().is_empty() {
+        return Err("dev_model 不能为空".into());
+    }
+    if put.default_provider.trim().is_empty() {
+        return Err("default_provider 不能为空".into());
+    }
+    if put.providers.is_empty() {
+        return Err("至少需要一个 provider".into());
+    }
+    let active = put
+        .providers
+        .iter()
+        .find(|p| p.name == put.default_provider)
+        .ok_or_else(|| format!("default_provider「{}」不在 providers 列表中", put.default_provider))?;
+    let base = active.base_url.as_deref().unwrap_or("").trim();
+    if base.is_empty() {
+        return Err("当前 provider 的 base_url 不能为空".into());
+    }
+    if active.api_key_env.trim().is_empty() {
+        return Err("当前 provider 的 api_key_env 不能为空".into());
+    }
+    if put.tasks.is_empty() {
+        return Err("至少需要一个 task".into());
+    }
+    for t in &put.tasks {
+        if t.name.trim().is_empty() {
+            return Err("task name 不能为空".into());
+        }
+        if t.model.trim().is_empty() {
+            return Err(format!("任务「{}」的 model 不能为空", t.name));
+        }
+        if !(256..=384_000).contains(&t.max_tokens) {
+            return Err(format!(
+                "任务「{}」的 max_tokens 须在 256..=384000",
+                t.name
+            ));
+        }
+    }
+    if put.retry.max_retries > 8 {
+        return Err("max_retries 上限为 8".into());
+    }
+    if put.retry.base_delay_ms < 100 {
+        return Err("base_delay_ms 至少 100".into());
+    }
+    if put.retry.max_delay_ms < put.retry.base_delay_ms {
+        return Err("max_delay_ms 不能小于 base_delay_ms".into());
+    }
+    if let Some(key) = put.api_key.as_deref() {
+        let key = key.trim();
+        if !key.is_empty() && key.len() < 8 {
+            return Err("API Key 过短".into());
+        }
+    }
+    Ok(())
+}
+
+/// Patch `llm.yaml` Value with form fields; preserves agents and per-task extras (e.g. temperature).
+pub fn apply_llm_form_to_yaml(
+    existing: &str,
+    put: &LlmFormPut,
+) -> Result<String, String> {
+    let mut root: serde_yaml::Value = if existing.trim().is_empty() {
+        serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
+    } else {
+        serde_yaml::from_str(existing).map_err(|e| format!("解析现有 llm.yaml 失败：{e}"))?
+    };
+    if !root.is_mapping() {
+        root = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+    }
+    let map = root.as_mapping_mut().expect("mapping");
+
+    map.insert(
+        serde_yaml::Value::String("profile".into()),
+        serde_yaml::Value::String(put.profile.trim().to_ascii_lowercase()),
+    );
+    map.insert(
+        serde_yaml::Value::String("dev_model".into()),
+        serde_yaml::Value::String(put.dev_model.trim().to_string()),
+    );
+    map.insert(
+        serde_yaml::Value::String("default_provider".into()),
+        serde_yaml::Value::String(put.default_provider.trim().to_string()),
+    );
+
+    let mut retry_map = serde_yaml::Mapping::new();
+    retry_map.insert(
+        serde_yaml::Value::String("max_retries".into()),
+        serde_yaml::Value::Number(put.retry.max_retries.into()),
+    );
+    retry_map.insert(
+        serde_yaml::Value::String("base_delay_ms".into()),
+        serde_yaml::Value::Number(put.retry.base_delay_ms.into()),
+    );
+    retry_map.insert(
+        serde_yaml::Value::String("max_delay_ms".into()),
+        serde_yaml::Value::Number(put.retry.max_delay_ms.into()),
+    );
+    map.insert(
+        serde_yaml::Value::String("retry".into()),
+        serde_yaml::Value::Mapping(retry_map),
+    );
+
+    let mut providers = match map
+        .get(&serde_yaml::Value::String("providers".into()))
+        .and_then(|x| x.as_mapping())
+        .cloned()
+    {
+        Some(m) => m,
+        None => serde_yaml::Mapping::new(),
+    };
+    for p in &put.providers {
+        let key = serde_yaml::Value::String(p.name.clone());
+        let mut prov = providers
+            .get(&key)
+            .and_then(|x| x.as_mapping())
+            .cloned()
+            .unwrap_or_default();
+        match &p.base_url {
+            Some(url) if !url.trim().is_empty() => {
+                prov.insert(
+                    serde_yaml::Value::String("base_url".into()),
+                    serde_yaml::Value::String(url.trim().to_string()),
+                );
+            }
+            _ => {
+                prov.insert(
+                    serde_yaml::Value::String("base_url".into()),
+                    serde_yaml::Value::Null,
+                );
+            }
+        }
+        prov.insert(
+            serde_yaml::Value::String("api_key_env".into()),
+            serde_yaml::Value::String(p.api_key_env.trim().to_string()),
+        );
+        providers.insert(key, serde_yaml::Value::Mapping(prov));
+    }
+    map.insert(
+        serde_yaml::Value::String("providers".into()),
+        serde_yaml::Value::Mapping(providers),
+    );
+
+    let mut tasks = match map
+        .get(&serde_yaml::Value::String("tasks".into()))
+        .and_then(|x| x.as_mapping())
+        .cloned()
+    {
+        Some(m) => m,
+        None => serde_yaml::Mapping::new(),
+    };
+    for t in &put.tasks {
+        let key = serde_yaml::Value::String(t.name.clone());
+        let mut task = tasks
+            .get(&key)
+            .and_then(|x| x.as_mapping())
+            .cloned()
+            .unwrap_or_default();
+        if !t.description.trim().is_empty() {
+            task.insert(
+                serde_yaml::Value::String("description".into()),
+                serde_yaml::Value::String(t.description.trim().to_string()),
+            );
+        }
+        task.insert(
+            serde_yaml::Value::String("model".into()),
+            serde_yaml::Value::String(t.model.trim().to_string()),
+        );
+        task.insert(
+            serde_yaml::Value::String("max_tokens".into()),
+            serde_yaml::Value::Number(t.max_tokens.into()),
+        );
+        // Keep provider alignment with default when absent.
+        if !task.contains_key(serde_yaml::Value::String("provider".into())) {
+            task.insert(
+                serde_yaml::Value::String("provider".into()),
+                serde_yaml::Value::String(put.default_provider.trim().to_string()),
+            );
+        }
+        tasks.insert(key, serde_yaml::Value::Mapping(task));
+    }
+    map.insert(
+        serde_yaml::Value::String("tasks".into()),
+        serde_yaml::Value::Mapping(tasks),
+    );
+
+    serde_yaml::to_string(&root).map_err(|e| format!("序列化 llm.yaml 失败：{e}"))
+}
+
+/// Upsert `KEY=value` in a dotenv file; does not log the value.
+pub fn upsert_dotenv_key(path: &Path, key: &str, value: &str) -> Result<(), String> {
+    let key = key.trim();
+    if key.is_empty() || key.contains('=') || key.contains('\n') {
+        return Err("非法环境变量名".into());
+    }
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("API Key 不能为空".into());
+    }
+    if value.contains('\n') || value.contains('\r') {
+        return Err("API Key 含非法换行".into());
+    }
+    let escaped = if value.bytes().any(|b| b.is_ascii_whitespace() || b == b'"' || b == b'#') {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        value.to_string()
+    };
+    let line = format!("{key}={escaped}");
+    let mut lines: Vec<String> = if path.exists() {
+        std::fs::read_to_string(path)
+            .map_err(|e| format!("读取 .env 失败：{e}"))?
+            .lines()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let prefix = format!("{key}=");
+    let mut found = false;
+    for row in &mut lines {
+        let trimmed = row.trim_start();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with(&prefix) || trimmed.split('=').next() == Some(key) {
+            *row = line.clone();
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        if lines.last().is_some_and(|l| !l.is_empty()) {
+            lines.push(String::new());
+        }
+        lines.push(line);
+    }
+    let mut out = lines.join("\n");
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败：{e}"))?;
+    }
+    std::fs::write(path, out).map_err(|e| format!("写入 .env 失败：{e}"))?;
+    // Process-local so reload sees the new key without restart.
+    unsafe { std::env::set_var(key, value) };
+    Ok(())
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
@@ -253,18 +723,46 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+fn resolve_api_key_from_env(api_key_env: &str) -> Option<String> {
+    std::env::var(api_key_env)
+        .ok()
+        .filter(|s| !s.is_empty() && !s.contains("your-") && s != "sk-your-deepseek-key")
+}
+
+/// Last 4 chars for UI confirmation; never expose the full key.
+pub fn api_key_suffix(key: &str) -> Option<String> {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let chars: Vec<char> = trimmed.chars().collect();
+    let n = chars.len().min(4);
+    Some(chars[chars.len() - n..].iter().collect())
+}
+
+/// Whether an env var currently holds a usable API key (no plaintext returned).
+pub fn env_has_api_key(api_key_env: &str) -> bool {
+    resolve_api_key_from_env(api_key_env).is_some()
+}
+
+pub fn env_api_key_suffix(api_key_env: &str) -> Option<String> {
+    resolve_api_key_from_env(api_key_env).as_deref().and_then(api_key_suffix)
+}
+
+struct LlmInner {
+    config: LlmConfig,
+    api_key: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct LlmClient {
-    config: Arc<LlmConfig>,
+    inner: Arc<RwLock<LlmInner>>,
     http: reqwest::Client,
-    api_key: Option<String>,
 }
 
 impl LlmClient {
     pub fn new(config: LlmConfig) -> Self {
-        let api_key = std::env::var(&config.api_key_env)
-            .ok()
-            .filter(|s| !s.is_empty() && !s.contains("your-") && s != "sk-your-deepseek-key");
+        let api_key = resolve_api_key_from_env(&config.api_key_env);
         if api_key.is_none() {
             tracing::warn!(
                 env = %config.api_key_env,
@@ -287,30 +785,87 @@ impl LlmClient {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            config: Arc::new(config),
+            inner: Arc::new(RwLock::new(LlmInner { config, api_key })),
             http,
-            api_key,
         }
     }
 
+    /// Hot-reload config; re-reads API key from the process environment.
+    pub fn reload(&self, config: LlmConfig) {
+        let api_key = resolve_api_key_from_env(&config.api_key_env);
+        if api_key.is_none() {
+            tracing::warn!(
+                env = %config.api_key_env,
+                "LLM API key missing after reload; responses will be placeholders"
+            );
+        } else {
+            tracing::info!(
+                env = %config.api_key_env,
+                model = %config.default_model,
+                base = %config.base_url,
+                tasks = config.tasks.len(),
+                "LLM client reloaded"
+            );
+        }
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        guard.config = config;
+        guard.api_key = api_key;
+    }
+
+    pub fn has_api_key(&self) -> bool {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .api_key
+            .is_some()
+    }
+
+    pub fn api_key_suffix(&self) -> Option<String> {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .api_key
+            .as_deref()
+            .and_then(api_key_suffix)
+    }
+
+    pub fn api_key_env(&self) -> String {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .config
+            .api_key_env
+            .clone()
+    }
+
+    pub fn snapshot_config(&self) -> LlmConfig {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .config
+            .clone()
+    }
+
     pub fn model_for_agent(&self, agent: &str) -> String {
-        if let Some(task) = self.config.agents.get(agent) {
-            if let Some(m) = self.config.tasks.get(task) {
+        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(task) = guard.config.agents.get(agent) {
+            if let Some(m) = guard.config.tasks.get(task) {
                 return m.clone();
             }
             return task.clone();
         }
-        self.config.default_model.clone()
+        guard.config.default_model.clone()
     }
 
     /// Resolve max_tokens for an agent from llm.yaml task config.
     pub fn max_tokens_for_agent(&self, agent: &str) -> u32 {
-        if let Some(task) = self.config.agents.get(agent) {
-            if let Some(&n) = self.config.task_max_tokens.get(task) {
+        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(task) = guard.config.agents.get(agent) {
+            if let Some(&n) = guard.config.task_max_tokens.get(task) {
                 return n.max(256);
             }
         }
-        self.config.default_max_tokens.max(256)
+        guard.config.default_max_tokens.max(256)
     }
 
     pub async fn complete(
@@ -416,7 +971,35 @@ impl LlmClient {
     {
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let Some(key) = &self.api_key else {
+        let snap = {
+            let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+            (
+                guard.api_key.clone(),
+                guard.config.default_model.clone(),
+                guard
+                    .config
+                    .task_max_tokens
+                    .get("studio")
+                    .copied()
+                    .unwrap_or(2048),
+                guard.config.default_max_tokens,
+                guard.config.base_url.clone(),
+                guard.config.max_retries,
+                guard.config.retry_base_delay_ms,
+                guard.config.retry_max_delay_ms,
+            )
+        };
+        let (
+            key,
+            default_model,
+            studio_tokens,
+            default_max_tokens,
+            base_url,
+            max_retries,
+            retry_base,
+            retry_max,
+        ) = snap;
+        let Some(key) = key else {
             let content = placeholder_reply(&messages);
             on_delta(content.clone()).await;
             return Ok(CompletionResult {
@@ -425,16 +1008,13 @@ impl LlmClient {
                 reasoning_content: None,
             });
         };
-        let model = model.unwrap_or(&self.config.default_model);
+        let model_owned = model.unwrap_or(&default_model).to_string();
+        let model = model_owned.as_str();
         // Tool loops stay bounded; prose/creative uses yaml (default 8k).
         let tokens = max_tokens.unwrap_or(if tools.is_some() {
-            self.config
-                .task_max_tokens
-                .get("studio")
-                .copied()
-                .unwrap_or(2048)
+            studio_tokens
         } else {
-            self.config.default_max_tokens
+            default_max_tokens
         });
         let messages = sanitize_chat_messages(messages);
         let mut body = json!({
@@ -467,10 +1047,7 @@ impl LlmClient {
                 .collect();
             body["tools"] = Value::Array(tools_json);
         }
-        let url = format!(
-            "{}/chat/completions",
-            self.config.base_url.trim_end_matches('/')
-        );
+        let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
         let deadline_secs = if tokens >= 65536 {
             300
         } else if tokens >= 4096 {
@@ -478,7 +1055,6 @@ impl LlmClient {
         } else {
             90
         };
-        let max_retries = self.config.max_retries;
         let started = std::time::Instant::now();
         tracing::info!(
             %model,
@@ -502,7 +1078,7 @@ impl LlmClient {
                 };
                 tokio::time::timeout(
                     std::time::Duration::from_secs(deadline_secs),
-                    self.drive_chat_stream(key, body.clone(), &mut delta_cb),
+                    self.drive_chat_stream(&key, &base_url, body.clone(), &mut delta_cb),
                 )
                 .await
             };
@@ -517,11 +1093,7 @@ impl LlmClient {
                     if !can_retry {
                         return Err(e);
                     }
-                    let delay = retry_delay_ms(
-                        attempt,
-                        self.config.retry_base_delay_ms,
-                        self.config.retry_max_delay_ms,
-                    );
+                    let delay = retry_delay_ms(attempt, retry_base, retry_max);
                     tracing::warn!(
                         %model,
                         attempt = attempt + 1,
@@ -548,11 +1120,7 @@ impl LlmClient {
                         );
                         anyhow::bail!(msg);
                     }
-                    let delay = retry_delay_ms(
-                        attempt,
-                        self.config.retry_base_delay_ms,
-                        self.config.retry_max_delay_ms,
-                    );
+                    let delay = retry_delay_ms(attempt, retry_base, retry_max);
                     tracing::warn!(
                         %model,
                         attempt = attempt + 1,
@@ -606,6 +1174,7 @@ impl LlmClient {
     async fn drive_chat_stream<F, Fut>(
         &self,
         key: &str,
+        base_url: &str,
         body: Value,
         on_delta: &mut F,
     ) -> Result<(String, Vec<ToolCall>, u32, Option<String>)>
@@ -613,10 +1182,7 @@ impl LlmClient {
         F: FnMut(String) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
-        let url = format!(
-            "{}/chat/completions",
-            self.config.base_url.trim_end_matches('/')
-        );
+        let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
         let resp = self
             .http
             .post(&url)
@@ -1070,6 +1636,120 @@ fn normalize_arg_key(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Serialize env-mutating tests across threads.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn api_key_suffix_takes_last_four() {
+        assert_eq!(api_key_suffix("sk-abcdefgh").as_deref(), Some("efgh"));
+        assert_eq!(api_key_suffix("ab").as_deref(), Some("ab"));
+        assert_eq!(api_key_suffix("   ").as_deref(), None);
+    }
+
+    #[test]
+    fn reload_updates_model_and_key_status() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let env = "NOVELX_TEST_LLM_KEY_RELOAD";
+        unsafe { std::env::remove_var(env) };
+        let mut cfg = LlmConfig::default();
+        cfg.api_key_env = env.into();
+        cfg.default_model = "model-a".into();
+        cfg.agents.insert("writer".into(), "creative".into());
+        cfg.tasks.insert("creative".into(), "model-a".into());
+        let client = LlmClient::new(cfg);
+        assert!(!client.has_api_key());
+        assert_eq!(client.model_for_agent("writer"), "model-a");
+
+        unsafe { std::env::set_var(env, "sk-test-secret-key-9999") };
+        let mut cfg2 = LlmConfig::default();
+        cfg2.api_key_env = env.into();
+        cfg2.default_model = "model-b".into();
+        cfg2.agents.insert("writer".into(), "creative".into());
+        cfg2.tasks.insert("creative".into(), "model-b".into());
+        client.reload(cfg2);
+        assert!(client.has_api_key());
+        assert_eq!(client.api_key_suffix().as_deref(), Some("9999"));
+        assert_eq!(client.model_for_agent("writer"), "model-b");
+        unsafe { std::env::remove_var(env) };
+    }
+
+    #[test]
+    fn upsert_dotenv_key_roundtrip_without_exposing_in_errors() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "novelx-llm-dotenv-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".env");
+        let env_name = "NOVELX_TEST_DOTENV_KEY";
+        std::fs::write(&path, format!("FOO=1\n{env_name}=old\nBAR=2\n")).unwrap();
+        upsert_dotenv_key(&path, env_name, "sk-new-secret-abcd").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(&format!("{env_name}=sk-new-secret-abcd")));
+        assert!(text.contains("FOO=1"));
+        assert!(text.contains("BAR=2"));
+        assert_eq!(
+            std::env::var(env_name).ok().as_deref(),
+            Some("sk-new-secret-abcd")
+        );
+        unsafe { std::env::remove_var(env_name) };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_form_preserves_agents_and_temperature() {
+        let existing = r#"
+profile: prod
+dev_model: deepseek-v4-flash
+providers:
+  deepseek:
+    api_key_env: DEEPSEEK_API_KEY
+    base_url: https://api.deepseek.com
+tasks:
+  creative:
+    description: 正文
+    provider: deepseek
+    model: deepseek-v4-pro
+    temperature: 0.85
+    max_tokens: 131072
+agents:
+  writer: creative
+"#;
+        let put = LlmFormPut {
+            profile: "prod".into(),
+            dev_model: "deepseek-v4-flash".into(),
+            default_provider: "deepseek".into(),
+            providers: vec![LlmProviderForm {
+                name: "deepseek".into(),
+                base_url: Some("https://api.deepseek.com".into()),
+                api_key_env: "DEEPSEEK_API_KEY".into(),
+                has_api_key: false,
+                api_key_suffix: None,
+            }],
+            tasks: vec![LlmTaskForm {
+                name: "creative".into(),
+                description: "正文".into(),
+                model: "deepseek-v4-flash".into(),
+                max_tokens: 65536,
+            }],
+            retry: LlmRetryForm {
+                max_retries: 3,
+                base_delay_ms: 800,
+                max_delay_ms: 10000,
+            },
+            api_key: None,
+        };
+        validate_llm_form_put(&put).unwrap();
+        let out = apply_llm_form_to_yaml(existing, &put).unwrap();
+        assert!(out.contains("temperature"));
+        assert!(out.contains("writer"));
+        assert!(out.contains("deepseek-v4-flash"));
+        assert!(out.contains("65536"));
+    }
 
     #[test]
     fn transient_errors_are_retryable() {

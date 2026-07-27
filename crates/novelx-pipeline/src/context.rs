@@ -1,7 +1,12 @@
 //! Chapter-scoped CanonContext: lore pack for long-horizon consistency.
 
 use crate::cards::{load_markdown_cards, truncate_chars, truncate_chars_tail, MarkdownCard};
-use crate::memory::{load_memory, recall_archived_summaries};
+use crate::memory::{
+    load_memory, recall_archived_summaries_with, recall_archived_threads,
+    select_asserted_facts_for_context,
+};
+use crate::project::{load_project_state, read_chapter_draft};
+use novelx_harness::{ContinuityBudget, ContinuityTier};
 use serde_json::Value;
 use std::path::Path;
 
@@ -39,11 +44,32 @@ pub fn build_chapter_context(
     let haystack = format!("{draft}\n{outline}");
     let mut hits = Vec::new();
     let mut sections: Vec<(String, String)> = Vec::new();
+    let tier = continuity_tier_for(project_dir);
+    let roster = crate::schemas::outline_entity_roster(outline);
+    let entity_names: Vec<String> = roster
+        .characters
+        .iter()
+        .chain(roster.items.iter())
+        .chain(roster.locations.iter())
+        .cloned()
+        .collect();
 
     // --- 卷幕目标 ---
     let act_block = select_act_goals(project_dir, chapter, &mut hits);
     if !act_block.is_empty() {
         sections.push(("卷幕目标".into(), truncate_chars(&act_block, 800)));
+    }
+
+    // --- 章间衔接（上章钩子 + 章末原文；写章/审校硬承接）---
+    if chapter > 1 {
+        let bridge = format_chapter_bridge(project_dir, chapter);
+        if !bridge.trim().is_empty() {
+            hits.push("chapter_bridge".into());
+            sections.push((
+                "章间衔接（必须承接，禁止无视/断档另起）".into(),
+                truncate_chars(&bridge, tier.bridge_chars),
+            ));
+        }
     }
 
     // --- 身体与能力状态板（置顶：伤势侧别 / 能力载体；写章硬锁）---
@@ -58,18 +84,60 @@ pub fn build_chapter_context(
         }
     }
 
-    // --- 滚动记忆（近章优先；可按大纲关键词召回旧章摘要）---
-    let memory_block = select_memory(project_dir, chapter, &haystack, profile, &mut hits);
+    // --- 卷级 rollup（已确认的远距主线，防 100+ 章漂移）---
+    if profile == ContextProfile::Full {
+        let rollup_block = format_volume_rollups(project_dir, chapter, tier.volume_rollups);
+        if !rollup_block.is_empty() {
+            hits.push("volume_rollups".into());
+            sections.push((
+                "卷级主线摘要（已确认）".into(),
+                truncate_chars(&rollup_block, 800),
+            ));
+        }
+    }
+
+    // --- 滚动记忆（近章优先；实体名 + 关键词召回旧章摘要）---
+    let memory_block = select_memory(
+        project_dir,
+        chapter,
+        &haystack,
+        &entity_names,
+        profile,
+        &tier,
+        &mut hits,
+    );
     if !memory_block.is_empty() {
         let budget = if profile == ContextProfile::Pacing {
-            1100
+            (tier.memory_section * 55 / 100).max(900)
         } else {
-            2000
+            tier.memory_section
         };
         // Prefer keeping the recent tail if over budget.
         sections.push((
             "滚动记忆与未收线".into(),
             truncate_chars_tail(&memory_block, budget),
+        ));
+    }
+
+    // --- 未回收伏笔索引（热窗口 + 归档）---
+    let dangling_n = if profile == ContextProfile::Pacing {
+        tier.dangling_show.min(4)
+    } else {
+        tier.dangling_show
+    };
+    let dangling = crate::foreshadow::format_dangling_for_context(project_dir, dangling_n);
+    if !dangling.is_empty() {
+        hits.push("foreshadow_index".into());
+        sections.push((
+            "未回收伏笔".into(),
+            truncate_chars(
+                &dangling,
+                if profile == ContextProfile::Pacing {
+                    400
+                } else {
+                    900
+                },
+            ),
         ));
     }
 
@@ -113,10 +181,23 @@ pub fn build_chapter_context(
     }
 
     // --- 设定卡：章纲 characters/items/locations 名单优先，再辅以撞名 ---
-    let roster = crate::schemas::outline_entity_roster(outline);
     let entity_block = select_entities(project_dir, &haystack, &roster, &mut hits);
     if !entity_block.is_empty() {
         sections.push(("相关设定卡".into(), entity_block));
+    }
+
+    // --- 相关已断言事实（按名单/关键词召回，补细节漂移）---
+    {
+        let mem = load_memory(project_dir);
+        let facts =
+            select_asserted_facts_for_context(&mem, &haystack, &entity_names, tier.asserted_facts);
+        if !facts.is_empty() {
+            hits.push("asserted_facts".into());
+            sections.push((
+                "相关已断言事实".into(),
+                truncate_chars(&format!("- {}", facts.join("\n- ")), 700),
+            ));
+        }
     }
 
     // --- 设定缺口（软提示：章纲优先补全，不阻断写章）---
@@ -286,17 +367,150 @@ fn select_outline_markdown_fallback(project_dir: &Path, hits: &mut Vec<String>) 
     String::new()
 }
 
+/// Previous chapter hook + draft tail for hard continuity.
+pub fn format_chapter_bridge(project_dir: &Path, chapter: u32) -> String {
+    if chapter <= 1 {
+        return String::new();
+    }
+    let prev = chapter - 1;
+    let mut parts = Vec::new();
+
+    let summary_path = project_dir
+        .join("chapters")
+        .join(format!("{prev:03}"))
+        .join("summary.json");
+    if let Ok(text) = std::fs::read_to_string(&summary_path) {
+        if let Ok(v) = serde_json::from_str::<Value>(&text) {
+            let hook = v
+                .get("ending_hook")
+                .or_else(|| v.get("hook"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim();
+            let event = v
+                .get("event_summary")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim();
+            if !hook.is_empty() {
+                parts.push(format!("上章钩子：{}", truncate_chars(hook, 200)));
+            }
+            if !event.is_empty() {
+                parts.push(format!("上章摘要：{}", truncate_chars(event, 220)));
+            }
+        }
+    }
+
+    let mem = load_memory(project_dir);
+    if let Some(d) = mem.recent_digests.iter().find(|d| d.chapter == prev) {
+        if parts.is_empty() && !d.hook.is_empty() {
+            parts.push(format!("上章钩子：{}", truncate_chars(&d.hook, 200)));
+        }
+        if !parts.iter().any(|p| p.starts_with("上章摘要")) && !d.event_summary.is_empty() {
+            parts.push(format!(
+                "上章摘要：{}",
+                truncate_chars(&d.event_summary, 220)
+            ));
+        }
+    }
+
+    let draft = read_chapter_draft(project_dir, prev).unwrap_or_default();
+    let tail = draft_tail_excerpt(&draft, 420);
+    if !tail.is_empty() {
+        parts.push(format!("上章章末原文：\n{tail}"));
+    }
+
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "承接第{prev}章 → 第{chapter}章开篇必须接上列钩子/章末态势，禁止另起无关开局。\n{}",
+            parts.join("\n")
+        )
+    }
+}
+
+fn draft_tail_excerpt(draft: &str, max_chars: usize) -> String {
+    let t = draft.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    let count = t.chars().count();
+    if count <= max_chars {
+        return t.to_string();
+    }
+    let skip = count - max_chars;
+    t.chars().skip(skip).collect()
+}
+
+fn continuity_tier_for(project_dir: &Path) -> ContinuityTier {
+    let published = load_project_state(project_dir)
+        .map(|s| s.published_count)
+        .unwrap_or(0);
+    let budget = find_continuity_budget(project_dir);
+    budget.for_published(published).clone()
+}
+
+fn find_continuity_budget(project_dir: &Path) -> ContinuityBudget {
+    // projects/<name> → <repo>/config/continuity.yaml
+    if let Some(root) = project_dir.parent().and_then(|p| p.parent()) {
+        let p = root.join("config/continuity.yaml");
+        if p.is_file() {
+            return ContinuityBudget::load(&p);
+        }
+    }
+    ContinuityBudget::default()
+}
+
+fn format_volume_rollups(project_dir: &Path, chapter: u32, limit: usize) -> String {
+    let mem = load_memory(project_dir);
+    if mem.volume_rollups.is_empty() || limit == 0 {
+        return String::new();
+    }
+    // Prefer completed volumes before current chapter.
+    let mut rolls: Vec<_> = mem
+        .volume_rollups
+        .iter()
+        .filter(|r| r.chapter_end > 0 && r.chapter_end < chapter)
+        .cloned()
+        .collect();
+    if rolls.is_empty() {
+        rolls = mem.volume_rollups.clone();
+    }
+    rolls.sort_by_key(|r| std::cmp::Reverse(r.volume_index));
+    rolls
+        .into_iter()
+        .take(limit)
+        .map(|r| {
+            let title = if r.name.is_empty() {
+                format!("第{}卷", r.volume_index)
+            } else {
+                format!("第{}卷「{}」", r.volume_index, r.name)
+            };
+            format!(
+                "{title}（至第{}章）：{}",
+                r.chapter_end,
+                truncate_chars(&r.summary, 280)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 fn select_memory(
     project_dir: &Path,
     chapter: u32,
     haystack: &str,
+    entity_names: &[String],
     profile: ContextProfile,
+    tier: &ContinuityTier,
     hits: &mut Vec<String>,
 ) -> String {
     let mem = load_memory(project_dir);
     if mem.rolling_summary.is_empty()
         && mem.recent_digests.is_empty()
         && mem.open_threads.is_empty()
+        && mem.archived_threads.is_empty()
     {
         return String::new();
     }
@@ -379,10 +593,16 @@ fn select_memory(
         }
     }
 
-    // Keyword recall of archived chapter summaries outside the hot digest window.
+    // Entity-name + keyword recall of archived chapter summaries.
     if profile == ContextProfile::Full {
         let exclude: Vec<u32> = mem.recent_digests.iter().map(|d| d.chapter).collect();
-        let recalled = recall_archived_summaries(project_dir, haystack, &exclude, 2);
+        let recalled = recall_archived_summaries_with(
+            project_dir,
+            haystack,
+            entity_names,
+            &exclude,
+            tier.summary_recall,
+        );
         for d in recalled {
             hits.push(format!("recall:ch{}", d.chapter));
             parts.push(format!(
@@ -409,11 +629,36 @@ fn select_memory(
     let open_texts: Vec<String> = open
         .into_iter()
         .take(8)
-        .map(|t| t.text)
-        .filter(|t| !t.is_empty())
+        .filter(|t| !t.text.is_empty())
+        .map(|t| {
+            if t.planted_chapter > 0 {
+                format!("{}（埋于第{}章）", t.text, t.planted_chapter)
+            } else {
+                t.text
+            }
+        })
         .collect();
     if !open_texts.is_empty() {
         parts.push(format!("未收线：\n- {}", open_texts.join("\n- ")));
+    }
+
+    // Keyword-recall archived dangling threads outside the hot list.
+    if profile == ContextProfile::Full {
+        let recalled = recall_archived_threads(&mem, haystack, tier.archive_thread_recall);
+        if !recalled.is_empty() {
+            hits.push("archived_threads".into());
+            let lines: Vec<String> = recalled
+                .into_iter()
+                .map(|t| {
+                    format!(
+                        "{}（埋于第{}章·归档）",
+                        truncate_chars(&t.text, 80),
+                        t.planted_chapter
+                    )
+                })
+                .collect();
+            parts.push(format!("召回未收线：\n- {}", lines.join("\n- ")));
+        }
     }
 
     parts.join("\n\n")
@@ -884,6 +1129,30 @@ mod tests {
         assert!(pack.markdown.contains("设定缺口"));
         let pacing = build_chapter_context(&dir, 1, "客串甲与林舟会面", "", ContextProfile::Pacing);
         assert!(!pacing.hits.iter().any(|h| h == "entity_gaps"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chapter_bridge_injects_prev_hook_and_tail() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-canon-bridge");
+        let _ = fs::remove_dir_all(&dir);
+        fixture_project(&dir);
+        write(
+            &dir.join("chapters/001/summary.json"),
+            r#"{"event_summary":"主角发现异象。","ending_hook":"门外忽然响起三声叩击。"}"#,
+        );
+        write(
+            &dir.join("chapters/001/draft.md"),
+            "甲段。\n\n乙段。\n\n他屏住呼吸，门外忽然响起三声叩击。\n",
+        );
+        let pack = build_chapter_context(&dir, 2, "他推开门。", "", ContextProfile::Full);
+        assert!(
+            pack.hits.iter().any(|h| h == "chapter_bridge"),
+            "hits={:?}",
+            pack.hits
+        );
+        assert!(pack.markdown.contains("章间衔接"));
+        assert!(pack.markdown.contains("三声叩击"));
         let _ = fs::remove_dir_all(&dir);
     }
 

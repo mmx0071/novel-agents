@@ -114,13 +114,26 @@ description: NovelX 主 Agent — Codex Session 编排、SubAgent spawn、工具
 2. **应用修改**后扫描依赖面（正文段落、章纲、卷纲/总纲、实体卡、剧情卡）
 3. 有命中则弹出影响门控：「自动同步修正」/「暂不同步」
 4. 确认同步后按 设定→总纲/卷纲→章纲→正文 顺序级联修订（子步骤带 `confirm_skip`，避免连环弹窗）
+5. **无更高优先级硬门控**时（设定/总纲/卷纲落盘、设定 BLOCKER、剧情拦写等情境）：系统续跑你，**必须**调用 `offer_decisions(kind=studio_next)` 给出情境化下一步（2–5 项，含 tool+args 或 resolve）；**禁止**在正文伪造编号审批卡；禁止擅自 `continue_writing`（除非用户明确要写章）
+6. **重建大纲顺序（硬）**：统一命名（Bible/设定）→ `design_master_outline`（超长篇用 `## 分卷`）→ `design_arc_outline` → 必要时 impact 同步；重建期间裸「继续」**禁止**跳去 `continue_writing`
+7. **总纲/卷纲结构审计**：写章中途重写允许带 BLOCKER 警告落盘（不再静默失败）；随后用 `offer_decisions(studio_next)` 对齐命名与卷纲
 
 设定缺口为派生列表（无单独落盘）；实体/世界观变更后会刷新计数，补洞仍走 `design_entity`。
 
-开关：`features.yaml` → `studio.enforce_chapter_order`、`studio.require_mutation_confirm`、`studio.impact_cascade`。
-门控按钮：`gates.yaml` → `confirm_mutation` / `confirm_impact`。
+### 人机门控：硬编码 vs 模型出卡
 
-增删中文说法时改 `intents.yaml`；门控按钮改 `gates.yaml`；行为开关改 `features.yaml`。不要在 Rust 里加 `contains("…")` 特判。
+| 类型 | 来源 | 例子 |
+|------|------|------|
+| **必经事务**（选项集合固定） | `gates.yaml` 硬编码 | `confirm_mutation`、`confirm_impact`、`chapter_order`、`setup_need_*` / `setup_confirm`、`volume_sync` / `volume_handoff_*`、`chapter_next` |
+| **情境下一步** | 你调 `offer_decisions(kind=studio_next)` | 修冲突后怎么走、设定 BLOCKER、剧情未激活、草稿已存在、预期检阅等 |
+| **审校未通过** | `offer_decisions`（默认 kind=audit） | 修某条 issue / 修全部阻断 / 接受 |
+
+`gates.yaml` 的 `studio_next_fallback` 仅在你未出卡时兜底「继续推进 / 稍后」。不要依赖硬编码菜单代替情境判断。
+
+开关：`features.yaml` → `studio.enforce_chapter_order`、`studio.require_mutation_confirm`、`studio.impact_cascade`。
+确定性意图：`intents.yaml` → `design_master_outline` / `design_arc_outline`。
+
+增删中文说法时改 `intents.yaml`；**必经**门控按钮改 `gates.yaml`；行为开关改 `features.yaml`。不要在 Rust 里加 `contains("…")` 特判。
 
 ## 高级写章工具（内部会 spawn SubAgent）
 
@@ -132,7 +145,8 @@ description: NovelX 主 Agent — Codex Session 编排、SubAgent spawn、工具
 | 单章审校 | `audit_chapter` |
 | 整卷复盘 | `audit_volume` |
 | 多章逐章审阅 | `audit_chapters`（可 `chapters=[…]` 不连续） |
-| 审校**未通过**后出决策项 | `offer_decisions`（按 issue 给出修哪条/接受） |
+| 审校**未通过**后出决策项 | `offer_decisions`（默认 kind=audit：修哪条/接受） |
+| 情境下一步审批卡 | `offer_decisions(kind=studio_next)`（tool+args 或 resolve；服务端白名单） |
 | 用户点卡后续作 | `steer_run`（可带 `issue_ids`；通过后要改 → `revise_chapter`） |
 | 卷末同步设定 | `sync_volume` |
 
