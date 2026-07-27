@@ -200,6 +200,9 @@ export default function App() {
   const [novelRecord, setNovelRecord] = useState(null)
   const [project, setProject] = useState(initialProject)
   const [preview, setPreview] = useState(null)
+  /** On-demand chapter body (preview lists omit full drafts for longform). */
+  const [chapterCache, setChapterCache] = useState({})
+  const [chapterLoading, setChapterLoading] = useState(false)
   const [selectedChapter, setSelectedChapter] = useState(() => initialWorkspace.selectedChapter || 1)
   const [readerTab, setReaderTab] = useState('draft')
   const [readerCardKey, setReaderCardKey] = useState('')
@@ -277,6 +280,8 @@ export default function App() {
     if (data.error) return false
     setNovelRecord(data.novel)
     setPreview(data.preview)
+    // Preview no longer embeds bodies — drop stale chapter cache on refresh.
+    setChapterCache({})
     setProject(name)
     currentProjectRef.current = name
     if (data.preview?.chapters?.length) {
@@ -321,10 +326,26 @@ export default function App() {
     const data = await api(`/projects/${name}/preview`)
     setPreview(data)
     const chapters = data.chapters || []
+    // Invalidate only the written chapter (or prune deleted ones). Full wipe flashes empty body.
     if (opts.chapter != null && opts.chapter > 0) {
+      setChapterCache((prev) => {
+        const next = { ...prev }
+        delete next[opts.chapter]
+        return next
+      })
       setSelectedChapter(opts.chapter)
-    } else if ((opts.focusLatestChapter || !opts.keepSelection) && chapters.length) {
-      setSelectedChapter(chapters[chapters.length - 1].number)
+    } else {
+      const nums = new Set(chapters.map((c) => c.number))
+      setChapterCache((prev) => {
+        const next = {}
+        for (const [k, v] of Object.entries(prev)) {
+          if (nums.has(Number(k))) next[k] = v
+        }
+        return next
+      })
+      if ((opts.focusLatestChapter || !opts.keepSelection) && chapters.length) {
+        setSelectedChapter(chapters[chapters.length - 1].number)
+      }
     }
     if (opts.readerTab) {
       setReaderTab(opts.readerTab === 'plots' ? 'arcs' : opts.readerTab)
@@ -364,7 +385,71 @@ export default function App() {
     }
   }, [selectProject])
 
-  const chapterData = preview?.chapters?.find((c) => c.number === selectedChapter)
+  const chapterMeta = preview?.chapters?.find((c) => c.number === selectedChapter)
+  const chapterData = (() => {
+    const cached = chapterCache[selectedChapter]
+    if (cached) {
+      return {
+        number: selectedChapter,
+        title: cached.title || chapterMeta?.title || `第${selectedChapter}章`,
+        draft: cached.draft || '',
+        outline: cached.outline || '',
+        body_chars: cached.body_chars ?? chapterMeta?.body_chars,
+      }
+    }
+    if (!chapterMeta) return null
+    // Legacy: preview still embeds bodies (older servers).
+    if (chapterMeta.draft || chapterMeta.outline) return chapterMeta
+    return {
+      number: selectedChapter,
+      title: chapterMeta.title || `第${selectedChapter}章`,
+      draft: '',
+      outline: '',
+      body_chars: chapterMeta.body_chars,
+    }
+  })()
+
+  // Fetch chapter body when selection changes (longform-safe preview).
+  const chapterCacheRef = useRef(chapterCache)
+  chapterCacheRef.current = chapterCache
+  useEffect(() => {
+    const proj = project
+    const ch = selectedChapter
+    if (!proj || !ch) return
+    const meta = preview?.chapters?.find((c) => c.number === ch)
+    if (!meta) return
+    if (meta.draft || meta.outline) return // embedded (legacy servers)
+    if (!meta.has_draft && !meta.has_outline) return
+    const hit = chapterCacheRef.current[ch]
+    if (hit?.draft || hit?.outline) return // keep showing cached body across preview refresh
+    let cancelled = false
+    setChapterLoading(true)
+    api(`/projects/${encodeURIComponent(proj)}/chapters/${ch}`)
+      .then((data) => {
+        if (cancelled || data.error) return
+        setChapterCache((prev) => ({
+          ...prev,
+          [ch]: {
+            title: data.title,
+            draft: data.draft || '',
+            outline: data.outline || '',
+            body_chars: data.body_chars,
+          },
+        }))
+      })
+      .finally(() => {
+        if (!cancelled) setChapterLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [project, selectedChapter, preview])
+
+  // Drop body cache when switching novels.
+  useEffect(() => {
+    setChapterCache({})
+  }, [project])
+
   const storyOutline = preview?.story_outline
   const nextChapter = novelRecord?.next_chapter ?? (preview?.chapters?.length || 0) + 1
   const publishedSet = new Set((preview?.chapters || []).map((c) => c.number))
@@ -519,6 +604,24 @@ export default function App() {
     return `已写 ${n} 章`
   })()
 
+  const longformHealth = preview?.longform_health || null
+  const foreshadowDebt = longformHealth?.foreshadow || null
+  const volumeHealth = longformHealth?.volume || null
+  const lengthHealth = longformHealth?.length || null
+  const longformTier = longformHealth?.longform || null
+  const costByAgent = Array.isArray(preview?.cost_by_agent) ? preview.cost_by_agent : []
+  const costTop = costByAgent
+    .filter((c) => c?.agent && c.agent !== 'pipeline')
+    .slice(0, 4)
+    .map((c) => `${c.agent}≈${Math.round((c.approx_tokens || 0) / 1000)}k`)
+    .join(' · ')
+  const lengthChip = lengthHealth
+    ? `偏短率 ${Math.round((lengthHealth.soft_short_rate || 0) * 100)}%`
+      + (lengthHealth.consecutive_soft_short
+        ? ` · 连短 ${lengthHealth.consecutive_soft_short}`
+        : '')
+    : ''
+
   const hasReaderMaterial = Boolean(
     chapterList.length
     || artifactTabs.length
@@ -534,8 +637,14 @@ export default function App() {
   )
 
   const readerContent = (() => {
-    if (readerTab === 'draft') return chapterData?.draft
-    if (readerTab === 'outline') return chapterData?.outline
+    if (readerTab === 'draft') {
+      if (chapterLoading && !chapterData?.draft) return '（加载正文中…）'
+      return chapterData?.draft
+    }
+    if (readerTab === 'outline') {
+      if (chapterLoading && !chapterData?.outline) return '（加载章纲中…）'
+      return chapterData?.outline
+    }
     if (readerTab === 'master') {
       return preview?.artifacts?.master_outline
         || preview?.artifacts?.master_planner
@@ -715,6 +824,13 @@ export default function App() {
     } else {
       await fetchNovelPreview(project)
     }
+    if (readerTab === 'draft' || readerTab === 'outline') {
+      setChapterCache((prev) => {
+        const next = { ...prev }
+        delete next[selectedChapter]
+        return next
+      })
+    }
     setReaderEditing(false)
     setReaderEditText('')
   }
@@ -772,6 +888,11 @@ export default function App() {
     if (data.preview) {
       setPreview(data.preview)
     }
+    setChapterCache((prev) => {
+      const next = { ...prev }
+      delete next[chapter]
+      return next
+    })
     const remaining = Array.isArray(data.remaining)
       ? data.remaining
       : (data.preview?.chapters || []).map((c) => c.number)
@@ -912,6 +1033,83 @@ export default function App() {
               </div>
             )}
           </div>
+
+          {project && longformHealth && (
+            <div className="longform-health" aria-label="超长篇健康">
+              <div className="longform-health-card">
+                <div className="longform-health-title">伏笔债务</div>
+                <div className="longform-health-body">
+                  未收 {foreshadowDebt?.dangling_total ?? 0}
+                  {foreshadowDebt?.open_cold ? ` · 冷档 ${foreshadowDebt.open_cold}` : ''}
+                </div>
+                {Array.isArray(foreshadowDebt?.oldest) && foreshadowDebt.oldest.length > 0 && (
+                  <ul className="longform-health-list">
+                    {foreshadowDebt.oldest.slice(0, 3).map((t) => (
+                      <li key={t.id || `${t.planted_chapter}-${t.text}`}>
+                        第{t.planted_chapter || '?'}章 · {t.text}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+              <div className="longform-health-card">
+                <div className="longform-health-title">卷健康</div>
+                <div className="longform-health-body">
+                  {volumeHealth?.active_index
+                    ? `第${volumeHealth.active_index}卷 · ${volumeHealth.chapters_in_volume || 0}章`
+                    : '尚无进行中卷'}
+                  {volumeHealth?.has_audit_report ? ' · 已复盘' : ''}
+                  {volumeHealth?.thick_volume_warning ? (
+                    <span className="longform-health-warn"> · 厚卷</span>
+                  ) : null}
+                </div>
+                <div className="longform-health-sub">
+                  rollup {volumeHealth?.rollup_total ?? 0}
+                  {volumeHealth?.mid_audit_threshold
+                    ? ` · 中卷审≥${volumeHealth.mid_audit_threshold}章`
+                    : ''}
+                </div>
+              </div>
+              {lengthHealth ? (
+                <div className="longform-health-card">
+                  <div className="longform-health-title">篇幅</div>
+                  <div className="longform-health-body">
+                    {lengthChip || '—'}
+                    {lengthHealth.word_hard_min
+                      ? ` · 硬门 ${lengthHealth.word_hard_min}`
+                      : ''}
+                  </div>
+                  <div className="longform-health-sub">
+                    目标 {lengthHealth.word_min}–{lengthHealth.word_max}
+                    {lengthHealth.target_chapters
+                      ? ` · 规划 ${lengthHealth.target_chapters} 章`
+                      : ''}
+                  </div>
+                </div>
+              ) : null}
+              {longformTier ? (
+                <div className="longform-health-card">
+                  <div className="longform-health-title">长篇档</div>
+                  <div className="longform-health-body">
+                    {longformTier.quality_tier || '—'}
+                    {longformTier.audit_tier ? ` · 审 ${longformTier.audit_tier}` : ''}
+                  </div>
+                  <div className="longform-health-sub">
+                    impact {longformTier.impact_scan_mode || '—'}
+                    {longformTier.drift_samples != null
+                      ? ` · 漂移抽样 ${longformTier.drift_samples}`
+                      : ''}
+                  </div>
+                </div>
+              ) : null}
+              {costTop ? (
+                <div className="longform-health-card">
+                  <div className="longform-health-title">成本（近录）</div>
+                  <div className="longform-health-body longform-health-cost">{costTop}</div>
+                </div>
+              ) : null}
+            </div>
+          )}
 
           {!hasReaderMaterial ? (
             <div className="empty small">在 NovelX 创建小说后，卷大纲、设定卡与正文将显示在此</div>

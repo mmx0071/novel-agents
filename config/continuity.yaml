@@ -20,11 +20,27 @@ tiers:
     asserted_facts: 8
     volume_rollups: 3
     bridge_chars: 1000
-  - max_published: 0   # 0 = unlimited / default for 120+
-    memory_section: 2800
+  - max_published: 200
+    memory_section: 3000
     dangling_show: 12
     archive_thread_recall: 4
     summary_recall: 6
-    asserted_facts: 10
+    asserted_facts: 12
     volume_rollups: 4
     bridge_chars: 1100
+  - max_published: 500
+    memory_section: 3400
+    dangling_show: 14
+    archive_thread_recall: 5
+    summary_recall: 8
+    asserted_facts: 22
+    volume_rollups: 8
+    bridge_chars: 1200
+  - max_published: 0   # 0 = unlimited / default for 500+
+    memory_section: 4200
+    dangling_show: 16
+    archive_thread_recall: 8
+    summary_recall: 12
+    asserted_facts: 36
+    volume_rollups: 12
+    bridge_chars: 1300

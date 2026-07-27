@@ -97,6 +97,8 @@ function isAuditToolName(name) {
 /** Tools that write project files — refresh reader when they finish (don't wait for turn_complete). */
 const PREVIEW_MUTATING_TOOLS = new Set([
   'continue_writing',
+  'continue_writing_batch',
+  'replan_volume',
   'revise_chapter',
   'revise_outline',
   'design_plot',
@@ -108,6 +110,7 @@ const PREVIEW_MUTATING_TOOLS = new Set([
   'upsert_setting',
   'supplement_setting',
   'sync_volume',
+  'confirm_volume_memory',
   'create_novel',
   'init_novel',
   'steer_run',

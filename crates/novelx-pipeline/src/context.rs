@@ -2,8 +2,9 @@
 
 use crate::cards::{load_markdown_cards, truncate_chars, truncate_chars_tail, MarkdownCard};
 use crate::memory::{
-    load_memory, recall_archived_summaries_with, recall_archived_threads,
-    select_asserted_facts_for_context,
+    load_all_volume_rollups, load_memory, recall_archived_summaries_with,
+    recall_archived_threads_in, select_dangling_age_boosted, select_entity_timeline_for_context,
+    select_asserted_facts_for_context_in,
 };
 use crate::project::{load_project_state, read_chapter_draft};
 use novelx_harness::{ContinuityBudget, ContinuityTier};
@@ -80,6 +81,26 @@ pub fn build_chapter_context(
             sections.push((
                 "身体与能力状态板（开写前锁定）".into(),
                 truncate_chars(&body, 1200),
+            ));
+        }
+    }
+
+    // --- 本卷未收束（剧情卡退出条件，强制锚点防漂移）---
+    if let Some((entry, exit, _)) = crate::plots::active_plot_exit_context(project_dir) {
+        let exit = exit.trim();
+        if !exit.is_empty() {
+            hits.push("active_plot_exit".into());
+            let label = if entry.title.is_empty() {
+                entry.slug.clone()
+            } else {
+                entry.title.clone()
+            };
+            sections.push((
+                "本卷未收束（必须朝向，勿另起主线）".into(),
+                truncate_chars(
+                    &format!("进行中剧情卡「{label}」收束条件：\n{exit}"),
+                    600,
+                ),
             ));
         }
     }
@@ -189,8 +210,13 @@ pub fn build_chapter_context(
     // --- 相关已断言事实（按名单/关键词召回，补细节漂移）---
     {
         let mem = load_memory(project_dir);
-        let facts =
-            select_asserted_facts_for_context(&mem, &haystack, &entity_names, tier.asserted_facts);
+        let facts = select_asserted_facts_for_context_in(
+            Some(project_dir),
+            &mem,
+            &haystack,
+            &entity_names,
+            tier.asserted_facts,
+        );
         if !facts.is_empty() {
             hits.push("asserted_facts".into());
             sections.push((
@@ -463,19 +489,21 @@ fn find_continuity_budget(project_dir: &Path) -> ContinuityBudget {
 }
 
 fn format_volume_rollups(project_dir: &Path, chapter: u32, limit: usize) -> String {
-    let mem = load_memory(project_dir);
-    if mem.volume_rollups.is_empty() || limit == 0 {
+    if limit == 0 {
         return String::new();
     }
-    // Prefer completed volumes before current chapter.
-    let mut rolls: Vec<_> = mem
-        .volume_rollups
+    let all = load_all_volume_rollups(project_dir);
+    if all.is_empty() {
+        return String::new();
+    }
+    // Prefer completed volumes before current chapter (hot + cold archive).
+    let mut rolls: Vec<_> = all
         .iter()
         .filter(|r| r.chapter_end > 0 && r.chapter_end < chapter)
         .cloned()
         .collect();
     if rolls.is_empty() {
-        rolls = mem.volume_rollups.clone();
+        rolls = all;
     }
     rolls.sort_by_key(|r| std::cmp::Reverse(r.volume_index));
     rolls
@@ -618,17 +646,10 @@ fn select_memory(
         }
     }
 
-    let mut open: Vec<_> = mem
-        .open_threads
-        .iter()
-        .filter(|t| t.status == "open" || t.status.is_empty())
-        .cloned()
-        .collect();
-    // Prefer recently planted threads.
-    open.sort_by_key(|t| std::cmp::Reverse(t.planted_chapter));
+    // Longform: oldest planted first so early debts are not crowded out.
+    let open = select_dangling_age_boosted(&mem.open_threads, 8);
     let open_texts: Vec<String> = open
         .into_iter()
-        .take(8)
         .filter(|t| !t.text.is_empty())
         .map(|t| {
             if t.planted_chapter > 0 {
@@ -639,12 +660,13 @@ fn select_memory(
         })
         .collect();
     if !open_texts.is_empty() {
-        parts.push(format!("未收线：\n- {}", open_texts.join("\n- ")));
+        parts.push(format!("未收线（旧线优先）：\n- {}", open_texts.join("\n- ")));
     }
 
-    // Keyword-recall archived dangling threads outside the hot list.
+    // Keyword-recall archived + cold-archive dangling threads.
     if profile == ContextProfile::Full {
-        let recalled = recall_archived_threads(&mem, haystack, tier.archive_thread_recall);
+        let recalled =
+            recall_archived_threads_in(Some(project_dir), &mem, haystack, tier.archive_thread_recall);
         if !recalled.is_empty() {
             hits.push("archived_threads".into());
             let lines: Vec<String> = recalled
@@ -658,6 +680,20 @@ fn select_memory(
                 })
                 .collect();
             parts.push(format!("召回未收线：\n- {}", lines.join("\n- ")));
+        }
+    }
+
+    // Structured entity timeline (status / holdings / injury).
+    if profile == ContextProfile::Full {
+        let timeline = select_entity_timeline_for_context(
+            project_dir,
+            &mem,
+            entity_names,
+            tier.asserted_facts.min(12).max(4),
+        );
+        if !timeline.is_empty() {
+            hits.push("entity_timeline".into());
+            parts.push(format!("实体时间线：\n- {}", timeline.join("\n- ")));
         }
     }
 

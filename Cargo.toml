@@ -38,6 +38,8 @@ tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+flate2 = "1"
 novelx-protocol = { path = "crates/novelx-protocol" }
 novelx-skills = { path = "crates/novelx-skills" }
 novelx-draft-patch = { path = "crates/novelx-draft-patch" }

@@ -418,26 +418,12 @@ struct VolumeContextPack {
 }
 
 fn gather_volume_context(project_dir: &Path, volume: &VolumeBound) -> Result<VolumeContextPack> {
-    let mut summary_parts = Vec::new();
     let upto = if volume.end_chapter > 0 {
         volume.end_chapter
     } else {
         max_existing_chapter(project_dir).max(1)
     };
-    let (from, to) = volume_chapter_span(volume, upto);
-    for ch in from..=to {
-        let path = project_dir
-            .join("chapters")
-            .join(format!("{ch:03}"))
-            .join("summary.json");
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            let excerpt: String = text.chars().take(1200).collect();
-            summary_parts.push(format!("## 第{ch}章\n{excerpt}"));
-        }
-    }
-    if summary_parts.is_empty() {
-        summary_parts.push("（本卷尚无 summary.json，请依据现有设定做最小同步）".into());
-    }
+    let layered = crate::volume_pack::gather_volume_layered_pack(project_dir, volume, upto, &[])?;
 
     let mem = load_memory(project_dir);
     let mem_excerpt: String = serde_json::to_string_pretty(&mem)
@@ -463,7 +449,7 @@ fn gather_volume_context(project_dir: &Path, volume: &VolumeBound) -> Result<Vol
     );
 
     Ok(VolumeContextPack {
-        summaries: summary_parts.join("\n\n"),
+        summaries: layered.text,
         existing_excerpt,
     })
 }
@@ -531,6 +517,23 @@ fn apply_sync_json(
             match upsert_entity_card(project_dir, ent, mode)? {
                 Some(UpsertEntityOutcome { name, incomplete }) => {
                     entities_upserted += 1;
+                    let kind = ent
+                        .get("kind")
+                        .or_else(|| ent.get("type"))
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("character");
+                    let status = ent
+                        .get("status")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("");
+                    let rel = format!("entities/{kind}/{name}.md");
+                    let _ = crate::lore_index::upsert_entity_index_row(
+                        project_dir,
+                        kind,
+                        &name,
+                        &rel,
+                        status,
+                    );
                     if incomplete {
                         incomplete_entities.push(name);
                     }

@@ -5,16 +5,20 @@ pub mod chapter_budget;
 pub mod content_rules;
 pub mod continuity;
 pub mod gates;
+pub mod longform;
 pub mod naming_rules;
 pub mod pipeline_config;
 pub mod policies;
 pub mod review_priority;
 
 pub use activation::{
-    collect_signals, evaluate_activation, resolve_pipeline_agents, ActivationSignals,
-    ActivationSuggestion,
+    collect_signals, evaluate_activation, resolve_pipeline_agents, resolve_pipeline_agents_filtered,
+    resolve_pipeline_agents_with_tier, ActivationSignals, ActivationSuggestion,
 };
-pub use chapter_budget::ChapterBudget;
+pub use chapter_budget::{
+    consecutive_soft_short_from_meta, set_consecutive_soft_short, ChapterBudget, LengthAssessment,
+};
+pub use longform::{AuditTier, ImpactScanMode, LongformConfig, QualityTier};
 pub use continuity::{ContinuityBudget, ContinuityTier};
 pub use content_rules::{
     check_draft, check_draft_with, has_blocking_violation, rewrite_meta_chapter_refs_in_body,

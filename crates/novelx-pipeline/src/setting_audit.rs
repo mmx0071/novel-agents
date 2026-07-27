@@ -56,30 +56,63 @@ pub fn build_setting_audit_pack(project_dir: &Path, opts: &SettingAuditPackOpts)
         bible.chars().take(3000).collect::<String>()
     ));
 
+    // Longform: no hard take(12) blind spot — roster all names, expand stubs fully,
+    // then fill remaining char budget with complete cards.
+    const ENTITY_SECTION_BUDGET: usize = 14_000;
+    let mut entity_chars = 0usize;
+    let mut roster_lines = Vec::new();
+    let mut stub_bodies = Vec::new();
+    let mut complete_bodies = Vec::new();
     for group in ["characters", "items", "locations"] {
         let folder = project_dir.join("entities").join(group);
-        if let Ok(rd) = std::fs::read_dir(folder) {
-            for e in rd.flatten().take(12) {
-                if let Ok(t) = std::fs::read_to_string(e.path()) {
-                    // Prefer fuller stub text so auditor can judge omissions.
-                    let limit = if t.contains("complete: false")
-                        || t.contains("source: volume_sync")
-                        || t.contains("source: plot_sync")
-                        || t.contains("## 卷末同步摘要")
-                        || t.contains("## 剧情同步摘要")
-                    {
-                        900
-                    } else {
-                        400
-                    };
-                    pack.push_str(&format!(
-                        "\n## [{group}] {}\n{}\n",
-                        e.file_name().to_string_lossy(),
-                        t.chars().take(limit).collect::<String>()
-                    ));
-                }
+        let Ok(rd) = std::fs::read_dir(&folder) else {
+            continue;
+        };
+        let mut entries: Vec<_> = rd.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let name = e.file_name().to_string_lossy().to_string();
+            let Ok(t) = std::fs::read_to_string(e.path()) else {
+                continue;
+            };
+            let incomplete = t.contains("complete: false")
+                || t.contains("source: volume_sync")
+                || t.contains("source: plot_sync")
+                || t.contains("## 卷末同步摘要")
+                || t.contains("## 剧情同步摘要");
+            roster_lines.push(format!("- [{group}] {name}{}", if incomplete { " ·待补" } else { "" }));
+            let limit = if incomplete { 900 } else { 400 };
+            let body = format!(
+                "\n## [{group}] {name}\n{}\n",
+                t.chars().take(limit).collect::<String>()
+            );
+            if incomplete {
+                stub_bodies.push(body);
+            } else {
+                complete_bodies.push(body);
             }
         }
+    }
+    if !roster_lines.is_empty() {
+        let roster = format!("# 实体名册（全量）\n{}\n", roster_lines.join("\n"));
+        entity_chars += roster.chars().count();
+        pack.push_str(&roster);
+    }
+    for body in stub_bodies {
+        if entity_chars + body.chars().count() > ENTITY_SECTION_BUDGET {
+            pack.push_str("\n（其余待补实体因字数预算未展开正文；见名册）\n");
+            break;
+        }
+        entity_chars += body.chars().count();
+        pack.push_str(&body);
+    }
+    for body in complete_bodies {
+        if entity_chars + body.chars().count() > ENTITY_SECTION_BUDGET {
+            pack.push_str("\n（其余已补全实体因字数预算未展开正文；见名册）\n");
+            break;
+        }
+        entity_chars += body.chars().count();
+        pack.push_str(&body);
     }
 
     let gaps = collect_entity_gaps(project_dir);
@@ -155,8 +188,11 @@ fn read_plot_card_text(project_dir: &Path, title: &str) -> Option<String> {
 }
 
 fn load_setting_auditor_skill(config_root: &Path) -> String {
-    let root = config_root.join("skills/agents");
-    let outcome = load_skills(&[(SkillScope::Agent, root)]);
+    // Include Studio root so shared `content-formats` can prepend.
+    let outcome = load_skills(&[
+        (SkillScope::Studio, config_root.join("skills")),
+        (SkillScope::Agent, config_root.join("skills/agents")),
+    ]);
     let inj = build_skill_injections(&outcome.skills, &["setting-auditor".into()]);
     inj.into_iter()
         .next()

@@ -2,12 +2,162 @@
 //! Deterministic keyword / name matching (optional LLM refine is feature-gated elsewhere).
 
 use crate::cards::{entity_names_equivalent, load_markdown_cards};
-use crate::project::{list_chapter_numbers, read_chapter_draft, read_chapter_outline};
-use crate::volume::{list_arc_outline_volumes, read_arc_outline_text};
+use crate::project::{list_chapter_numbers, load_project_state, read_chapter_draft, read_chapter_outline};
+use crate::volume::{active_volume_for_chapter, list_arc_outline_volumes, read_arc_outline_text};
+use novelx_harness::ImpactScanMode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
+
+/// When false (default), draft scans are limited to the active volume — unless
+/// Entity/Bible mutations enable `studio.impact_scan_all_on_setting`.
+fn feature_bool(project_dir: &Path, key: &str, default: bool) -> bool {
+    let mut candidates = Vec::new();
+    if let Some(root) = crate::volume_audit_gate::find_config_root(project_dir) {
+        candidates.push(root.join("features.yaml"));
+    }
+    // Fallbacks for unusual layouts / cwd-based runs.
+    candidates.push(project_dir.join("../../config/features.yaml"));
+    candidates.push(project_dir.join("../config/features.yaml"));
+    candidates.push(Path::new("config/features.yaml").to_path_buf());
+    for path in candidates {
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            #[derive(Deserialize)]
+            struct FeaturesFile {
+                #[serde(default)]
+                features: HashMap<String, bool>,
+            }
+            if let Ok(file) = serde_yaml::from_str::<FeaturesFile>(&raw) {
+                return file.features.get(key).copied().unwrap_or(default);
+            }
+        }
+    }
+    default
+}
+
+fn impact_scan_all_drafts(project_dir: &Path) -> bool {
+    feature_bool(project_dir, "studio.impact_scan_all_drafts", false)
+}
+
+fn impact_scan_all_on_setting(project_dir: &Path) -> bool {
+    // Default false: prefer longform.yaml impact_scan_mode (indexed).
+    feature_bool(project_dir, "studio.impact_scan_all_on_setting", false)
+}
+
+fn impact_scan_mode(project_dir: &Path) -> ImpactScanMode {
+    if let Some(root) = crate::volume_audit_gate::find_config_root(project_dir) {
+        return novelx_harness::LongformConfig::load_from_config_root(&root).impact_scan_mode;
+    }
+    for path in [
+        project_dir.join("../../config/longform.yaml"),
+        project_dir.join("../config/longform.yaml"),
+        Path::new("config/longform.yaml").to_path_buf(),
+    ] {
+        if path.exists() {
+            return novelx_harness::LongformConfig::load(&path).impact_scan_mode;
+        }
+    }
+    ImpactScanMode::Indexed
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ImpactScanOpts {
+    /// Override volume vs all-drafts. None = feature/longform-driven.
+    pub scan_all_drafts: Option<bool>,
+    /// Override scan mode. None = longform.yaml / feature flags.
+    pub scan_mode: Option<ImpactScanMode>,
+}
+
+fn scan_drafts_respecting_volume_flag(
+    project_dir: &Path,
+    keys: &[String],
+    report: &mut ImpactReport,
+    source_kind: &ImpactSourceKind,
+    opts: &ImpactScanOpts,
+) {
+    // Explicit opt-in full scan via feature or opts.
+    let force_all = opts.scan_all_drafts.unwrap_or_else(|| {
+        if impact_scan_all_drafts(project_dir) {
+            return true;
+        }
+        matches!(
+            source_kind,
+            ImpactSourceKind::Entity | ImpactSourceKind::Bible
+        ) && impact_scan_all_on_setting(project_dir)
+    });
+    if force_all {
+        scan_drafts(project_dir, keys, report);
+        return;
+    }
+
+    let mode = opts.scan_mode.unwrap_or_else(|| impact_scan_mode(project_dir));
+    match mode {
+        ImpactScanMode::All => {
+            scan_drafts(project_dir, keys, report);
+        }
+        ImpactScanMode::Volume => {
+            let upto = load_project_state(project_dir)
+                .map(|s| s.published_count.max(s.next_chapter.saturating_sub(1)).max(1))
+                .unwrap_or_else(|_| list_chapter_numbers(project_dir).last().copied().unwrap_or(1));
+            if let Some(vol) = active_volume_for_chapter(project_dir, upto) {
+                scan_drafts_in_volume(project_dir, vol.volume_index, keys, report);
+            } else {
+                scan_drafts(project_dir, keys, report);
+            }
+        }
+        ImpactScanMode::Indexed => {
+            scan_drafts_indexed(project_dir, keys, report);
+        }
+    }
+}
+
+/// Active volume drafts + BM25/key-matched chapters elsewhere (longform default).
+fn scan_drafts_indexed(project_dir: &Path, keys: &[String], report: &mut ImpactReport) {
+    let upto = load_project_state(project_dir)
+        .map(|s| s.published_count.max(s.next_chapter.saturating_sub(1)).max(1))
+        .unwrap_or_else(|_| list_chapter_numbers(project_dir).last().copied().unwrap_or(1));
+    let mut scanned: HashSet<u32> = HashSet::new();
+    if let Some(vol) = active_volume_for_chapter(project_dir, upto) {
+        let before = report.hits.len();
+        scan_drafts_in_volume(project_dir, vol.volume_index, keys, report);
+        for h in report.hits.iter().skip(before) {
+            if let Some(ch) = h.chapter {
+                scanned.insert(ch);
+            }
+        }
+        // Also mark volume span as scanned even if no hits.
+        let chapters = list_chapter_numbers(project_dir);
+        let max_ch = chapters.iter().copied().max().unwrap_or(1);
+        let bounds = crate::volume::load_volume_bounds(project_dir);
+        if let Some(b) = crate::volume::bound_for_volume(&bounds, vol.volume_index) {
+            let (from, to) = crate::volume::volume_chapter_span(&b, max_ch);
+            for ch in from..=to {
+                scanned.insert(ch);
+            }
+        }
+    } else {
+        // No volume → fall back to recent window only; indexed recall adds more.
+        for ch in list_chapter_numbers(project_dir)
+            .into_iter()
+            .rev()
+            .take(40)
+        {
+            scanned.insert(ch);
+            scan_draft_chapter(project_dir, ch, keys, report);
+        }
+    }
+
+    let query = keys.join(" ");
+    let hits = crate::chapter_index::bm25_recall(project_dir, &query, keys, &[], 24);
+    for dig in hits {
+        if scanned.contains(&dig.chapter) {
+            continue;
+        }
+        scanned.insert(dig.chapter);
+        scan_draft_chapter(project_dir, dig.chapter, keys, report);
+    }
+}
 
 /// What was mutated (source of the cascade).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -308,6 +458,15 @@ fn normalize_ws(s: &str) -> String {
 
 /// Scan project artifacts for impact of `source`.
 pub fn scan_impact(project_dir: &Path, source: &ImpactSource) -> ImpactReport {
+    scan_impact_with_opts(project_dir, source, &ImpactScanOpts::default())
+}
+
+/// Like [`scan_impact`], with controllable draft-scan scope for longform.
+pub fn scan_impact_with_opts(
+    project_dir: &Path,
+    source: &ImpactSource,
+    opts: &ImpactScanOpts,
+) -> ImpactReport {
     let mut report = ImpactReport::default();
     report.entity_gaps_count = crate::cards::collect_entity_gaps(project_dir).len();
 
@@ -323,7 +482,13 @@ pub fn scan_impact(project_dir: &Path, source: &ImpactSource) -> ImpactReport {
 
     match source.kind {
         ImpactSourceKind::Entity | ImpactSourceKind::Bible => {
-            scan_drafts(project_dir, &keys, &mut report);
+            scan_drafts_respecting_volume_flag(
+                project_dir,
+                &keys,
+                &mut report,
+                &source.kind,
+                opts,
+            );
             scan_outlines(project_dir, &keys, &mut report, None);
             scan_arc_outlines(project_dir, &keys, &mut report, None);
             if source.kind == ImpactSourceKind::Bible {
@@ -916,6 +1081,70 @@ mod tests {
             phrases.iter().any(|p| p.contains("用完即毁") || p.contains("一次性")),
             "{phrases:?}"
         );
+    }
+
+    #[test]
+    fn indexed_mode_scans_active_and_recalled() {
+        let root = tmp_root("indexed");
+        fs::create_dir_all(root.join("chapters/001")).unwrap();
+        fs::create_dir_all(root.join("chapters/050")).unwrap();
+        fs::create_dir_all(root.join("lore")).unwrap();
+        fs::create_dir_all(root.join("artifacts/arc_outlines")).unwrap();
+        fs::write(
+            root.join("state.json"),
+            r#"{"name":"sample-novel","genre":"未定","target_chapters":900,"published_count":50,"next_chapter":51,"active_agents":[]}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("artifacts/arc_outlines/01.md"),
+            "# 卷一\n\n## 终止条件\n- 抵达落点\n- 目击异象\n",
+        )
+        .unwrap();
+        // Minimal story_outline so volume bounds exist for ch 50.
+        fs::write(
+            root.join("artifacts/story_outline.json"),
+            r#"{"acts":[{"volume_index":1,"start_chapter":1,"end_chapter":60,"name":"卷一"}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("chapters/001/draft.md"),
+            "主角带着旧令牌离开。\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("chapters/050/draft.md"),
+            "他想起旧令牌还在怀里。\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("lore/chapter_index.json"),
+            r#"{"version":1,"chapters":[{"chapter":1,"title":"","tokens":["旧令牌","主角"],"event_summary":"旧令牌出场","hook":"","fingerprint":""}]}"#,
+        )
+        .unwrap();
+        let source = ImpactSource {
+            kind: ImpactSourceKind::Entity,
+            id: "旧令牌".into(),
+            entity_kind: "item".into(),
+            chapter: None,
+            volume: None,
+            before_snippet: String::new(),
+            after_snippet: String::new(),
+            keys: vec!["旧令牌".into()],
+        };
+        let report = scan_impact_with_opts(
+            &root,
+            &source,
+            &ImpactScanOpts {
+                scan_all_drafts: Some(false),
+                scan_mode: Some(ImpactScanMode::Indexed),
+            },
+        );
+        assert!(
+            report.hits.iter().any(|h| h.chapter == Some(50)),
+            "active volume draft should hit: {:?}",
+            report.hits
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

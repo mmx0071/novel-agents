@@ -26,18 +26,38 @@ enum Commands {
         name: String,
         #[arg(long, default_value = "未定")]
         genre: String,
-        #[arg(long, default_value_t = 100)]
+        #[arg(long, default_value_t = 900)]
         chapters: u32,
     },
     /// Run chapter pipeline via Codex Session + SubAgent spawn chain
     Run {
         name: String,
+        /// Target chapter (ignored when --batch)
+        #[arg(default_value_t = 0)]
         chapter: u32,
         /// Revise existing draft (local patch preferred)
         #[arg(long)]
         revise: bool,
         #[arg(long)]
         instructions: Option<String>,
+        /// Unattended batch continue until a hard gate
+        #[arg(long)]
+        batch: bool,
+        /// Max chapters in --batch (default from longform.yaml)
+        #[arg(long)]
+        max_chapters: Option<u32>,
+        /// Stop after publishing this chapter (batch)
+        #[arg(long)]
+        until_chapter: Option<u32>,
+        /// Skip mid-volume audit soft gate (batch)
+        #[arg(long)]
+        skip_volume_audit: bool,
+        /// Skip expected-events review gate (batch)
+        #[arg(long)]
+        skip_expected: bool,
+        /// Disable one-shot auto length revise in batch
+        #[arg(long)]
+        no_auto_length_revise: bool,
     },
     /// Show project status
     Status { name: String },
@@ -84,14 +104,44 @@ async fn main() -> Result<()> {
             chapter,
             revise,
             instructions,
+            batch,
+            max_chapters,
+            until_chapter,
+            skip_volume_audit,
+            skip_expected,
+            no_auto_length_revise,
         } => {
             let llm_cfg = load_llm_config(&config.join("llm.yaml"))?;
             let llm = Arc::new(LlmClient::new(llm_cfg));
-            let core = novelx_core::NovelxCore::new(projects, config, llm);
-            let run = core
-                .run_chapter_headless(&name, chapter, revise, instructions)
+            if batch {
+                if revise {
+                    anyhow::bail!("--batch 与 --revise 不能同时使用");
+                }
+                let result = novelx_pipeline::run_continue_batch(
+                    &projects,
+                    &config,
+                    novelx_pipeline::BatchContinueOpts {
+                        project: name,
+                        max_chapters,
+                        until_chapter,
+                        confirm_skip_volume_audit: skip_volume_audit,
+                        confirm_skip_expected: skip_expected,
+                        auto_length_revise: !no_auto_length_revise,
+                    },
+                    llm,
+                )
                 .await?;
-            println!("{}", serde_json::to_string_pretty(&run)?);
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                if chapter == 0 {
+                    anyhow::bail!("请指定章号，或使用 --batch");
+                }
+                let core = novelx_core::NovelxCore::new(projects, config, llm);
+                let run = core
+                    .run_chapter_headless(&name, chapter, revise, instructions)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&run)?);
+            }
         }
         Commands::Status { name } => {
             let state = load_project_state(&projects.join(&name))?;

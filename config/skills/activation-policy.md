@@ -13,7 +13,7 @@ Harness 范式：`agents.yaml` 中的 `activation` 条件产生**建议**；本�
 | ID | 职责 |
 |----|------|
 | chapter_planner | 章纲 |
-| lore_librarian | Lore query（摘要后 assert 挂在 summarizer） |
+| lore_librarian | Lore **确定性** query（摘要后 assert 挂在 summarizer；非 LLM） |
 | writer | 正文 |
 | consistency_auditor | 一致性审计（FAIL 时阻断发布） |
 | pacing_reviewer | 节奏审查 |
@@ -64,11 +64,16 @@ chapter_planner → lore_librarian → writer
 | literary_editor | **非 MVP**。规则建议（近章审校失败率偏高）或 Studio `activate_agents`；用户点名润色时持久激活，勿每章必跑 |
 | master_planner / arc_planner | 尚无总纲/卷纲 |
 | expectation_reviewer | **不进章流水线**。由 Studio `review_expected_events` 在硬条件满足时调用；用户决策纳入/跳过 |
+| volume_auditor | **不进章流水线**。Studio `audit_volume` 摘要层复盘 + 建议深审章；深审再走 `audit_chapters` |
+
+共享短文：`prose-pitfalls`（正文硬雷区）、`content-formats`（落盘格式）、`volume-lifecycle`（卷相位/衔接章）由运行时按 Agent 白名单前缀注入；勿在各 SKILL 内复制长文。
 
 ## 人工门控
 
+细则以 `config/skills/studio.md` 为准。摘要：
+
 **仅当一致性审校未通过**（或基础设施失败重试、队列/卷审等系统已 `open_gate`）时，才出现审校决策卡。  
-内容审校失败时优先 **按 issue 决策**（Studio `offer_decisions`，或系统按 P0 兜底），不再固定「整章局部修订 / 接受」二元项。  
+内容审校失败时优先 **按 issue 决策**（Studio `offer_decisions`，或系统按 P0 兜底）。  
 **审校已通过**（即使报告有 P1/P2）**不弹**审校门控；用户要改走 `revise_chapter`。
 
 静态门控模板见 `config/gates.yaml`；动态审校选项由 pending_audit.decision_options 生成。`steer_run` 支持 `issue_ids`。

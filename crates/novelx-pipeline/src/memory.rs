@@ -13,10 +13,13 @@ pub const RECENT_DIGEST_LIMIT: usize = 12;
 pub const ROLLING_SUMMARY_LIMIT: usize = 2500;
 /// Cap open foreshadow threads in the hot list (overflow → archived_threads).
 pub const OPEN_THREAD_LIMIT: usize = 24;
-/// Cap archived (still-open) foreshadow threads kept for recall.
+/// Cap archived (still-open) foreshadow threads kept in `memory.json`
+/// (overflow → `lore/foreshadow_archive.jsonl`, never hard-dropped).
 pub const ARCHIVED_THREAD_LIMIT: usize = 120;
-/// Cap volume rollups retained in memory.
+/// Cap volume rollups retained in hot memory (overflow → archive jsonl).
 pub const VOLUME_ROLLUP_LIMIT: usize = 40;
+/// Cap entity timeline facts in hot memory (overflow → archive jsonl).
+pub const HOT_ENTITY_TIMELINE_LIMIT: usize = 200;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProjectMemory {
@@ -36,6 +39,9 @@ pub struct ProjectMemory {
     pub volume_rollups: Vec<VolumeRollup>,
     #[serde(default)]
     pub asserted_facts: Vec<AssertedFact>,
+    /// Per-entity timeline facts (status / holdings / injury / relation).
+    #[serde(default)]
+    pub entity_timeline: Vec<EntityTimelineFact>,
     /// Highest chapter covered by `recent_digests` / last apply_summary_json.
     #[serde(default)]
     pub last_chapter: u32,
@@ -99,6 +105,30 @@ pub struct AssertedFact {
     pub chapter: u32,
     #[serde(default)]
     pub source: String,
+    /// Optional entity this fact is about (longform timeline).
+    #[serde(default)]
+    pub entity: String,
+    /// 0.0–1.0; higher preferred when recall ties. Default 1.0 for back-compat.
+    #[serde(default = "default_fact_confidence")]
+    pub confidence: f32,
+}
+
+fn default_fact_confidence() -> f32 {
+    1.0
+}
+
+/// Structured per-entity continuity fact for long-horizon recall.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EntityTimelineFact {
+    pub entity: String,
+    /// character | item | location | unknown
+    #[serde(default)]
+    pub kind: String,
+    pub text: String,
+    pub chapter: u32,
+    /// status | holding | injury | ability | relation | fact
+    #[serde(default)]
+    pub predicate: String,
 }
 
 pub fn memory_path(project_dir: &Path) -> std::path::PathBuf {
@@ -269,69 +299,191 @@ pub fn apply_summary_json(project_dir: &Path, chapter: u32, summary_raw: &str) -
     // Drop stale flatten copy if older dumps stored last_chapter only in extra.
     mem.extra.remove("last_chapter");
 
-    // Foreshadow / threads from foreshadow_updates.
+    // Single-pass foreshadow_updates: resolve (hot/archived/cold) or bury with full dedup.
     if let Some(arr) = v.get("foreshadow_updates").and_then(|x| x.as_array()) {
+        let mut resolve_needles = Vec::new();
+        let mut bury_texts = Vec::new();
         for item in arr {
-            let text = if let Some(s) = item.as_str() {
-                s.to_string()
-            } else {
-                item.get("text")
-                    .or_else(|| item.get("update"))
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_string()
-            };
+            let text = foreshadow_update_text(item);
             if text.is_empty() {
                 continue;
             }
-            let resolved = text.contains("回收") || text.contains("已收");
-            if resolved {
-                if let Some(t) = mem.open_threads.iter_mut().find(|t| {
-                    t.status == "open"
-                        && text.contains(&t.text.chars().take(12).collect::<String>())
-                }) {
-                    t.status = "resolved".into();
-                    t.resolved_chapter = chapter;
-                }
-            } else if !mem.open_threads.iter().any(|t| t.text == text) {
-                mem.open_threads.push(OpenThread {
-                    id: format!("thr_{}", &Uuid::new_v4().simple().to_string()[..10]),
-                    text,
-                    status: "open".into(),
-                    planted_chapter: chapter,
-                    resolved_chapter: 0,
-                });
+            if text.contains("回收") || text.contains("已收") {
+                resolve_needles.push(text);
+            } else {
+                bury_texts.push(text);
             }
+        }
+        if !resolve_needles.is_empty() {
+            resolve_open_threads_in_memory(
+                project_dir,
+                &mut mem,
+                chapter,
+                &resolve_needles,
+            );
+            let _ = resolve_foreshadow_archive(project_dir, chapter, |t| {
+                resolve_needles
+                    .iter()
+                    .any(|n| foreshadow_text_matches(n, &t.text))
+            });
+        }
+        for text in bury_texts {
+            if foreshadow_already_known(project_dir, &mem, None, &text) {
+                continue;
+            }
+            mem.open_threads.push(OpenThread {
+                id: format!("thr_{}", &Uuid::new_v4().simple().to_string()[..10]),
+                text,
+                status: "open".into(),
+                planted_chapter: chapter,
+                resolved_chapter: 0,
+            });
         }
     }
 
-    prune_open_threads_into_archive(&mut mem);
-    // Resolve matches in archive too.
-    if let Some(arr) = v.get("foreshadow_updates").and_then(|x| x.as_array()) {
-        for item in arr {
-            let text = item.as_str().unwrap_or("").to_string();
-            if text.is_empty() || !(text.contains("回收") || text.contains("已收")) {
-                continue;
-            }
-            for t in mem.archived_threads.iter_mut() {
-                if t.status == "open"
-                    && text.contains(&t.text.chars().take(12).collect::<String>())
-                {
-                    t.status = "resolved".into();
-                    t.resolved_chapter = chapter;
-                }
-            }
-        }
-    }
+    let _ = prune_open_threads_into_archive(Some(project_dir), &mut mem);
+
+    // Entity timeline from body_state + new_facts (best-effort name attribution).
+    ingest_entity_timeline_from_summary(project_dir, &mut mem, chapter, &v, &key_facts);
 
     let fact_count = key_facts.len();
     save_memory(project_dir, &mem)?;
     let _ = crate::foreshadow::rebuild_foreshadow_index(project_dir);
+    // Keep chapter index in sync for BM25 recall (best-effort).
+    let _ = crate::chapter_index::upsert_chapter_summary(project_dir, chapter, summary_raw);
+    // SQLite acceleration layer (best-effort).
+    let digest: String = event.chars().take(120).collect();
+    let title = v
+        .get("title")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let _ = crate::lore_index::upsert_chapter_index_row(
+        project_dir,
+        chapter,
+        &title,
+        &digest,
+        true,
+    );
+    for t in mem.open_threads.iter().chain(mem.archived_threads.iter()) {
+        let kw: String = t.text.chars().take(40).collect();
+        let status = if t.status.is_empty() {
+            "open"
+        } else {
+            t.status.as_str()
+        };
+        let _ = crate::lore_index::upsert_foreshadow_index_row(
+            project_dir,
+            &t.id,
+            t.planted_chapter,
+            status,
+            &kw,
+        );
+    }
     Ok(fact_count)
 }
 
-/// Move oldest open threads into `archived_threads` instead of dropping them.
-pub fn prune_open_threads_into_archive(mem: &mut ProjectMemory) {
+fn foreshadow_update_text(item: &Value) -> String {
+    if let Some(s) = item.as_str() {
+        return s.to_string();
+    }
+    item.get("text")
+        .or_else(|| item.get("update"))
+        .or_else(|| item.get("description"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+pub fn foreshadow_text_matches(needle: &str, thread_text: &str) -> bool {
+    if needle.is_empty() || thread_text.is_empty() {
+        return false;
+    }
+    if needle.contains(thread_text) || thread_text.contains(needle) {
+        return true;
+    }
+    let prefix: String = thread_text.chars().take(12).collect();
+    !prefix.is_empty() && needle.contains(&prefix)
+}
+
+/// True if text/id already exists in hot, archived, or cold open foreshadows.
+pub fn foreshadow_already_known(
+    project_dir: &Path,
+    mem: &ProjectMemory,
+    id: Option<&str>,
+    text: &str,
+) -> bool {
+    let text = text.trim();
+    if text.is_empty() && id.unwrap_or("").is_empty() {
+        return false;
+    }
+    let in_mem = mem
+        .open_threads
+        .iter()
+        .chain(mem.archived_threads.iter())
+        .any(|t| {
+            if !(t.status == "open" || t.status.is_empty()) {
+                return false;
+            }
+            if let Some(id) = id {
+                if !id.is_empty() && t.id == id {
+                    return true;
+                }
+            }
+            !text.is_empty() && (t.text == text || foreshadow_text_matches(text, &t.text))
+        });
+    if in_mem {
+        return true;
+    }
+    load_foreshadow_archive(project_dir).iter().any(|t| {
+        if let Some(id) = id {
+            if !id.is_empty() && t.id == id {
+                return true;
+            }
+        }
+        !text.is_empty() && (t.text == text || foreshadow_text_matches(text, &t.text))
+    })
+}
+
+fn resolve_open_threads_in_memory(
+    project_dir: &Path,
+    mem: &mut ProjectMemory,
+    chapter: u32,
+    needles: &[String],
+) {
+    for t in mem
+        .open_threads
+        .iter_mut()
+        .chain(mem.archived_threads.iter_mut())
+    {
+        if !(t.status == "open" || t.status.is_empty()) {
+            continue;
+        }
+        if !needles
+            .iter()
+            .any(|n| foreshadow_text_matches(n, &t.text))
+        {
+            continue;
+        }
+        t.status = "resolved".into();
+        t.resolved_chapter = chapter;
+        let kw: String = t.text.chars().take(40).collect();
+        let _ = crate::lore_index::upsert_foreshadow_index_row(
+            project_dir,
+            &t.id,
+            t.planted_chapter,
+            "resolved",
+            &kw,
+        );
+    }
+}
+
+/// Move oldest open threads into `archived_threads`; spill archive overflow to jsonl
+/// (never hard-delete open foreshadows).
+pub fn prune_open_threads_into_archive(
+    project_dir: Option<&Path>,
+    mem: &mut ProjectMemory,
+) -> Result<()> {
     let mut open: Vec<_> = mem
         .open_threads
         .iter()
@@ -362,14 +514,156 @@ pub fn prune_open_threads_into_archive(mem: &mut ProjectMemory) {
     closed.extend(open);
     mem.open_threads = closed;
 
-    // Cap archive: keep newest open entries.
     mem.archived_threads
         .retain(|t| t.status == "open" || t.status.is_empty());
     if mem.archived_threads.len() > ARCHIVED_THREAD_LIMIT {
         mem.archived_threads.sort_by_key(|t| t.planted_chapter);
         let skip = mem.archived_threads.len() - ARCHIVED_THREAD_LIMIT;
-        mem.archived_threads = mem.archived_threads.split_off(skip);
+        // Without a project_dir we cannot spill — keep overflow in memory (never hard-drop).
+        if let Some(dir) = project_dir {
+            let spilled: Vec<OpenThread> = mem.archived_threads.drain(..skip).collect();
+            append_foreshadow_archive(dir, &spilled)?;
+            for t in &spilled {
+                let kw: String = t.text.chars().take(40).collect();
+                let _ = crate::lore_index::upsert_foreshadow_index_row(
+                    dir,
+                    &t.id,
+                    t.planted_chapter,
+                    "open",
+                    &kw,
+                );
+            }
+        }
     }
+    Ok(())
+}
+
+pub fn foreshadow_archive_path(project_dir: &Path) -> std::path::PathBuf {
+    project_dir.join("lore/foreshadow_archive.jsonl")
+}
+
+pub fn append_foreshadow_archive(project_dir: &Path, threads: &[OpenThread]) -> Result<()> {
+    if threads.is_empty() {
+        return Ok(());
+    }
+    let path = foreshadow_archive_path(project_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    for t in threads {
+        let line = serde_json::to_string(t).context("serialize foreshadow archive row")?;
+        writeln!(f, "{line}")?;
+    }
+    Ok(())
+}
+
+fn foreshadow_row_key(t: &OpenThread) -> String {
+    if t.id.is_empty() {
+        t.text.clone()
+    } else {
+        t.id.clone()
+    }
+}
+
+/// Load cold foreshadow rows (last write wins per id/text). Includes resolved.
+pub fn load_foreshadow_archive_rows(project_dir: &Path) -> Vec<OpenThread> {
+    let path = foreshadow_archive_path(project_dir);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let mut by_id: std::collections::HashMap<String, OpenThread> =
+        std::collections::HashMap::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(t) = serde_json::from_str::<OpenThread>(line) else {
+            continue;
+        };
+        by_id.insert(foreshadow_row_key(&t), t);
+    }
+    by_id.into_values().collect()
+}
+
+/// Open (still dangling) cold-archive foreshadows only.
+pub fn load_foreshadow_archive(project_dir: &Path) -> Vec<OpenThread> {
+    load_foreshadow_archive_rows(project_dir)
+        .into_iter()
+        .filter(|t| t.status == "open" || t.status.is_empty())
+        .collect()
+}
+
+/// Rewrite cold foreshadow archive (deduped rows).
+pub fn save_foreshadow_archive(project_dir: &Path, threads: &[OpenThread]) -> Result<()> {
+    let path = foreshadow_archive_path(project_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    use std::io::Write;
+    let mut f = std::fs::File::create(&path)
+        .with_context(|| format!("create {}", path.display()))?;
+    for t in threads {
+        let line = serde_json::to_string(t).context("serialize foreshadow archive row")?;
+        writeln!(f, "{line}")?;
+    }
+    Ok(())
+}
+
+/// Mark matching open cold-archive threads resolved and sync SQLite.
+pub fn resolve_foreshadow_archive(
+    project_dir: &Path,
+    chapter: u32,
+    mut matches: impl FnMut(&OpenThread) -> bool,
+) -> Result<usize> {
+    let mut rows = load_foreshadow_archive_rows(project_dir);
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let mut n = 0usize;
+    for t in &mut rows {
+        if (t.status == "open" || t.status.is_empty()) && matches(t) {
+            t.status = "resolved".into();
+            t.resolved_chapter = chapter;
+            n += 1;
+            let kw: String = t.text.chars().take(40).collect();
+            let _ = crate::lore_index::upsert_foreshadow_index_row(
+                project_dir,
+                &t.id,
+                t.planted_chapter,
+                "resolved",
+                &kw,
+            );
+        }
+    }
+    if n > 0 {
+        save_foreshadow_archive(project_dir, &rows)?;
+    }
+    Ok(n)
+}
+
+/// Sort key for longform: older planted threads rank higher (age boost).
+pub fn foreshadow_age_priority(a: &OpenThread, b: &OpenThread) -> std::cmp::Ordering {
+    a.planted_chapter
+        .cmp(&b.planted_chapter)
+        .then_with(|| a.id.cmp(&b.id))
+}
+
+/// Select dangling threads for prompts: oldest-first age boost, then fill remainder.
+pub fn select_dangling_age_boosted(threads: &[OpenThread], limit: usize) -> Vec<OpenThread> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut open: Vec<_> = threads
+        .iter()
+        .filter(|t| t.status == "open" || t.status.is_empty())
+        .cloned()
+        .collect();
+    open.sort_by(foreshadow_age_priority);
+    open.truncate(limit);
+    open
 }
 
 /// Human-gated: build + persist volume rollup and refresh foreshadow index.
@@ -435,6 +729,16 @@ pub fn format_volume_memory_preview(
         out.push_str("\n\n仍开放伏笔（Top）：\n");
         out.push_str(&dangling);
     }
+    let checklist = crate::volume_checklist::run_volume_memory_checklist(
+        project_dir,
+        volume_index,
+        start_chapter,
+        end_chapter,
+    );
+    if !checklist.items.is_empty() {
+        out.push_str("\n\n");
+        out.push_str(&checklist.summary_markdown());
+    }
     out
 }
 
@@ -447,10 +751,65 @@ pub fn upsert_volume_rollup(project_dir: &Path, rollup: VolumeRollup) -> Result<
     mem.volume_rollups.sort_by_key(|r| r.volume_index);
     if mem.volume_rollups.len() > VOLUME_ROLLUP_LIMIT {
         let skip = mem.volume_rollups.len() - VOLUME_ROLLUP_LIMIT;
-        mem.volume_rollups = mem.volume_rollups.split_off(skip);
+        let spilled: Vec<VolumeRollup> = mem.volume_rollups.drain(..skip).collect();
+        append_volume_rollups_archive(project_dir, &spilled)?;
     }
     save_memory(project_dir, &mem)?;
     Ok(())
+}
+
+pub fn volume_rollups_archive_path(project_dir: &Path) -> std::path::PathBuf {
+    project_dir.join("lore/volume_rollups_archive.jsonl")
+}
+
+pub fn append_volume_rollups_archive(project_dir: &Path, rolls: &[VolumeRollup]) -> Result<()> {
+    if rolls.is_empty() {
+        return Ok(());
+    }
+    let path = volume_rollups_archive_path(project_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    for r in rolls {
+        let line = serde_json::to_string(r).context("serialize volume rollup archive")?;
+        writeln!(f, "{line}")?;
+    }
+    Ok(())
+}
+
+pub fn load_volume_rollups_archive(project_dir: &Path) -> Vec<VolumeRollup> {
+    let path = volume_rollups_archive_path(project_dir);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let mut by_vol: std::collections::BTreeMap<u32, VolumeRollup> =
+        std::collections::BTreeMap::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        if let Ok(r) = serde_json::from_str::<VolumeRollup>(line) {
+            by_vol.insert(r.volume_index, r);
+        }
+    }
+    by_vol.into_values().collect()
+}
+
+/// Hot + archived volume rollups (dedup by volume_index; hot wins).
+pub fn load_all_volume_rollups(project_dir: &Path) -> Vec<VolumeRollup> {
+    let mem = load_memory(project_dir);
+    let mut by_vol: std::collections::BTreeMap<u32, VolumeRollup> =
+        std::collections::BTreeMap::new();
+    for r in load_volume_rollups_archive(project_dir) {
+        by_vol.insert(r.volume_index, r);
+    }
+    for r in mem.volume_rollups {
+        by_vol.insert(r.volume_index, r);
+    }
+    by_vol.into_values().collect()
 }
 
 /// Build a deterministic volume rollup from on-disk chapter summaries.
@@ -503,8 +862,18 @@ pub fn build_volume_rollup_from_summaries(
     }
 }
 
-/// Keyword-recall archived dangling threads (not in the hot open list).
+/// Keyword-recall archived dangling threads (hot archive + cold jsonl).
 pub fn recall_archived_threads(mem: &ProjectMemory, haystack: &str, limit: usize) -> Vec<OpenThread> {
+    recall_archived_threads_in(None, mem, haystack, limit)
+}
+
+/// Like [`recall_archived_threads`], also searching `foreshadow_archive.jsonl`.
+pub fn recall_archived_threads_in(
+    project_dir: Option<&Path>,
+    mem: &ProjectMemory,
+    haystack: &str,
+    limit: usize,
+) -> Vec<OpenThread> {
     if limit == 0 || haystack.trim().is_empty() {
         return Vec::new();
     }
@@ -517,8 +886,20 @@ pub fn recall_archived_threads(mem: &ProjectMemory, haystack: &str, limit: usize
         .iter()
         .map(|t| t.id.as_str())
         .collect();
-    let mut scored: Vec<(usize, &OpenThread)> = Vec::new();
-    for t in &mem.archived_threads {
+    let mut pool: Vec<OpenThread> = mem.archived_threads.clone();
+    if let Some(dir) = project_dir {
+        for t in load_foreshadow_archive(dir) {
+            if hot_ids.contains(t.id.as_str()) {
+                continue;
+            }
+            if pool.iter().any(|a| a.id == t.id || a.text == t.text) {
+                continue;
+            }
+            pool.push(t);
+        }
+    }
+    let mut scored: Vec<(usize, OpenThread)> = Vec::new();
+    for t in pool {
         if !(t.status == "open" || t.status.is_empty()) {
             continue;
         }
@@ -527,16 +908,101 @@ pub fn recall_archived_threads(mem: &ProjectMemory, haystack: &str, limit: usize
         }
         let blob = t.text.as_str();
         let score = tokens.iter().filter(|tok| blob.contains(tok.as_str())).count();
+        // Age boost: older planted lines win ties / get +1 after long dormancy.
+        let age_bonus = if t.planted_chapter > 0 { 1 } else { 0 };
         if score > 0 {
-            scored.push((score, t));
+            scored.push((score.saturating_add(age_bonus), t));
         }
     }
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.planted_chapter.cmp(&a.1.planted_chapter)));
-    scored
-        .into_iter()
-        .take(limit)
-        .map(|(_, t)| t.clone())
+    // Prefer higher keyword score, then older planted (longform debt first).
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then(a.1.planted_chapter.cmp(&b.1.planted_chapter))
+    });
+    scored.into_iter().take(limit).map(|(_, t)| t).collect()
+}
+
+/// Hot-zone cap for `asserted_facts` in `memory.json` (overflow → facts_archive.jsonl).
+pub const HOT_FACTS_LIMIT: usize = 400;
+
+pub fn facts_archive_path(project_dir: &Path) -> std::path::PathBuf {
+    project_dir.join("lore/facts_archive.jsonl")
+}
+
+/// Append facts to archive jsonl (one JSON object per line).
+pub fn append_facts_archive(project_dir: &Path, facts: &[AssertedFact]) -> Result<()> {
+    if facts.is_empty() {
+        return Ok(());
+    }
+    let path = facts_archive_path(project_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    for fact in facts {
+        let line = serde_json::to_string(fact).context("serialize archived fact")?;
+        writeln!(f, "{line}")?;
+    }
+    Ok(())
+}
+
+/// Read archived facts (best-effort; skips bad lines).
+pub fn load_facts_archive(project_dir: &Path) -> Vec<AssertedFact> {
+    let path = facts_archive_path(project_dir);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<AssertedFact>(l).ok())
         .collect()
+}
+
+/// Move oldest hot facts into archive so `asserted_facts.len() <= HOT_FACTS_LIMIT`.
+pub fn prune_asserted_facts_to_archive(project_dir: &Path, mem: &mut ProjectMemory) -> Result<()> {
+    if mem.asserted_facts.len() <= HOT_FACTS_LIMIT {
+        return Ok(());
+    }
+    let skip = mem.asserted_facts.len() - HOT_FACTS_LIMIT;
+    let overflow: Vec<AssertedFact> = mem.asserted_facts.drain(..skip).collect();
+    append_facts_archive(project_dir, &overflow)?;
+    Ok(())
+}
+
+fn score_fact(f: &AssertedFact, haystack: &str, roster_names: &[String]) -> usize {
+    let mut score = 0usize;
+    for name in roster_names {
+        if name.is_empty() {
+            continue;
+        }
+        if !f.entity.is_empty() && (f.entity == *name || f.entity.contains(name)) {
+            score += 5;
+        } else if f.text.contains(name) {
+            score += 3;
+        }
+    }
+    for tok in recall_tokens(haystack).into_iter().take(16) {
+        if f.text.contains(&tok) {
+            score += 1;
+        }
+    }
+    if score == 0 {
+        return 0;
+    }
+    // Confidence + light recency (only among already-relevant facts).
+    let conf = if f.confidence.is_finite() {
+        f.confidence.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    score = ((score as f32) * (0.5 + 0.5 * conf)).round() as usize;
+    score = score.saturating_add((f.chapter / 50) as usize); // +1 per 50 chapters
+    score.max(1)
 }
 
 /// Asserted facts whose text overlaps haystack / roster names.
@@ -546,31 +1012,63 @@ pub fn select_asserted_facts_for_context(
     roster_names: &[String],
     limit: usize,
 ) -> Vec<String> {
+    select_asserted_facts_for_context_in(None, mem, haystack, roster_names, limit)
+}
+
+/// Like [`select_asserted_facts_for_context`], also topping up from `facts_archive.jsonl`.
+pub fn select_asserted_facts_for_context_in(
+    project_dir: Option<&Path>,
+    mem: &ProjectMemory,
+    haystack: &str,
+    roster_names: &[String],
+    limit: usize,
+) -> Vec<String> {
     if limit == 0 {
         return Vec::new();
     }
-    let mut scored: Vec<(usize, &AssertedFact)> = Vec::new();
+    let mut scored: Vec<(usize, AssertedFact)> = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
     for f in &mem.asserted_facts {
-        let mut score = 0usize;
-        for name in roster_names {
-            if !name.is_empty() && f.text.contains(name) {
-                score += 3;
-            }
-        }
-        for tok in recall_tokens(haystack).into_iter().take(16) {
-            if f.text.contains(&tok) {
-                score += 1;
-            }
-        }
+        let score = score_fact(f, haystack, roster_names);
         if score > 0 {
-            scored.push((score, f));
+            seen_ids.insert(f.id.clone());
+            scored.push((score, f.clone()));
         }
     }
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.chapter.cmp(&a.1.chapter)));
+    if scored.len() < limit {
+        if let Some(dir) = project_dir {
+            for f in load_facts_archive(dir) {
+                if seen_ids.contains(&f.id) {
+                    continue;
+                }
+                let score = score_fact(&f, haystack, roster_names);
+                if score > 0 {
+                    seen_ids.insert(f.id.clone());
+                    scored.push((score, f));
+                }
+            }
+        }
+    }
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then(
+                b.1.confidence
+                    .partial_cmp(&a.1.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+            .then(b.1.chapter.cmp(&a.1.chapter))
+    });
     scored
         .into_iter()
         .take(limit)
-        .map(|(_, f)| format!("[第{}章] {}", f.chapter, truncate_chars(&f.text, 100)))
+        .map(|(_, f)| {
+            format!(
+                "[第{}章·c{:.1}] {}",
+                f.chapter,
+                f.confidence.clamp(0.0, 1.0),
+                truncate_chars(&f.text, 100)
+            )
+        })
         .collect()
 }
 
@@ -585,7 +1083,7 @@ pub fn recall_archived_summaries(
     recall_archived_summaries_with(project_dir, haystack, &[], exclude_chapters, limit)
 }
 
-/// Entity-name–driven recall: roster / outline names score higher than token overlap.
+/// Entity-name–driven recall: prefer BM25 chapter index; fall back to directory scan.
 pub fn recall_archived_summaries_with(
     project_dir: &Path,
     haystack: &str,
@@ -596,6 +1094,26 @@ pub fn recall_archived_summaries_with(
     if limit == 0 {
         return Vec::new();
     }
+    let indexed = crate::chapter_index::bm25_recall(
+        project_dir,
+        haystack,
+        entity_names,
+        exclude_chapters,
+        limit,
+    );
+    if !indexed.is_empty() {
+        return indexed;
+    }
+    recall_archived_summaries_scan(project_dir, haystack, entity_names, exclude_chapters, limit)
+}
+
+fn recall_archived_summaries_scan(
+    project_dir: &Path,
+    haystack: &str,
+    entity_names: &[String],
+    exclude_chapters: &[u32],
+    limit: usize,
+) -> Vec<ChapterDigest> {
     let chapters_dir = project_dir.join("chapters");
     let Ok(rd) = std::fs::read_dir(&chapters_dir) else {
         return Vec::new();
@@ -687,7 +1205,7 @@ pub fn recall_archived_summaries_with(
     scored.into_iter().take(limit).map(|(_, d)| d).collect()
 }
 
-fn recall_tokens(haystack: &str) -> Vec<String> {
+pub fn recall_tokens(haystack: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let push = |t: String, tokens: &mut Vec<String>| {
         let n = t.chars().count();
@@ -749,6 +1267,411 @@ fn recall_tokens(haystack: &str) -> Vec<String> {
     tokens.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()));
     tokens.truncate(48);
     tokens
+}
+
+pub fn entity_timeline_archive_path(project_dir: &Path) -> std::path::PathBuf {
+    project_dir.join("lore/entity_timeline.jsonl")
+}
+
+pub fn append_entity_timeline_archive(
+    project_dir: &Path,
+    facts: &[EntityTimelineFact],
+) -> Result<()> {
+    if facts.is_empty() {
+        return Ok(());
+    }
+    let path = entity_timeline_archive_path(project_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    for fact in facts {
+        let line = serde_json::to_string(fact).context("serialize entity timeline")?;
+        writeln!(f, "{line}")?;
+    }
+    Ok(())
+}
+
+pub fn load_entity_timeline_archive(project_dir: &Path) -> Vec<EntityTimelineFact> {
+    let path = entity_timeline_archive_path(project_dir);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<EntityTimelineFact>(l).ok())
+        .collect()
+}
+
+pub fn prune_entity_timeline_to_archive(
+    project_dir: &Path,
+    mem: &mut ProjectMemory,
+) -> Result<()> {
+    if mem.entity_timeline.len() <= HOT_ENTITY_TIMELINE_LIMIT {
+        return Ok(());
+    }
+    let skip = mem.entity_timeline.len() - HOT_ENTITY_TIMELINE_LIMIT;
+    let spilled: Vec<EntityTimelineFact> = mem.entity_timeline.drain(..skip).collect();
+    append_entity_timeline_archive(project_dir, &spilled)?;
+    Ok(())
+}
+
+fn push_entity_timeline(
+    mem: &mut ProjectMemory,
+    entity: &str,
+    kind: &str,
+    predicate: &str,
+    text: &str,
+    chapter: u32,
+) {
+    let entity = entity.trim();
+    let text = text.trim();
+    if entity.is_empty() || text.is_empty() {
+        return;
+    }
+    if mem.entity_timeline.iter().any(|f| {
+        f.entity == entity && f.text == text && f.chapter == chapter && f.predicate == predicate
+    }) {
+        return;
+    }
+    mem.entity_timeline.push(EntityTimelineFact {
+        entity: entity.to_string(),
+        kind: kind.to_string(),
+        text: text.to_string(),
+        chapter,
+        predicate: predicate.to_string(),
+    });
+}
+
+fn entity_roster_pairs(project_dir: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for group in ["characters", "items", "locations"] {
+        let folder = project_dir.join("entities").join(group);
+        for card in crate::cards::load_markdown_cards(&folder, group) {
+            let name = if card.name.trim().is_empty() {
+                card.slug.clone()
+            } else {
+                card.name.clone()
+            };
+            if !name.trim().is_empty() {
+                out.push((group.trim_end_matches('s').to_string(), name.clone()));
+            }
+            if !card.slug.is_empty() && card.slug != name {
+                out.push((group.trim_end_matches('s').to_string(), card.slug));
+            }
+        }
+    }
+    // Prefer longer names first for matching.
+    out.sort_by(|a, b| b.1.chars().count().cmp(&a.1.chars().count()));
+    out
+}
+
+fn ingest_entity_timeline_from_summary(
+    project_dir: &Path,
+    mem: &mut ProjectMemory,
+    chapter: u32,
+    v: &Value,
+    key_facts: &[String],
+) {
+    let roster = entity_roster_pairs(project_dir);
+    let match_entity = |blob: &str| -> Option<(String, String)> {
+        for (kind, name) in &roster {
+            if !name.is_empty() && blob.contains(name.as_str()) {
+                return Some((kind.clone(), name.clone()));
+            }
+        }
+        // Fallback: 「甲：…」 style prefixes (reject meta labels).
+        if let Some((head, _)) = blob.split_once('：') {
+            let head = head.trim();
+            if (2..=12).contains(&head.chars().count())
+                && !matches!(
+                    head,
+                    "伤势" | "能力位置" | "持有" | "状态" | "关系" | "事实" | "备注" | "摘要"
+                )
+            {
+                return Some(("unknown".into(), head.to_string()));
+            }
+        }
+        None
+    };
+
+    if let Some(bs) = v.get("body_state") {
+        if let Some(arr) = bs.get("injuries").and_then(|x| x.as_array()) {
+            for item in arr {
+                let Some(s) = item.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+                    continue;
+                };
+                // Genre-neutral: skip unattributed body_state lines.
+                let Some((kind, entity)) = match_entity(s) else {
+                    continue;
+                };
+                push_entity_timeline(mem, &entity, &kind, "injury", s, chapter);
+            }
+        }
+        if let Some(arr) = bs.get("ability_loci").and_then(|x| x.as_array()) {
+            for item in arr {
+                let Some(s) = item.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+                    continue;
+                };
+                let Some((kind, entity)) = match_entity(s) else {
+                    continue;
+                };
+                push_entity_timeline(mem, &entity, &kind, "ability", s, chapter);
+            }
+        }
+    }
+
+    for fact in key_facts {
+        let Some((kind, entity)) = match_entity(fact) else {
+            continue;
+        };
+        let predicate = if fact.contains("持有") || fact.contains("失去") {
+            "holding"
+        } else if fact.contains("伤") {
+            "injury"
+        } else if fact.contains("关系") || fact.contains("敌对") || fact.contains("结盟") {
+            "relation"
+        } else {
+            "fact"
+        };
+        push_entity_timeline(mem, &entity, &kind, predicate, fact, chapter);
+    }
+
+    let _ = prune_entity_timeline_to_archive(project_dir, mem);
+}
+
+/// Select entity timeline lines for CanonContext (hot + cold archive).
+pub fn select_entity_timeline_for_context(
+    project_dir: &Path,
+    mem: &ProjectMemory,
+    entity_names: &[String],
+    limit: usize,
+) -> Vec<String> {
+    if limit == 0 || entity_names.is_empty() {
+        return Vec::new();
+    }
+    // Allow single CJK name chars (e.g. 「甲」); keep ASCII min length 2.
+    let names: Vec<&str> = entity_names
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| {
+            let n = s.chars().count();
+            n >= 2 || (n == 1 && s.chars().next().is_some_and(|c| !c.is_ascii()))
+        })
+        .collect();
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let mut pool = mem.entity_timeline.clone();
+    for f in load_entity_timeline_archive(project_dir) {
+        if pool.iter().any(|p| {
+            p.entity == f.entity && p.text == f.text && p.chapter == f.chapter
+        }) {
+            continue;
+        }
+        pool.push(f);
+    }
+    let mut scored: Vec<(usize, EntityTimelineFact)> = Vec::new();
+    for f in pool {
+        let mut score = 0usize;
+        for n in &names {
+            if f.entity.contains(n) || f.text.contains(n) {
+                score += 3;
+            }
+        }
+        if score == 0 {
+            continue;
+        }
+        // Prefer newer facts for the same entity, but keep older ones if room.
+        score += f.chapter.min(50) as usize / 10;
+        scored.push((score, f));
+    }
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then(b.1.chapter.cmp(&a.1.chapter))
+    });
+    // Cap per entity so one character doesn't fill the whole budget.
+    let mut per_entity: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut out = Vec::new();
+    for (_, f) in scored {
+        let n = per_entity.entry(f.entity.clone()).or_insert(0);
+        if *n >= 3 {
+            continue;
+        }
+        *n += 1;
+        out.push(format!(
+            "[{}/{}·第{}章] {}",
+            f.entity,
+            if f.predicate.is_empty() {
+                "fact"
+            } else {
+                f.predicate.as_str()
+            },
+            f.chapter,
+            truncate_chars(&f.text, 90)
+        ));
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
+}
+
+/// Longform health snapshot: foreshadow debt + volume ops (for Studio / Web).
+pub fn longform_health_snapshot(project_dir: &Path) -> Value {
+    let mem = load_memory(project_dir);
+    let idx = crate::foreshadow::load_foreshadow_index(project_dir);
+    let cold = load_foreshadow_archive(project_dir);
+    let open_hot = mem
+        .open_threads
+        .iter()
+        .filter(|t| t.status == "open" || t.status.is_empty())
+        .count();
+    let open_archived = mem
+        .archived_threads
+        .iter()
+        .filter(|t| t.status == "open" || t.status.is_empty())
+        .count();
+    let open_cold = cold.len();
+    // Index is authoritative after rebuild (hot + archived + open cold, deduped).
+    let dangling_total = idx.dangling.len();
+    let mut oldest = idx.dangling.clone();
+    oldest.sort_by(foreshadow_age_priority);
+    let oldest_lines: Vec<Value> = oldest
+        .iter()
+        .take(8)
+        .map(|t| {
+            serde_json::json!({
+                "id": t.id,
+                "text": truncate_chars(&t.text, 80),
+                "planted_chapter": t.planted_chapter,
+            })
+        })
+        .collect();
+    let rolls = load_all_volume_rollups(project_dir);
+    let state = crate::project::load_project_state(project_dir).ok();
+    let published = state.as_ref().map(|s| s.published_count).unwrap_or(0);
+    let vol = crate::volume::active_volume_for_chapter(project_dir, published.max(1));
+    let mid_threshold = crate::volume_audit_gate::mid_audit_threshold_resolved(project_dir);
+    let thick_threshold = crate::volume_audit_gate::thick_volume_threshold_resolved(project_dir);
+    let (vol_idx, vol_chapters) = if let Some(ref v) = vol {
+        let (from, to) = crate::volume::volume_chapter_span(v, published.max(1));
+        let mut n = 0u32;
+        if from <= to {
+            for ch in from..=to {
+                let dir = project_dir.join("chapters").join(format!("{ch:03}"));
+                if dir.join("summary.json").exists()
+                    || dir.join("draft.md").exists()
+                    || dir.join("draft.md.gz").exists()
+                {
+                    n += 1;
+                }
+            }
+        }
+        (v.volume_index, n)
+    } else {
+        (0u32, 0u32)
+    };
+    let has_audit = vol
+        .as_ref()
+        .map(|v| crate::volume_audit::volume_has_audit_report(project_dir, v.volume_index))
+        .unwrap_or(false);
+    let thick_warning = vol_chapters > thick_threshold;
+    let soft_short_streak = state
+        .as_ref()
+        .map(|s| novelx_harness::consecutive_soft_short_from_meta(&s.meta))
+        .unwrap_or(0);
+    let target_chapters = state.as_ref().map(|s| s.target_chapters).unwrap_or(900);
+    let word_budget = novelx_harness::ChapterBudget::default();
+    // Rough progress: published × midpoint target vs target_chapters × midpoint.
+    let target_mid = ((word_budget.word_min + word_budget.word_max) / 2) as u64;
+    let est_chars = published as u64 * target_mid;
+    let target_chars = target_chapters as u64 * target_mid;
+    // Recent SoftShort rate from last 50 chapter dirs (body length vs soft min).
+    let mut recent_soft = 0u32;
+    let mut recent_ok = 0u32;
+    let mut recent_hard = 0u32;
+    let sample_from = published.saturating_sub(49).max(1);
+    if published >= 1 {
+        for ch in sample_from..=published {
+            let Some(draft) = crate::project::read_chapter_draft(project_dir, ch)
+                .or_else(|| crate::cold_archive::read_chapter_draft_resolved(project_dir, ch))
+            else {
+                continue;
+            };
+            let n = crate::schemas::draft_body_chars(&draft);
+            match word_budget.assess_body_chars(n) {
+                novelx_harness::LengthAssessment::HardShort => recent_hard += 1,
+                novelx_harness::LengthAssessment::SoftShort => recent_soft += 1,
+                novelx_harness::LengthAssessment::Ok => recent_ok += 1,
+            }
+        }
+    }
+    let recent_n = recent_soft + recent_ok + recent_hard;
+    let soft_short_rate = if recent_n == 0 {
+        0.0
+    } else {
+        recent_soft as f64 / recent_n as f64
+    };
+    let drift_samples = count_jsonl_lines(&project_dir.join("lore/drift_samples.jsonl"));
+    let lf = crate::volume_audit_gate::find_config_root(project_dir)
+        .map(|r| novelx_harness::LongformConfig::load_from_config_root(&r))
+        .unwrap_or_default();
+    serde_json::json!({
+        "foreshadow": {
+            "open_hot": open_hot,
+            "open_archived": open_archived,
+            "open_cold": open_cold,
+            "dangling_total": dangling_total,
+            "oldest": oldest_lines,
+        },
+        "volume": {
+            "active_index": vol_idx,
+            "chapters_in_volume": vol_chapters,
+            "mid_audit_threshold": mid_threshold,
+            "thick_volume_threshold": thick_threshold,
+            "has_audit_report": has_audit,
+            "thick_volume_warning": thick_warning,
+            "rollup_hot": mem.volume_rollups.len(),
+            "rollup_total": rolls.len(),
+        },
+        "length": {
+            "word_min": word_budget.word_min,
+            "word_max": word_budget.word_max,
+            "word_hard_min": word_budget.word_hard_min,
+            "consecutive_soft_short": soft_short_streak,
+            "recent_sampled": recent_n,
+            "recent_soft_short": recent_soft,
+            "recent_hard_short": recent_hard,
+            "recent_ok": recent_ok,
+            "soft_short_rate": soft_short_rate,
+            "est_chars": est_chars,
+            "target_chars": target_chars,
+            "target_chapters": target_chapters,
+        },
+        "longform": {
+            "quality_tier": lf.quality_tier.as_str(),
+            "audit_tier": lf.audit_tier.as_str(),
+            "impact_scan_mode": lf.impact_scan_mode.as_str(),
+            "batch_max_chapters": lf.batch_max_chapters,
+            "drift_samples": drift_samples,
+        },
+        "entity_timeline_hot": mem.entity_timeline.len(),
+        "published_count": published,
+    })
+}
+
+fn count_jsonl_lines(path: &Path) -> usize {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return 0;
+    };
+    text.lines().filter(|l| !l.trim().is_empty()).count()
 }
 
 fn extract_summary_value(raw: &str) -> Value {
@@ -899,7 +1822,7 @@ mod tests {
                 resolved_chapter: 0,
             });
         }
-        prune_open_threads_into_archive(&mut mem);
+        prune_open_threads_into_archive(None, &mut mem).unwrap();
         let open_n = mem
             .open_threads
             .iter()
@@ -916,6 +1839,173 @@ mod tests {
         );
         let recalled = recall_archived_threads(&mem, "矿井 线索", 5);
         assert!(!recalled.is_empty());
+    }
+
+    #[test]
+    fn foreshadow_cold_archive_can_resolve() {
+        let dir = std::env::temp_dir().join(format!(
+            "novelx-fs-resolve-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("lore")).unwrap();
+        append_foreshadow_archive(
+            &dir,
+            &[OpenThread {
+                id: "cold_old".into(),
+                text: "远古驿站密信尚未揭开".into(),
+                status: "open".into(),
+                planted_chapter: 2,
+                resolved_chapter: 0,
+            }],
+        )
+        .unwrap();
+        let n = resolve_foreshadow_archive(&dir, 90, |t| t.id == "cold_old").unwrap();
+        assert_eq!(n, 1);
+        let open = load_foreshadow_archive(&dir);
+        assert!(open.is_empty(), "resolved cold thread must leave open list");
+        let rows = load_foreshadow_archive_rows(&dir);
+        assert!(
+            rows.iter()
+                .any(|t| t.id == "cold_old" && t.status == "resolved"),
+            "resolved row must remain on disk: {rows:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn foreshadow_cold_archive_never_hard_drops() {
+        let dir = std::env::temp_dir().join(format!(
+            "novelx-fs-cold-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("lore")).unwrap();
+        let mut mem = ProjectMemory::default();
+        for i in 1..=(ARCHIVED_THREAD_LIMIT as u32 + OPEN_THREAD_LIMIT as u32 + 5) {
+            mem.open_threads.push(OpenThread {
+                id: format!("t{i}"),
+                text: format!("长线伏笔{i}驿站密信"),
+                status: "open".into(),
+                planted_chapter: i,
+                resolved_chapter: 0,
+            });
+        }
+        prune_open_threads_into_archive(Some(&dir), &mut mem).unwrap();
+        assert!(mem.archived_threads.len() <= ARCHIVED_THREAD_LIMIT);
+        let cold = load_foreshadow_archive(&dir);
+        assert!(
+            !cold.is_empty(),
+            "overflow must spill to foreshadow_archive.jsonl"
+        );
+        assert!(
+            cold.iter().any(|t| t.text.contains("伏笔1")),
+            "oldest line must survive in cold archive"
+        );
+        let recalled = recall_archived_threads_in(Some(&dir), &mem, "驿站 密信", 8);
+        assert!(
+            recalled.iter().any(|t| t.text.contains("伏笔1") || t.text.contains("密信")),
+            "cold archive must be recallable: {recalled:?}"
+        );
+        let boosted = select_dangling_age_boosted(
+            &mem
+                .open_threads
+                .iter()
+                .chain(mem.archived_threads.iter())
+                .chain(cold.iter())
+                .cloned()
+                .collect::<Vec<_>>(),
+            5,
+        );
+        assert!(
+            boosted.first().map(|t| t.planted_chapter).unwrap_or(999) <= 5,
+            "age boost must prefer oldest: {boosted:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn entity_timeline_ingest_and_select() {
+        let dir = std::env::temp_dir().join(format!(
+            "novelx-entity-tl-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("entities/characters")).unwrap();
+        fs::create_dir_all(dir.join("lore")).unwrap();
+        fs::write(
+            dir.join("entities/characters/甲.md"),
+            "---\nname: 甲\ncomplete: true\n---\n简介\n",
+        )
+        .unwrap();
+        let summary = r#"{
+            "event_summary": "甲负伤撤退。",
+            "ending_hook": "远处有火光。",
+            "new_facts": ["甲持有旧钥"],
+            "body_state": {"injuries": ["甲左臂骨裂"], "ability_loci": ["无关无主条目"]}
+        }"#;
+        apply_summary_json(&dir, 3, summary).unwrap();
+        let mem = load_memory(&dir);
+        assert!(
+            mem.entity_timeline.iter().any(|f| f.entity.contains("甲")),
+            "timeline should capture entity: {:?}",
+            mem.entity_timeline
+        );
+        assert!(
+            !mem.entity_timeline
+                .iter()
+                .any(|f| f.text.contains("无关无主")),
+            "unattributed body_state must be skipped: {:?}",
+            mem.entity_timeline
+        );
+        let lines = select_entity_timeline_for_context(&dir, &mem, &["甲".into()], 6);
+        assert!(
+            lines.iter().any(|s| s.contains("甲")),
+            "context select should surface timeline: {lines:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bury_skips_cold_archive_duplicates() {
+        let dir = std::env::temp_dir().join(format!(
+            "novelx-bury-dedup-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("lore")).unwrap();
+        append_foreshadow_archive(
+            &dir,
+            &[OpenThread {
+                id: "cold_dup".into(),
+                text: "矿井下仍有回声".into(),
+                status: "open".into(),
+                planted_chapter: 4,
+                resolved_chapter: 0,
+            }],
+        )
+        .unwrap();
+        let mem = ProjectMemory::default();
+        assert!(foreshadow_already_known(
+            &dir,
+            &mem,
+            None,
+            "矿井下仍有回声"
+        ));
+        let summary = r#"{
+            "event_summary": "继续追查。",
+            "ending_hook": "风起。",
+            "new_facts": [],
+            "foreshadow_updates": ["矿井下仍有回声"]
+        }"#;
+        apply_summary_json(&dir, 10, summary).unwrap();
+        let mem = load_memory(&dir);
+        assert!(
+            !mem.open_threads.iter().any(|t| t.text.contains("矿井")),
+            "must not re-bury cold open thread into hot list: {:?}",
+            mem.open_threads
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -940,6 +2030,48 @@ mod tests {
         upsert_volume_rollup(&dir, rollup).unwrap();
         let mem = load_memory(&dir);
         assert_eq!(mem.volume_rollups.len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn facts_overflow_archives_and_recalls() {
+        let dir = std::env::temp_dir().join("novelx-facts-archive");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("lore")).unwrap();
+        let mut mem = ProjectMemory {
+            version: 1,
+            ..Default::default()
+        };
+        for i in 0..(HOT_FACTS_LIMIT + 5) {
+            mem.asserted_facts.push(AssertedFact {
+                id: format!("fact_{i}"),
+                text: if i < 5 {
+                    format!("旧事实{i}：主角曾路过驿站")
+                } else {
+                    format!("新事实{i}：无关条目填充")
+                },
+                chapter: (i as u32) + 1,
+                source: "test".into(),
+                entity: if i < 5 { "主角".into() } else { String::new() },
+                confidence: 1.0,
+            });
+        }
+        prune_asserted_facts_to_archive(&dir, &mut mem).unwrap();
+        assert_eq!(mem.asserted_facts.len(), HOT_FACTS_LIMIT);
+        let archived = load_facts_archive(&dir);
+        assert_eq!(archived.len(), 5);
+        save_memory(&dir, &mem).unwrap();
+        let picked = select_asserted_facts_for_context_in(
+            Some(&dir),
+            &mem,
+            "主角 驿站",
+            &["主角".into()],
+            3,
+        );
+        assert!(
+            picked.iter().any(|s| s.contains("驿站")),
+            "archive recall should surface old facts: {picked:?}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -5,11 +5,16 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::SystemTime;
 
+use crate::longform::QualityTier;
 use crate::PipelineConfig;
 
 #[derive(Debug, Clone, Default)]
 pub struct ActivationSignals {
     pub published_count: u32,
+    /// Chapters written in the current volume/arc (not whole-book published_count).
+    pub chapters_in_current_arc: u32,
+    /// Chapter being planned/written (for lean foreshadow cadence).
+    pub chapter: u32,
     pub entity_count: usize,
     pub open_foreshadows: usize,
     pub draft_chars: usize,
@@ -23,6 +28,8 @@ pub struct ActivationSignals {
     pub has_new_entity_hints: bool,
     pub audit_fail_rate: f64,
     pub bible_stale: bool,
+    /// Volume phase is handoff / awaiting sync (long-range QA hint).
+    pub volume_handoff: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,7 +103,12 @@ fn condition_matches(rule: &ActivationRule, s: &ActivationSignals) -> bool {
         "no_nomenclature" => !s.has_nomenclature,
         "entity_count_gt" => (s.entity_count as f64) > thr,
         "chapter_count_gt" => (s.published_count as f64) > thr,
-        "chapters_in_arc_gt" => (s.published_count as f64) > thr,
+        "chapters_in_arc_gt" => (s.chapters_in_current_arc as f64) > thr,
+        "chapter_mod_eq" => {
+            let m = thr as u32;
+            m > 0 && s.chapter > 0 && s.chapter % m == 0
+        }
+        "volume_handoff" => s.volume_handoff,
         "active_foreshadows_gt" => (s.open_foreshadows as f64) > thr,
         "word_count_gt" => (s.draft_chars as f64) > thr,
         "dialogue_ratio_gt" => s.dialogue_ratio > thr,
@@ -124,6 +136,33 @@ pub fn resolve_pipeline_agents(
     pipe: &PipelineConfig,
     suggestions: &[ActivationSuggestion],
 ) -> Vec<String> {
+    resolve_pipeline_agents_filtered(base_active, pipe, suggestions, None)
+}
+
+/// Like [`resolve_pipeline_agents`], with optional longform lean filtering.
+///
+/// Lean may drop activation **suggestions** (and foreshadow cadence), but never
+/// removes agents that are already in `base_active` (user/Studio persistence).
+///
+/// `tier` refines lean aggressiveness (`economy` > `balanced` > `quality`=no lean).
+pub fn resolve_pipeline_agents_filtered(
+    base_active: &[String],
+    pipe: &PipelineConfig,
+    suggestions: &[ActivationSuggestion],
+    lean: Option<&ActivationSignals>,
+) -> Vec<String> {
+    resolve_pipeline_agents_with_tier(base_active, pipe, suggestions, lean, QualityTier::Balanced)
+}
+
+/// Resolve pipeline agents with an explicit [`QualityTier`].
+pub fn resolve_pipeline_agents_with_tier(
+    base_active: &[String],
+    pipe: &PipelineConfig,
+    suggestions: &[ActivationSuggestion],
+    lean: Option<&ActivationSignals>,
+    tier: QualityTier,
+) -> Vec<String> {
+    let pinned: HashSet<String> = base_active.iter().cloned().collect();
     let mut set: HashSet<String> = HashSet::new();
     for a in pipe.mvp() {
         set.insert(a.clone());
@@ -134,6 +173,65 @@ pub fn resolve_pipeline_agents(
     for s in suggestions {
         if pipe.is_pipeline_agent(&s.agent) {
             set.insert(s.agent.clone());
+        }
+    }
+    // quality: keep all suggestions; no lean stripping.
+    if matches!(tier, QualityTier::Quality) {
+        return pipe
+            .order()
+            .iter()
+            .filter(|a| set.contains(*a))
+            .cloned()
+            .collect();
+    }
+    if let Some(sig) = lean {
+        let economy = matches!(tier, QualityTier::Economy);
+        // economy: foreshadow only on even chapters when no open threads.
+        // balanced: never drop foreshadow when open threads remain; otherwise even cadence.
+        let drop_foreshadow = if economy {
+            sig.published_count >= 3
+                && sig.open_foreshadows == 0
+                && sig.chapter > 0
+                && sig.chapter % 2 != 0
+                && !pinned.contains("foreshadow_tracker")
+        } else {
+            // balanced
+            sig.published_count >= 3
+                && sig.open_foreshadows == 0
+                && sig.chapter > 0
+                && sig.chapter % 2 != 0
+                && !pinned.contains("foreshadow_tracker")
+        };
+        if drop_foreshadow {
+            set.remove("foreshadow_tracker");
+        }
+        // Dialogue/scene: only drop suggestion-only agents when we have evidence.
+        // Empty draft at plan-time must NOT strip specialists (continue_writing path).
+        let dialogue_heavy = sig.dialogue_ratio > 0.22 || sig.speaking_characters >= 3;
+        let has_draft_signal = sig.draft_chars >= 200;
+        if has_draft_signal && !dialogue_heavy && !pinned.contains("dialogue_specialist") {
+            set.remove("dialogue_specialist");
+        }
+        let scene_heavy = sig.scene_tags.iter().any(|t| {
+            let t = t.to_lowercase();
+            t.contains("战斗")
+                || t.contains("动作")
+                || t.contains("battle")
+                || t.contains("action")
+                || t.contains("chase")
+                || t.contains("高潮")
+        });
+        // Only skip scene when tags are present and clearly non-action; unknown → keep.
+        // economy: also drop literary_editor suggestion-only.
+        if !sig.scene_tags.is_empty() && !scene_heavy && !pinned.contains("scene_specialist") {
+            set.remove("scene_specialist");
+        }
+        if economy && !pinned.contains("literary_editor") {
+            set.remove("literary_editor");
+        }
+        if economy && !pinned.contains("nomenclature_curator") && sig.published_count >= 5 {
+            // After early chapters, skip nomenclature unless pinned.
+            set.remove("nomenclature_curator");
         }
     }
     pipe.order()
@@ -184,6 +282,8 @@ pub fn collect_signals(
 
     ActivationSignals {
         published_count,
+        chapters_in_current_arc: 0,
+        chapter: 0,
         entity_count,
         open_foreshadows: count_open_threads(project_dir),
         draft_chars: draft.chars().count(),
@@ -197,6 +297,7 @@ pub fn collect_signals(
         has_new_entity_hints,
         audit_fail_rate,
         bible_stale,
+        volume_handoff: false,
     }
 }
 
@@ -442,5 +543,116 @@ mod tests {
         let (r, n) = dialogue_stats("张三：「你好。」李四站着。");
         assert!(r > 0.0);
         assert!(n >= 1);
+    }
+
+    #[test]
+    fn chapters_in_arc_uses_arc_field_not_published() {
+        let rule = ActivationRule {
+            condition: "chapters_in_arc_gt".into(),
+            threshold: Some(8.0),
+            tags: vec![],
+            reason: "arc".into(),
+        };
+        let mut s = ActivationSignals {
+            published_count: 100,
+            chapters_in_current_arc: 3,
+            ..Default::default()
+        };
+        assert!(!condition_matches(&rule, &s));
+        s.chapters_in_current_arc = 9;
+        assert!(condition_matches(&rule, &s));
+    }
+
+    #[test]
+    fn lean_drops_foreshadow_on_odd_without_open() {
+        let pipe = PipelineConfig::defaults();
+        let suggestions = vec![ActivationSuggestion {
+            agent: "foreshadow_tracker".into(),
+            reason: "ch3+".into(),
+        }];
+        let sig = ActivationSignals {
+            published_count: 5,
+            chapter: 5,
+            open_foreshadows: 0,
+            ..Default::default()
+        };
+        let got = resolve_pipeline_agents_filtered(&[], &pipe, &suggestions, Some(&sig));
+        assert!(!got.iter().any(|a| a == "foreshadow_tracker"));
+        let sig2 = ActivationSignals {
+            published_count: 5,
+            chapter: 6,
+            open_foreshadows: 0,
+            ..Default::default()
+        };
+        let got2 = resolve_pipeline_agents_filtered(&[], &pipe, &suggestions, Some(&sig2));
+        assert!(got2.iter().any(|a| a == "foreshadow_tracker"));
+        let sig3 = ActivationSignals {
+            published_count: 5,
+            chapter: 5,
+            open_foreshadows: 2,
+            ..Default::default()
+        };
+        let got3 = resolve_pipeline_agents_filtered(&[], &pipe, &suggestions, Some(&sig3));
+        assert!(got3.iter().any(|a| a == "foreshadow_tracker"));
+    }
+
+    #[test]
+    fn lean_skips_dialogue_and_scene_when_not_tagged() {
+        let pipe = PipelineConfig::defaults();
+        let suggestions = vec![
+            ActivationSuggestion {
+                agent: "dialogue_specialist".into(),
+                reason: "dialog".into(),
+            },
+            ActivationSuggestion {
+                agent: "scene_specialist".into(),
+                reason: "scene".into(),
+            },
+        ];
+        // Empty draft at plan-time: keep dialogue suggestion (unknown until written).
+        let empty_draft = ActivationSignals {
+            published_count: 10,
+            chapter: 10,
+            draft_chars: 0,
+            dialogue_ratio: 0.0,
+            speaking_characters: 0,
+            scene_tags: vec![],
+            ..Default::default()
+        };
+        let got0 = resolve_pipeline_agents_filtered(&[], &pipe, &suggestions, Some(&empty_draft));
+        assert!(got0.iter().any(|a| a == "dialogue_specialist"));
+        // Quiet chapter with real draft + non-action tags → drop both.
+        let quiet = ActivationSignals {
+            published_count: 10,
+            chapter: 10,
+            draft_chars: 800,
+            dialogue_ratio: 0.05,
+            speaking_characters: 0,
+            scene_tags: vec!["日常".into()],
+            ..Default::default()
+        };
+        let got = resolve_pipeline_agents_filtered(&[], &pipe, &suggestions, Some(&quiet));
+        assert!(!got.iter().any(|a| a == "dialogue_specialist"));
+        assert!(!got.iter().any(|a| a == "scene_specialist"));
+        let heavy = ActivationSignals {
+            published_count: 10,
+            chapter: 10,
+            draft_chars: 800,
+            dialogue_ratio: 0.4,
+            speaking_characters: 4,
+            scene_tags: vec!["战斗".into()],
+            ..Default::default()
+        };
+        let got2 = resolve_pipeline_agents_filtered(&[], &pipe, &suggestions, Some(&heavy));
+        assert!(got2.iter().any(|a| a == "dialogue_specialist"));
+        assert!(got2.iter().any(|a| a == "scene_specialist"));
+        // Pinned active_agents survive lean even when quiet.
+        let pinned = vec![
+            "dialogue_specialist".into(),
+            "scene_specialist".into(),
+        ];
+        let got3 = resolve_pipeline_agents_filtered(&pinned, &pipe, &[], Some(&quiet));
+        assert!(got3.iter().any(|a| a == "dialogue_specialist"));
+        assert!(got3.iter().any(|a| a == "scene_specialist"));
     }
 }

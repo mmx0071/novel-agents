@@ -114,22 +114,23 @@ impl GateCatalog {
             .unwrap_or_default()
     }
 
-    /// chapter_next: published → continue; blocked → revise;
-    /// published + plot still open (accept failed) → both.
+    /// chapter_next: published → continue (+ batch); blocked → revise;
+    /// published + plot still open (accept failed) → continue/revise/batch.
+    /// Display order follows gates.yaml: continue → revise → batch.
     pub fn chapter_next_options(
         &self,
         published: bool,
         plot_accept_open: bool,
     ) -> Vec<UserInputOption> {
         let opts = self.options("chapter_next");
-        if published && plot_accept_open {
-            return opts
-                .into_iter()
-                .filter(|o| o.id == "cn_continue" || o.id == "cn_revise")
-                .collect();
-        }
-        let want = if published { "cn_continue" } else { "cn_revise" };
-        opts.into_iter().filter(|o| o.id == want).collect()
+        opts.into_iter()
+            .filter(|o| match o.id.as_str() {
+                "cn_continue" => published,
+                "cn_revise" => !published || plot_accept_open,
+                "cn_batch" => published,
+                _ => false,
+            })
+            .collect()
     }
 
     pub fn is_known_token(&self, text: &str) -> bool {
@@ -665,15 +666,17 @@ mod tests {
             _ => panic!("expected continue_writing"),
         }
         let cont = g.chapter_next_options(true, false);
-        assert_eq!(cont.len(), 1);
+        assert_eq!(cont.len(), 2);
         assert_eq!(cont[0].id, "cn_continue");
+        assert_eq!(cont[1].id, "cn_batch");
         let fix = g.chapter_next_options(false, false);
         assert_eq!(fix.len(), 1);
         assert_eq!(fix[0].id, "cn_revise");
         let open = g.chapter_next_options(true, true);
-        assert_eq!(open.len(), 2);
+        assert_eq!(open.len(), 3);
         assert_eq!(open[0].id, "cn_continue");
         assert_eq!(open[1].id, "cn_revise");
+        assert_eq!(open[2].id, "cn_batch");
         let r = g.resolve_chapter_next("修正本章", "demo", 2).unwrap();
         match r {
             GateResolve::Tool { name, args } => {

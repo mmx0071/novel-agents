@@ -2017,8 +2017,10 @@ impl NovelxCore {
                 t.pending_chapter_order = None;
                 t.ui_turns = strip_ui_approvals(std::mem::take(&mut t.ui_turns));
             }
-            // Gate already confirmed intent — skip a second mutation card for continue_writing.
-            let args = if tool_name == "continue_writing" {
+            // Gate already confirmed intent — skip a second mutation card for continue/batch.
+            let args = if tool_name == "continue_writing"
+                || tool_name == "continue_writing_batch"
+            {
                 novelx_tools::with_confirm_skip(args)
             } else {
                 args
@@ -2361,8 +2363,10 @@ impl NovelxCore {
             } else {
                 (tool_name, args, None)
             };
-            // Gate intent for continue_writing is already confirmed; revise still needs diff confirm.
-            let args = if tool_name == "continue_writing" {
+            // Gate intent for continue / batch is already confirmed; revise still needs diff confirm.
+            let args = if tool_name == "continue_writing"
+                || tool_name == "continue_writing_batch"
+            {
                 novelx_tools::with_confirm_skip(args)
             } else {
                 args
@@ -4686,15 +4690,37 @@ impl NovelxCore {
             self.roots.config_root.join("skills/studio.md"),
         )
         .unwrap_or_default();
+        let novel_draft_body = std::fs::read_to_string(
+            self.roots.config_root.join("skills/novel-draft.md"),
+        )
+        .unwrap_or_default();
+        let qa_hint_block = bound_project.as_deref().and_then(|p| {
+            let dir = self.roots.projects_root.join(p);
+            let hints = novelx_pipeline::studio_activation_hints_for_project(
+                &self.roots.config_root,
+                &dir,
+                p,
+            );
+            novelx_pipeline::format_studio_activation_hints_block(&hints).map(|b| {
+                format!(
+                    "\n【当前项目长程 QA】\n{b}\n\
+                     若用户未否定，应在合适时机主动调用上述工具；汇报进度时须转述此建议。\n"
+                )
+            })
+        });
         let project_bind = if let Some(p) = bound_project.as_deref() {
-            format!(
+            let mut s = format!(
                 "当前会话已绑定项目《{p}》。用户指令默认针对此书。\n\
                  - 禁止无谓调用 list_projects（除非用户明确要「列出所有项目」）。\n\
-             - 「修正/扩写/重写/加长第N章」→ 立即 revise_chapter(project=\"{p}\", chapter=N, instructions=用户原话或「扩写到3000-5000字」)。\n\
+             - 「修正/扩写/重写/加长第N章」→ 立即 revise_chapter(project=\"{p}\", chapter=N, instructions=用户原话或「扩写到5000-6000字」)。\n\
              - 用户只说「继续」：若下一章尚无正文 → 必须 continue_writing；若下一章已有草稿 → 先问清写下一章/修订/审校（勿只查状态就结束）。\n\
              - 问剧情卡/主线/写到哪了/对照进度 → list_plots + get_project_status 后中文汇报；禁止 continue_writing。\n\
              - 不要只列项目或只口头答应就结束；同一轮必须把可执行工具跑完。\n"
-            )
+            );
+            if let Some(qa) = qa_hint_block {
+                s.push_str(&qa);
+            }
+            s
         } else {
             "尚未绑定项目：若用户已点名书名则直接用该 project；仅当完全不清楚时才 list_projects，然后必须继续执行原请求。\n".into()
         };
@@ -4716,8 +4742,13 @@ impl NovelxCore {
             system.push_str("\n\n# Skill: studio\n\n");
             system.push_str(&studio_body);
         }
+        // Field contract for setup collecting — not an LLM extractor agent.
+        if !novel_draft_body.trim().is_empty() {
+            system.push_str("\n\n# Skill: novel-draft\n\n");
+            system.push_str(&novel_draft_body);
+        }
         for inj in &injections {
-            if inj.name == "studio" {
+            if inj.name == "studio" || inj.name == "novel-draft" {
                 continue; // already injected as default
             }
             system.push_str(&format!(
@@ -4754,6 +4785,9 @@ impl NovelxCore {
         let mut awaiting_studio_audit_offer = false;
 
         for _round in 0..MAX_TOOL_ROUNDS {
+            // Set when continue_writing audit-fails: stub sibling tools, then continue
+            // the outer loop so Studio can call offer_decisions (do not pause yet).
+            let mut end_batch_for_studio_offer = false;
             if self
                 .threads
                 .read()
@@ -5396,6 +5430,16 @@ impl NovelxCore {
                             &data,
                         )
                         .await?;
+                    // Content audit fail: keep the tool loop alive for one Studio
+                    // `offer_decisions` round. Pausing here left pending_audit in
+                    // awaiting_offer with no RequestUserInput (zombie gate).
+                    if defer_pause_for_studio_audit_offer(
+                        audit_fail,
+                        awaiting_studio_audit_offer,
+                    ) {
+                        end_batch_for_studio_offer = true;
+                        break;
+                    }
                     pause_for_human = true;
                     break;
                 }
@@ -5417,18 +5461,27 @@ impl NovelxCore {
                 // Other mutate tools that returned needs_confirm already paused above.
             }
             // Human gate / early stop: stub remaining tool_call_ids so next turn's history is valid.
-            if pause_for_human {
+            // Also stub when ending a batch for Studio offer_decisions (no pause yet).
+            if pause_for_human || end_batch_for_studio_offer {
                 if let Some(t) = self.threads.write().await.get_mut(&thread_id) {
                     for tc in &pending_tool_calls {
                         if answered_ids.iter().any(|id| id == &tc.id) {
                             continue;
                         }
-                        t.messages.push(ChatMessage {
-                            role: "tool".into(),
-                            content: format!(
+                        let reason = if pause_for_human {
+                            format!(
                                 "（未执行：上一工具需用户确认后结束本轮，跳过 {}）",
                                 tc.name
-                            ),
+                            )
+                        } else {
+                            format!(
+                                "（未执行：上一工具触发审校决策，等待 offer_decisions，跳过 {}）",
+                                tc.name
+                            )
+                        };
+                        t.messages.push(ChatMessage {
+                            role: "tool".into(),
+                            content: reason,
                             tool_call_id: Some(tc.id.clone()),
                             tool_calls: None,
                     ..Default::default()
@@ -5437,12 +5490,26 @@ impl NovelxCore {
                     // Persist a repaired history for the next user turn.
                     t.messages = sanitize_chat_messages(std::mem::take(&mut t.messages));
                 }
-                break;
+                if pause_for_human {
+                    break;
+                }
+                // end_batch_for_studio_offer: continue outer loop for Studio offer.
+                continue;
             }
         }
 
         // Studio skipped offer_decisions → open deterministic per-P0 decision card.
-        if awaiting_studio_audit_offer && !pause_for_human {
+        // Independent of pause_for_human: continue_writing used to pause before Studio
+        // could offer, leaving awaiting_offer with no UI card.
+        let pending_awaiting_offer = {
+            self.threads
+                .read()
+                .await
+                .get(&thread_id)
+                .and_then(|t| t.pending_audit.as_ref())
+                .is_some_and(|p| p.awaiting_offer && p.kind == AuditGateKind::Content)
+        };
+        if should_open_audit_offer_fallback(awaiting_studio_audit_offer, pending_awaiting_offer) {
             let pending = {
                 self.threads
                     .read()
@@ -5471,6 +5538,7 @@ impl NovelxCore {
                     false,
                 )
                 .await?;
+                pause_for_human = true;
             }
         }
 
@@ -8215,11 +8283,13 @@ impl NovelxCore {
         let published = data.get("published").and_then(|v| v.as_bool()) == Some(true);
         let content_blocked =
             data.get("content_rule_blocked").and_then(|v| v.as_bool()) == Some(true);
+        let length_blocked = is_length_publish_blocked(data);
         let plot_accept_open = published
             && data.get("plot_accept_passed").and_then(|v| v.as_bool()) == Some(false);
-        // Clean publish → continue next chapter. Hard-rule block → revise this chapter.
+        // Clean publish → continue next chapter.
+        // Hard-rule / length block → revise this chapter.
         // Other unpublished cases (consistency / P0) use the audit gate instead.
-        if !published && !content_blocked {
+        if !published && !content_blocked && !length_blocked {
             return Ok(false);
         }
         let options = self.chapter_next_options(published, plot_accept_open);
@@ -8233,10 +8303,14 @@ impl NovelxCore {
         let report = data.get("report").and_then(|v| v.as_str()).unwrap_or("");
         let prompt = if published {
             chapter_next_published_prompt(chapter, plot_accept_open)
+        } else if length_blocked {
+            chapter_next_length_prompt(chapter, detail)
         } else {
             chapter_next_hard_rule_prompt(chapter, detail)
         };
-        let revise_instructions = if content_blocked {
+        let revise_instructions = if length_blocked {
+            Some(length_revise_instructions(&self.roots.config_root, detail))
+        } else if content_blocked {
             Some(hard_rule_revise_instructions(
                 &self.roots.projects_root,
                 &self.roots.config_root,
@@ -9209,11 +9283,15 @@ impl NovelxCore {
         let published = data.get("published").and_then(|v| v.as_bool()) == Some(true);
         let content_blocked =
             data.get("content_rule_blocked").and_then(|v| v.as_bool()) == Some(true);
+        let length_blocked = is_length_publish_blocked(data);
         let plot_accept_open = published
             && data.get("plot_accept_passed").and_then(|v| v.as_bool()) == Some(false);
-        let resume_chapter_next = chapter > 0 && (published || content_blocked);
-        let revise_instructions = if content_blocked {
-            let detail_msg = data.get("message").and_then(|v| v.as_str()).unwrap_or("");
+        let resume_chapter_next =
+            chapter > 0 && (published || content_blocked || length_blocked);
+        let detail_msg = data.get("message").and_then(|v| v.as_str()).unwrap_or("");
+        let revise_instructions = if length_blocked {
+            Some(length_revise_instructions(&self.roots.config_root, detail_msg))
+        } else if content_blocked {
             let report = data.get("report").and_then(|v| v.as_str()).unwrap_or("");
             Some(hard_rule_revise_instructions(
                 &self.roots.projects_root,
@@ -9349,7 +9427,8 @@ impl NovelxCore {
         if project.is_empty() || chapter == 0 {
             return Ok(false);
         }
-        if !published && !content_blocked {
+        // Unpublished revise: hard-rule (`content_blocked`) or length (pre-filled expand instructions).
+        if !published && !content_blocked && revise_instructions.is_none() {
             return Ok(false);
         }
         {
@@ -9373,8 +9452,13 @@ impl NovelxCore {
         if options.is_empty() {
             return Ok(false);
         }
+        let length_revise = revise_instructions
+            .as_deref()
+            .is_some_and(|s| s.contains("扩写到") || s.contains("完整一章"));
         let prompt = if published {
             chapter_next_published_prompt(chapter, plot_accept_open)
+        } else if length_revise {
+            chapter_next_length_prompt(chapter, "正文字数未达发布门槛")
         } else {
             format!(
                 "第{chapter}章因硬规则未发布。请选择：修正本章；也可点「其他」说明要求。"
@@ -10068,6 +10152,25 @@ fn mirror_status_for_agent_bubble(delta: &str) -> Option<String> {
     }
 }
 
+/// After `continue_writing` content-audit fail: do not pause-for-human yet —
+/// Studio still needs a tool round for `offer_decisions` (or loop-end fallback).
+fn defer_pause_for_studio_audit_offer(
+    audit_fail: bool,
+    awaiting_studio_audit_offer: bool,
+) -> bool {
+    audit_fail && awaiting_studio_audit_offer
+}
+
+/// Open the deterministic audit card when Studio never called `offer_decisions`.
+/// Must not require `!pause_for_human` — write tools used to pause first and strand
+/// `awaiting_offer` with no UI options.
+fn should_open_audit_offer_fallback(
+    awaiting_studio_audit_offer: bool,
+    pending_awaiting_offer: bool,
+) -> bool {
+    awaiting_studio_audit_offer && pending_awaiting_offer
+}
+
 fn audit_failure_is_meta_only(data: &Value) -> bool {
     let Some(issues) = data.get("issues").and_then(|v| v.as_array()) else {
         // Fallback: report text from empty/unparseable auditor.
@@ -10204,6 +10307,48 @@ fn chapter_next_published_prompt(chapter: u32, plot_accept_open: bool) -> String
     }
 }
 
+/// True when publish was blocked by chapter length hard gate / SoftShort streak escalate.
+fn is_length_publish_blocked(data: &Value) -> bool {
+    matches!(
+        data.get("length_status").and_then(|v| v.as_str()).unwrap_or(""),
+        "hard_short" | "soft_short_escalated"
+    )
+}
+
+fn length_revise_instructions(config_root: &std::path::Path, detail: &str) -> String {
+    let budget = novelx_harness::ChapterBudget::load_from_config_root(config_root);
+    let mut msg = format!(
+        "扩写到{}字完整一章；保持情节与人物一致，补足场景与对话，勿注水、勿另起主线。",
+        budget.range_label()
+    );
+    let hint: String = detail
+        .lines()
+        .map(str::trim)
+        .filter(|l| {
+            !l.is_empty()
+                && (l.contains("字数") || l.contains("偏短") || l.contains("硬门控"))
+        })
+        .take(3)
+        .collect::<Vec<_>>()
+        .join("；");
+    if !hint.is_empty() {
+        msg.push_str(" 参考：");
+        msg.push_str(&hint);
+    }
+    msg
+}
+
+fn chapter_next_length_prompt(chapter: u32, tool_message: &str) -> String {
+    let hint = tool_message
+        .lines()
+        .map(str::trim)
+        .find(|l| l.contains("字数") || l.contains("偏短") || l.contains("硬门控"))
+        .unwrap_or("正文字数未达发布门槛");
+    format!(
+        "第{chapter}章因字数未发布（{hint}）。请选择：修正本章（扩写）；也可点「其他」说明要求。"
+    )
+}
+
 fn chapter_next_hard_rule_prompt(chapter: u32, tool_message: &str) -> String {
     let mut lines: Vec<String> = Vec::new();
     for line in tool_message.lines() {
@@ -10291,6 +10436,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn length_publish_blocked_detects_hard_and_escalate() {
+        assert!(is_length_publish_blocked(&json!({"length_status": "hard_short"})));
+        assert!(is_length_publish_blocked(
+            &json!({"length_status": "soft_short_escalated"})
+        ));
+        assert!(!is_length_publish_blocked(&json!({"length_status": "soft_short"})));
+        assert!(!is_length_publish_blocked(&json!({"length_status": "ok"})));
+        assert!(!is_length_publish_blocked(&json!({})));
+    }
+
+    #[test]
+    fn length_prompt_mentions_expand() {
+        let p = chapter_next_length_prompt(3, "正文字数 4200，低于硬门控 4500");
+        assert!(p.contains("第3章"));
+        assert!(p.contains("字数"));
+        assert!(p.contains("修正本章"));
+    }
+
+    #[test]
     fn merge_tool_ui_skips_restated_audit_report() {
         let streamed = format!(
             "一致性审计\n## 第17章审校报告\n结果：未通过\n{}",
@@ -10353,6 +10517,19 @@ mod tests {
             &json!({"blocked": true}),
         );
         assert!(blocked.contains("BLOCKER"));
+    }
+
+    #[test]
+    fn continue_writing_audit_fail_defers_pause_and_fallback_opens() {
+        // Zombie-gate regression: write tool + audit fail must not pause before
+        // Studio offer / must still open fallback when awaiting_offer remains.
+        assert!(defer_pause_for_studio_audit_offer(true, true));
+        assert!(!defer_pause_for_studio_audit_offer(true, false));
+        assert!(!defer_pause_for_studio_audit_offer(false, true));
+        // Fallback must not depend on !pause_for_human (write path used to pause first).
+        assert!(should_open_audit_offer_fallback(true, true));
+        assert!(!should_open_audit_offer_fallback(true, false));
+        assert!(!should_open_audit_offer_fallback(false, true));
     }
 
     #[test]

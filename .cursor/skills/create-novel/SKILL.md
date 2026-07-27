@@ -60,7 +60,8 @@ CLI / Web → Op::UserInput (Submission)
 ```bash
 cd /path/to/novel-agents
 
-cargo run -p novelx-cli -- init my-novel --genre 未定 --chapters 100
+# --chapters 仅为 state 软上限/占位，不驱动「先写到第 N 章」；创作按卷推进
+cargo run -p novelx-cli -- init my-novel --genre 未定
 cargo run -p novelx-cli -- run my-novel 1
 cargo run -p novelx-cli -- run my-novel 1 --revise --instructions "改第2段"
 cargo run -p novelx-cli -- status my-novel
@@ -86,7 +87,7 @@ Release 二进制：`cargo build -p novelx-cli --release` → `./target/release/
 | ID | 职责 |
 |----|------|
 | chapter_planner | 输出章纲 |
-| lore_librarian | Lore query |
+| lore_librarian | Lore **确定性** query（非 LLM；摘要后 assert） |
 | writer | 写正文初稿（修订默认局部补丁） |
 | consistency_auditor | 一致性审计 |
 | pacing_reviewer | 节奏审查 |
@@ -102,6 +103,7 @@ Release 二进制：`cargo build -p novelx-cli --release` → `./target/release/
 | dialogue_specialist / scene_specialist | 对话密集 / 战斗高潮 |
 | foreshadow_tracker / literary_editor | 伏笔/风格（润色：activation 建议 + Studio `activate_agents`，非每章必跑） |
 | entity_designer / plot_designer / setting_auditor | Studio 介入；剧情收束后自动巡检（±轻量同步），不进章流水线 order |
+| volume_auditor | Studio `audit_volume`；不进章流水线 |
 
 ## 流水线顺序
 
@@ -120,9 +122,10 @@ chapter_planner → lore_librarian → writer
 
 ### 新建小说
 
-1. `cargo run -p novelx-cli -- init <name> --genre <题材> --chapters <N>`
-2. `lock_brief` → 总纲/卷纲 → **补齐 Bible（0/1/2/7）** → `confirm_setup`
-3. 剧情卡收束后会自动设定巡检（±轻量同步）；卷末仍走 `sync_volume` 门控
+1. CLI：`init <name> --genre <题材>`（可选 `--chapters` 仅软上限）；或 Web/Studio：`create_novel` / `init_novel`
+2. 立项字段约定见 `config/skills/novel-draft.md`（非独立提取器）
+3. `lock_brief` → 总纲/卷纲 → **补齐 Bible（0/1/2/7）** → `confirm_setup`
+4. 剧情卡收束后会自动设定巡检（±轻量同步）；卷末仍走 `sync_volume` 门控
 
 ### 写每一章
 
@@ -130,6 +133,17 @@ chapter_planner → lore_librarian → writer
 2. `run <name> <chapter>` 续写；修订用 `--revise --instructions ...`
 3. 一致性 FAIL 时局部修订，不要跳过审校
 4. Studio：跳章硬拦；落盘突变默认预览，用户确认后再写；局部修订先出 diff（见 `studio.enforce_chapter_order` / `studio.require_mutation_confirm`）
+5. **批写到卡点**（超长篇吞吐）：`run <name> --batch [--max-chapters N] [--until-chapter M]`，或工具 `continue_writing_batch`；遇一致性/卷审/卷末/字数阻断即停
+6. **卷软重规划**：`replan_volume` 生成不锁章号的台阶草案（`artifacts/arc_outlines/{NN}.replan.md`）
+
+### 超长篇旋钮
+
+| 配置 | 作用 |
+|------|------|
+| `config/chapter.yaml` | 章长 5000–6000；硬门 4500；连续 SoftShort 升格 |
+| `config/longform.yaml` | `quality_tier` / `audit_tier` / `impact_scan_mode` / `batch_max_chapters` |
+| `config/continuity.yaml` | 晚期章 CanonContext 预算 |
+| `config/volume.yaml` | 薄卷中审 / 厚卷警告阈值 |
 
 ## LLM 配置
 
@@ -137,7 +151,7 @@ chapter_planner → lore_librarian → writer
 |------|------|
 | API Key | `.env` 的 `DEEPSEEK_API_KEY` |
 | 任务 → 模型 | `config/llm.yaml` |
-| Skills | `config/skills/**/SKILL.md` |
+| Skills | `config/skills/**`（含共享 pitfalls / formats / volume-lifecycle） |
 
 无 Key 时 LLM 客户端降级占位回复。
 

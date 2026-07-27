@@ -3,19 +3,42 @@
 use serde::Deserialize;
 use std::path::Path;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LengthAssessment {
+    /// Within or above soft target (`word_min`).
+    Ok,
+    /// Below `word_min` but at/above `word_hard_min` — warn, do not block publish
+    /// (unless soft-short streak forces escalate).
+    SoftShort,
+    /// Below `word_hard_min` — block publish.
+    HardShort,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChapterBudget {
     #[serde(default = "default_word_min")]
     pub word_min: u32,
     #[serde(default = "default_word_max")]
     pub word_max: u32,
+    #[serde(default = "default_word_hard_min")]
+    pub word_hard_min: u32,
+    /// When consecutive SoftShort reaches this, SoftShort escalates to block publish.
+    /// 0 = never escalate. Overridden by `longform.yaml` when both set (longform wins if >0).
+    #[serde(default = "default_soft_short_auto")]
+    pub soft_short_auto_revise_after: u32,
 }
 
 fn default_word_min() -> u32 {
-    3000
+    5000
 }
 fn default_word_max() -> u32 {
-    5000
+    6000
+}
+fn default_word_hard_min() -> u32 {
+    4500
+}
+fn default_soft_short_auto() -> u32 {
+    3
 }
 
 impl Default for ChapterBudget {
@@ -23,6 +46,8 @@ impl Default for ChapterBudget {
         Self {
             word_min: default_word_min(),
             word_max: default_word_max(),
+            word_hard_min: default_word_hard_min(),
+            soft_short_auto_revise_after: default_soft_short_auto(),
         }
     }
 }
@@ -40,6 +65,12 @@ impl ChapterBudget {
                 if b.word_max < b.word_min {
                     b.word_max = b.word_min;
                 }
+                if b.word_hard_min == 0 {
+                    b.word_hard_min = default_word_hard_min();
+                }
+                if b.word_hard_min > b.word_min {
+                    b.word_hard_min = b.word_min;
+                }
                 b
             }
             Err(e) => {
@@ -50,10 +81,16 @@ impl ChapterBudget {
     }
 
     pub fn load_from_config_root(config_root: &Path) -> Self {
-        Self::load(&config_root.join("chapter.yaml"))
+        let mut b = Self::load(&config_root.join("chapter.yaml"));
+        // longform.yaml may override streak threshold.
+        let lf = crate::longform::LongformConfig::load_from_config_root(config_root);
+        if lf.soft_short_auto_revise_after > 0 {
+            b.soft_short_auto_revise_after = lf.soft_short_auto_revise_after;
+        }
+        b
     }
 
-    /// e.g. `3000–5000`
+    /// e.g. `5000–6000`
     pub fn range_label(&self) -> String {
         format!("{}–{}", self.word_min, self.word_max)
     }
@@ -68,6 +105,62 @@ impl ChapterBudget {
             self.range_label()
         )
     }
+
+    /// Assess body length (chars after title line).
+    pub fn assess_body_chars(&self, body_chars: usize) -> LengthAssessment {
+        let hard = self.word_hard_min as usize;
+        let soft = self.word_min as usize;
+        if body_chars < hard {
+            LengthAssessment::HardShort
+        } else if body_chars < soft {
+            LengthAssessment::SoftShort
+        } else {
+            LengthAssessment::Ok
+        }
+    }
+
+    pub fn hard_short_message(&self, body_chars: usize) -> String {
+        format!(
+            "正文字数不足（硬门控）：当前 {body_chars} 字，至少需要 {} 字才能发布（创作目标 {}）",
+            self.word_hard_min,
+            self.range_label()
+        )
+    }
+
+    pub fn soft_short_message(&self, body_chars: usize) -> String {
+        format!(
+            "正文字数偏短（软警告）：当前 {body_chars} 字，创作目标 {}（不阻断发布）",
+            self.range_label()
+        )
+    }
+
+    pub fn soft_short_escalate_message(&self, body_chars: usize, streak: u32) -> String {
+        format!(
+            "正文字数连续偏短（已连续 {streak} 章未达 {}）：当前 {body_chars} 字，阻断发布，请扩写后再发布",
+            self.range_label()
+        )
+    }
+}
+
+/// Read consecutive SoftShort counter from project state meta.
+pub fn consecutive_soft_short_from_meta(meta: &std::collections::HashMap<String, serde_json::Value>) -> u32 {
+    meta.get("consecutive_soft_short")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32
+}
+
+pub fn set_consecutive_soft_short(
+    meta: &mut std::collections::HashMap<String, serde_json::Value>,
+    n: u32,
+) {
+    if n == 0 {
+        meta.remove("consecutive_soft_short");
+    } else {
+        meta.insert(
+            "consecutive_soft_short".into(),
+            serde_json::json!(n),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -79,10 +172,48 @@ mod tests {
         let dir = std::env::temp_dir().join("novelx-chapter-budget-test");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("chapter.yaml");
-        std::fs::write(&path, "word_min: 2000\nword_max: 4000\n").unwrap();
+        std::fs::write(
+            &path,
+            "word_min: 2000\nword_max: 4000\nword_hard_min: 1500\n",
+        )
+        .unwrap();
         let b = ChapterBudget::load(&path);
         assert_eq!(b.word_min, 2000);
         assert_eq!(b.word_max, 4000);
+        assert_eq!(b.word_hard_min, 1500);
         assert!(b.range_label().contains("2000"));
+    }
+
+    #[test]
+    fn assess_hard_soft_ok() {
+        let b = ChapterBudget::default();
+        assert_eq!(b.assess_body_chars(4400), LengthAssessment::HardShort);
+        assert_eq!(b.assess_body_chars(4500), LengthAssessment::SoftShort);
+        assert_eq!(b.assess_body_chars(5000), LengthAssessment::Ok);
+        assert_eq!(b.assess_body_chars(5600), LengthAssessment::Ok);
+    }
+
+    #[test]
+    fn clamps_hard_min_above_soft() {
+        let dir = std::env::temp_dir().join("novelx-chapter-budget-clamp");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("chapter.yaml");
+        std::fs::write(
+            &path,
+            "word_min: 5000\nword_max: 6000\nword_hard_min: 5500\n",
+        )
+        .unwrap();
+        let b = ChapterBudget::load(&path);
+        assert_eq!(b.word_hard_min, 5000);
+    }
+
+    #[test]
+    fn soft_short_meta_roundtrip() {
+        let mut meta = std::collections::HashMap::new();
+        assert_eq!(consecutive_soft_short_from_meta(&meta), 0);
+        set_consecutive_soft_short(&mut meta, 2);
+        assert_eq!(consecutive_soft_short_from_meta(&meta), 2);
+        set_consecutive_soft_short(&mut meta, 0);
+        assert_eq!(consecutive_soft_short_from_meta(&meta), 0);
     }
 }

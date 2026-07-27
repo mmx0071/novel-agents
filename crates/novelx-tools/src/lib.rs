@@ -28,21 +28,25 @@ use novelx_pipeline::project::{
 use novelx_pipeline::{
     active_volume_for_chapter, bound_for_volume, build_chapter_context, build_setting_audit_pack,
     build_structure_audit_candidate, check_chapter_order, check_plot_write_gate_with,
-    check_revise_target, confirm_setup_approve, confirm_setup_revise, design_plot_force_allowed,
+    check_revise_target, check_volume_audit_for_continue, check_volume_audit_for_sync,
+    confirm_setup_approve, confirm_setup_revise, design_plot_force_allowed,
     display_chapter_outline, ensure_bridge_plot_active, ensure_plot_card_lifecycle_frontmatter,
-    execute_pipeline, format_plot_progress_report_for, impact_source_arc, impact_source_bible,
-    impact_source_draft, impact_source_entity, impact_source_master, impact_source_outline,
-    list_plots_summary, list_projects, load_memory, load_meta_json, load_volume_bounds, lock_brief,
-    lore_query, mark_volume_sync_skipped, materialize_plot_card_markdown,
-    maybe_advance_setup_after_outlines, normalize_plot_card_best_effort,
-    parse_chapter_outline_text, plot_design_blocked_reason, read_arc_outline_excerpt,
-    read_chapter_draft, rebuild_plot_index, resolve_setup_next_step, resolve_setup_phase,
-    confirm_volume_memory, resolve_volume_phase, run_setting_audit,
-    run_volume_audit, run_volume_sync, set_volume_phase,
-    steer_revision_options, update_plot_card, validate_arc_outline, validate_bible,
-    validate_entity_card, validate_master_outline, volume_chapter_span, ContextProfile, EntityKind,
-    PhaseEnforceFlags, PlotWriteGate, PlotWriteMode, RevisionOptions, RunMode, SettingAuditPackOpts,
-    SetupPhase, VolumePhase,
+    execute_pipeline, format_cost_by_agent_line, format_cost_status_line,
+    format_plot_progress_report_for, impact_source_arc, longform_health_snapshot,
+    impact_source_bible, impact_source_draft, impact_source_entity, impact_source_master,
+    impact_source_outline, list_plots_summary, list_projects, load_memory, load_meta_json,
+    load_volume_bounds, lock_brief, lore_query, mark_volume_sync_skipped,
+    materialize_plot_card_markdown, maybe_advance_setup_after_outlines, maybe_cold_archive_volume,
+    normalize_plot_card_best_effort, parse_chapter_outline_text, plot_design_blocked_reason,
+    read_arc_outline_excerpt, read_arc_outline_text, read_chapter_draft,
+    read_chapter_draft_resolved,
+    rebuild_plot_index, resolve_setup_next_step, resolve_setup_phase, confirm_volume_memory,
+    resolve_volume_phase, run_continue_batch, run_setting_audit, run_volume_audit,
+    run_volume_drift_check_with, run_volume_sync, set_volume_phase, steer_revision_options,
+    update_plot_card, BatchContinueOpts, DriftCheckOpts, validate_arc_outline, validate_bible,
+    validate_entity_card, validate_master_outline, volume_chapter_span, ContextProfile,
+    EntityKind, PhaseEnforceFlags, PlotWriteGate, PlotWriteMode, RevisionOptions, RunMode,
+    SettingAuditPackOpts, SetupPhase, VolumePhase,
 };
 use novelx_protocol::{AgentPath, ThreadId};
 use novelx_skills::{build_skill_injections, load_skills, SkillScope};
@@ -138,6 +142,8 @@ pub trait ToolHandler: Send + Sync {
 
 pub struct ListProjects;
 pub struct ContinueWriting;
+pub struct ContinueWritingBatch;
+pub struct ReplanVolume;
 pub struct ReviseChapter;
 pub struct AuditChapter;
 pub struct AuditChapters;
@@ -200,7 +206,8 @@ impl ToolHandler for ContinueWriting {
             "type":"object",
             "properties":{
                 "project":{"type":"string"},
-                "chapter":{"type":"integer","description":"目标章号。用户指定第N章时必填；省略则用 next_chapter"}
+                "chapter":{"type":"integer","description":"目标章号。用户指定第N章时必填；省略则用 next_chapter"},
+                "confirm_skip_volume_audit":{"type":"boolean","description":"跳过本卷中段必须先 audit_volume 的软门控"}
             },
             "required":["project"]
         })
@@ -211,6 +218,25 @@ impl ToolHandler for ContinueWriting {
         let state = load_project_state(&dir)?;
         let explicit = args.get("chapter").and_then(|v| v.as_u64()).map(|c| c as u32);
         let chapter = explicit.unwrap_or(state.next_chapter).max(1);
+        let skip_vol_audit = args
+            .get("confirm_skip_volume_audit")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if let Some(block) =
+            check_volume_audit_for_continue(&ctx.config_root, &dir, chapter, skip_vol_audit)
+        {
+            return Ok(ToolResult {
+                output: format!("⛔ 写章已拦截\n\n{}", block.message),
+                data: json!({
+                    "blocked": true,
+                    "reason": block.reason,
+                    "volume_audit_gate": block.kind,
+                    "volume_index": block.volume_index,
+                    "project": project,
+                    "chapter": chapter,
+                }),
+            });
+        }
         // Omitting chapter while next_chapter already has a draft used to silently rewrite
         // that chapter (e.g. model said「第7章」but left chapter unset → rewrote ch6).
         if explicit.is_none() {
@@ -381,6 +407,244 @@ impl ToolHandler for ContinueWriting {
 }
 
 #[async_trait]
+impl ToolHandler for ContinueWritingBatch {
+    fn name(&self) -> &'static str {
+        "continue_writing_batch"
+    }
+    fn description(&self) -> &'static str {
+        "无人值守连写多章，直到硬门控（一致性 FAIL / 卷审 / 卷末 / 字数阻断 / 剧情门）或达到 max_chapters。\
+         适合超长篇推进；不会跳过需人工确认的门。默认上限见 config/longform.yaml。"
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "project":{"type":"string"},
+                "max_chapters":{"type":"integer","description":"最多连写章数（默认 longform.batch_max_chapters，上限 100）"},
+                "until_chapter":{"type":"integer","description":"写到该章号（含）后停止"},
+                "confirm_skip_volume_audit":{"type":"boolean","description":"跳过卷中审软门控"},
+                "confirm_skip_expected":{"type":"boolean","description":"跳过预处理预期检阅门控"},
+                "auto_length_revise":{"type":"boolean","description":"字数不足时自动全文扩写一次（默认 true）"}
+            },
+            "required":["project"]
+        })
+    }
+    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
+        let project = args["project"].as_str().unwrap_or("").to_string();
+        if project.is_empty() {
+            anyhow::bail!("project 必填");
+        }
+        let max_chapters = args
+            .get("max_chapters")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32);
+        let until_chapter = args
+            .get("until_chapter")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32);
+        let skip_vol = args
+            .get("confirm_skip_volume_audit")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let skip_expected = args
+            .get("confirm_skip_expected")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let auto_length_revise = args
+            .get("auto_length_revise")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        if let Some(prev) = mutation::maybe_preview(
+            &ctx.config_root,
+            &args,
+            "continue_writing_batch",
+            &format!(
+                "将连写最多 {} 章（至硬门控为止）{}",
+                max_chapters.unwrap_or(0),
+                until_chapter
+                    .map(|u| format!("，直到第{u}章"))
+                    .unwrap_or_default()
+            ),
+            json!({
+                "kind": "continue_writing_batch",
+                "max_chapters": max_chapters,
+                "until_chapter": until_chapter,
+                "markdown": "确认后开始批写；遇一致性/卷审/卷末/预期检阅/字数阻断即停；字数不足可自动扩写一次。",
+            }),
+            "continue_writing_batch",
+            json!({
+                "project": project,
+                "max_chapters": max_chapters,
+                "until_chapter": until_chapter,
+                "confirm_skip_volume_audit": skip_vol,
+                "confirm_skip_expected": skip_expected,
+                "auto_length_revise": auto_length_revise,
+            }),
+        ) {
+            return Ok(prev);
+        }
+        let result = run_continue_batch(
+            &ctx.projects_root,
+            &ctx.config_root,
+            BatchContinueOpts {
+                project,
+                max_chapters,
+                until_chapter,
+                confirm_skip_volume_audit: skip_vol,
+                confirm_skip_expected: skip_expected,
+                auto_length_revise,
+            },
+            ctx.llm.clone(),
+        )
+        .await?;
+        Ok(ToolResult {
+            output: result.summary_text(),
+            data: result.to_json(),
+        })
+    }
+}
+
+#[async_trait]
+impl ToolHandler for ReplanVolume {
+    fn name(&self) -> &'static str {
+        "replan_volume"
+    }
+    fn description(&self) -> &'static str {
+        "根据已写摘要与卷终止条件，生成当前卷「软台阶」重规划草案（不锁死章号）。\
+         默认先预览；确认后写入 artifacts/arc_outlines 旁的 replan 草稿，供 design_arc_outline 采纳。"
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "project":{"type":"string"},
+                "volume":{"type":"integer","description":"卷号；默认当前活跃卷"},
+                "notes":{"type":"string","description":"重规划额外约束（可选）"}
+            },
+            "required":["project"]
+        })
+    }
+    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
+        let project = args["project"].as_str().unwrap_or("").to_string();
+        let dir = project_dir(&ctx.projects_root, &project);
+        let state = load_project_state(&dir)?;
+        let vol = args
+            .get("volume")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32)
+            .or_else(|| {
+                active_volume_for_chapter(&dir, state.published_count.max(1))
+                    .map(|v| v.volume_index)
+            })
+            .unwrap_or(1);
+        let notes = args
+            .get("notes")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let arc = read_arc_outline_text(&dir, vol)
+            .map(|t| {
+                let t = t.trim();
+                if t.chars().count() > 4000 {
+                    t.chars().take(4000).collect()
+                } else {
+                    t.to_string()
+                }
+            })
+            .unwrap_or_default();
+        let mem = load_memory(&dir);
+        let digests: Vec<String> = mem
+            .recent_digests
+            .iter()
+            .rev()
+            .take(12)
+            .map(|d| {
+                format!(
+                    "- 第{}章：{}",
+                    d.chapter,
+                    d.event_summary.chars().take(120).collect::<String>()
+                )
+            })
+            .collect();
+        let open: Vec<String> = mem
+            .open_threads
+            .iter()
+            .filter(|t| t.status == "open" || t.status.is_empty())
+            .take(10)
+            .map(|t| format!("- [{}] {}", t.id, t.text.chars().take(80).collect::<String>()))
+            .collect();
+        let draft = format!(
+            "# 第{vol}卷软台阶重规划草案\n\n\
+             > 不锁死精确章号；以卷终止条件与主角弧拐点为准。确认后可交给 design_arc_outline 吸收。\n\n\
+             ## 当前卷纲摘录\n\n{}\n\n\
+             ## 近章摘要\n\n{}\n\n\
+             ## 未收束线索\n\n{}\n\n\
+             ## 重规划建议（请模型/作者补全）\n\n\
+             1. 保留卷终止条件（至少 2 条可验收）。\n\
+             2. 将剩余情节改为「拐点台阶」而非「第 N 章必发生」。\n\
+             3. 标注可裁剪/可延后的支线，避免厚卷（>40 章）。\n\
+             {}\n",
+            if arc.trim().is_empty() {
+                "（尚无卷纲）"
+            } else {
+                arc.trim()
+            },
+            if digests.is_empty() {
+                "（尚无摘要）".into()
+            } else {
+                digests.join("\n")
+            },
+            if open.is_empty() {
+                "（无开放伏笔）".into()
+            } else {
+                open.join("\n")
+            },
+            if notes.is_empty() {
+                String::new()
+            } else {
+                format!("### 额外约束\n\n{notes}\n")
+            },
+        );
+        let rel = format!("artifacts/arc_outlines/{vol:02}.replan.md");
+        if let Some(prev) = mutation::maybe_preview(
+            &ctx.config_root,
+            &args,
+            "replan_volume",
+            &format!("将写入第{vol}卷软重规划草案 {rel}"),
+            json!({
+                "kind": "replan_volume",
+                "volume": vol,
+                "path": rel,
+                "markdown": draft.chars().take(2000).collect::<String>(),
+            }),
+            "replan_volume",
+            json!({
+                "project": project,
+                "volume": vol,
+                "notes": notes,
+            }),
+        ) {
+            return Ok(prev);
+        }
+        let path = dir.join(&rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, &draft)?;
+        Ok(ToolResult {
+            output: format!("已写入软重规划草案：{rel}\n\n{}", draft.chars().take(800).collect::<String>()),
+            data: json!({
+                "ok": true,
+                "volume": vol,
+                "path": rel,
+                "chars": draft.chars().count(),
+            }),
+        })
+    }
+}
+
+#[async_trait]
 impl ToolHandler for ReviseChapter {
     fn name(&self) -> &'static str {
         "revise_chapter"
@@ -394,7 +658,7 @@ impl ToolHandler for ReviseChapter {
             "properties":{
                 "project":{"type":"string"},
                 "chapter":{"type":"integer"},
-                "instructions":{"type":"string","description":"修订要求，如：扩写到3000字、重写本章、改第3段"},
+                "instructions":{"type":"string","description":"修订要求，如：扩写到5000-6000字、重写本章、改第3段"},
                 "audit_issues":{
                     "type":"array",
                     "description":"结构化审校问题（含 id/quote/location）；局部补丁优先按此定位"
@@ -1023,7 +1287,8 @@ impl ToolHandler for AuditVolume {
     }
     fn description(&self) -> &'static str {
         "整卷复盘（L1）：只读本卷各章摘要与卷纲，输出跨章问题与建议深审章号；\
-         不逐章读正文。深审请再 audit_chapters(chapters=[…]) 或点「按建议深审」。"
+         不逐章读正文。深审请再 audit_chapters(chapters=[…]) 或点「按建议深审」。\
+         当 get_project_status / 写章结果 / system 出现「长程 QA 建议」指向本工具时，应主动调用。"
     }
     fn parameters(&self) -> Value {
         json!({
@@ -1286,7 +1551,7 @@ impl ToolHandler for InitNovel {
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
         let name = args["name"].as_str().unwrap_or("untitled").to_string();
         let genre = args["genre"].as_str().unwrap_or("未定").to_string();
-        let chapters = args["chapters"].as_u64().unwrap_or(100) as u32;
+        let chapters = args["chapters"].as_u64().unwrap_or(900) as u32;
         let dir = init_project(&ctx.projects_root, &name, &genre, chapters)?;
         Ok(ToolResult {
             output: format!("已创建项目 {}", dir.display()),
@@ -1326,7 +1591,9 @@ impl ToolHandler for ReadChapter {
             .map(|n| n as u32)
             .unwrap_or_else(|| state.published_count.max(1));
         let max_chars = args["max_chars"].as_u64().unwrap_or(12000) as usize;
-        let draft = read_chapter_draft(&dir, chapter).unwrap_or_default();
+        let draft = read_chapter_draft_resolved(&dir, chapter)
+            .or_else(|| read_chapter_draft(&dir, chapter))
+            .unwrap_or_default();
         let outline = read_chapter_outline(&dir, chapter).unwrap_or_default();
         let draft_chars = draft.chars().count();
         let draft_body: String = if draft_chars > max_chars {
@@ -2545,7 +2812,8 @@ impl ToolHandler for SyncVolume {
             "properties":{
                 "project":{"type":"string"},
                 "volume":{"type":"integer","description":"卷第，默认按 published_count 推断刚结束的卷"},
-                "confirm_memory":{"type":"boolean","description":"true=同步后写入卷级记忆 rollup（默认 true）"}
+                "confirm_memory":{"type":"boolean","description":"true=同步后写入卷级记忆 rollup（默认 true）"},
+                "confirm_skip_volume_audit":{"type":"boolean","description":"跳过「同步前须先 audit_volume」门控"}
             },
             "required":["project"]
         })
@@ -2573,6 +2841,27 @@ impl ToolHandler for SyncVolume {
         // Open-ended volumes (end_chapter=0) must still sync through published chapters.
         if volume.end_chapter == 0 {
             volume.end_chapter = pc;
+        }
+        let skip_vol_audit = args
+            .get("confirm_skip_volume_audit")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if let Some(block) = check_volume_audit_for_sync(
+            &ctx.config_root,
+            &dir,
+            volume.volume_index,
+            skip_vol_audit,
+        ) {
+            return Ok(ToolResult {
+                output: format!("⛔ 卷同步已拦截\n\n{}", block.message),
+                data: json!({
+                    "blocked": true,
+                    "reason": block.reason,
+                    "volume_audit_gate": block.kind,
+                    "volume_index": block.volume_index,
+                    "project": project,
+                }),
+            });
         }
         let confirm_memory = args
             .get("confirm_memory")
@@ -2621,6 +2910,8 @@ impl ToolHandler for SyncVolume {
         let (span_start, span_end) =
             novelx_pipeline::volume_chapter_span(&volume, volume.end_chapter.max(1));
         let mut memory_chars = 0usize;
+        // Rollup first so drift check can see this volume's delivered facts.
+        let mut memory_ok = false;
         if confirm_memory {
             if let Ok(rollup) = confirm_volume_memory(
                 &dir,
@@ -2631,19 +2922,59 @@ impl ToolHandler for SyncVolume {
                 "",
             ) {
                 memory_chars = rollup.summary.chars().count();
+                memory_ok = true;
             }
         }
+        // Skip ending↔rollup checks when memory was not confirmed (stale/empty rollup).
+        let drift = run_volume_drift_check_with(
+            &dir,
+            &volume,
+            DriftCheckOpts {
+                memory_confirmed: memory_ok,
+            },
+        )
+        .ok();
+        let _ = maybe_cold_archive_volume(
+            &ctx.config_root,
+            &dir,
+            volume.volume_index,
+            span_start,
+            span_end,
+        );
         let _ = mark_volume_sync_skipped(&dir, false);
         let _ = set_volume_phase(&dir, VolumePhase::AwaitingNextArc);
 
+        let drift_line = drift
+            .as_ref()
+            .map(|d| {
+                let blockers = d.notes.iter().filter(|n| n.severity == "BLOCKER").count();
+                format!(
+                    "；总纲偏离报告已写入 {}（{} 条，BLOCKER={})",
+                    d.path,
+                    d.notes.len(),
+                    blockers
+                )
+            })
+            .unwrap_or_default();
+        let drift_blocker = drift
+            .as_ref()
+            .map(|d| d.notes.iter().any(|n| n.severity == "BLOCKER"))
+            .unwrap_or(false);
+
         Ok(ToolResult {
             output: format!(
-                "卷末同步完成：{}{}。volume_phase=awaiting_next_arc — 请 design_arc_outline 细化下卷。",
+                "卷末同步完成：{}{}{}。volume_phase=awaiting_next_arc — 请 design_arc_outline 细化下卷。{}",
                 report.message,
                 if confirm_memory {
                     format!("；卷记忆已确认（{memory_chars} 字）")
                 } else {
                     String::new()
+                },
+                drift_line,
+                if drift_blocker {
+                    " 若有 BLOCKER，建议人工确认后调用 master_planner 修订总纲。"
+                } else {
+                    ""
                 }
             ),
             data: json!({
@@ -2659,6 +2990,8 @@ impl ToolHandler for SyncVolume {
                 "memory_confirmed": confirm_memory,
                 "volume_phase": VolumePhase::AwaitingNextArc.as_str(),
                 "offer_volume_handoff": true,
+                "drift_path": drift.as_ref().map(|d| d.path.clone()),
+                "drift_blocker": drift_blocker,
             }),
         })
     }
@@ -2980,7 +3313,7 @@ fn parse_volume_range_hint(brief: &str) -> Option<(u32, u32)> {
                 let after = rest[c.len_utf8()..].trim_start();
                 if let Some((b_str, tail)) = split_leading_digits(after) {
                     if let Ok(b) = b_str.parse::<u32>() {
-                        if tail.trim_start().starts_with('卷') && a >= 1 && b >= a && b <= 30 {
+                        if tail.trim_start().starts_with('卷') && a >= 1 && b >= a && b <= 40 {
                             return Some((a, b));
                         }
                     }
@@ -2995,19 +3328,34 @@ fn parse_volume_range_hint(brief: &str) -> Option<(u32, u32)> {
 
 fn longform_scale_hint(target: u32, brief: &str) -> String {
     if let Some((a, b)) = parse_volume_range_hint(brief) {
+        let mid = ((a + b) as f64 / 2.0).max(1.0);
+        let per = (target as f64 / mid).round() as u32;
+        let lo_ch = ((per as f64) * 0.8).round() as u32;
+        let hi_ch = ((per as f64) * 1.2).round() as u32;
         return format!(
-            "- 规模：用户要求约 {a}-{b} 卷、体量约 {target} 章；请用 `## 分卷` 列出每一卷的目标/核心事件/终止条件（可略写，但卷数必须覆盖）"
+            "- 规模：用户要求约 {a}-{b} 卷、体量约 {target} 章；请用 `## 分卷` 列出每一卷的目标/核心事件/终止条件（可略写，但卷数必须覆盖）；建议每卷约 {lo_ch}–{hi_ch} 章（软预算，以终止条件为准，禁止硬锁逐章表）"
         );
     }
     if target >= 500 {
-        let lo = ((target as f64 / 120.0).ceil() as u32).clamp(8, 12);
-        let hi = (lo + 2).min(14);
+        // Thin volumes (~30–50 ch/vol): derive volume count from target first so
+        // soft chapter budget * volume count stays near `target` (no independent floors).
+        let lo = ((target as f64 / 45.0).ceil() as u32).clamp(12, 26);
+        let hi = (lo + 2).min(28);
+        let mid = ((lo + hi) as f64 / 2.0).max(1.0);
+        let per = (target as f64 / mid).round().max(1.0) as u32;
+        let lo_ch = ((per as f64) * 0.8).round() as u32;
+        let hi_ch = ((per as f64) * 1.2).round() as u32;
+        // Cap the soft upper band only; never raise lo_ch above the derived per.
+        let hi_ch = hi_ch.min(50).max(lo_ch);
         format!(
-            "- 规模：超长篇（约 {target} 章）→ 使用 `## 分卷`，规划约 {lo}-{hi} 卷；每卷写清目标/核心事件/终止条件；禁止压成短篇三幕敷衍"
+            "- 规模：超长篇（约 {target} 章）→ 使用 `## 分卷`，规划约 {lo}-{hi} 卷；每卷写清目标/核心事件/终止条件；建议每卷约 {lo_ch}–{hi_ch} 章（软预算，以终止条件为准）；禁止压成短篇三幕敷衍，禁止硬锁「第1–N章」表"
         )
     } else if target >= 200 {
+        let per = (target as f64 / 6.0).round() as u32;
+        let lo_ch = ((per as f64) * 0.8).round() as u32;
+        let hi_ch = ((per as f64) * 1.2).round() as u32;
         format!(
-            "- 规模：中长篇（约 {target} 章）→ 优先 `## 分卷`（约 4-8 卷），也可将三幕映射为多卷"
+            "- 规模：中长篇（约 {target} 章）→ 优先 `## 分卷`（约 4-8 卷），也可将三幕映射为多卷；建议每卷约 {lo_ch}–{hi_ch} 章（软预算）"
         )
     } else {
         format!(
@@ -3366,7 +3714,8 @@ impl ToolHandler for GetProjectStatus {
         "get_project_status"
     }
     fn description(&self) -> &'static str {
-        "查看项目进度、setup/volume 阶段、active_agents、已有章节草稿"
+        "查看项目进度、setup/volume 阶段、active_agents、已有章节草稿；\
+         若触发长程 QA（如本卷 40+ 章 / 卷交接）会附带 volume_auditor → audit_volume 建议"
     }
     fn parameters(&self) -> Value {
         json!({
@@ -3396,22 +3745,38 @@ impl ToolHandler for GetProjectStatus {
         if let Ok(rd) = std::fs::read_dir(ch_root) {
             for e in rd.flatten() {
                 let draft = e.path().join("draft.md");
-                if draft.exists() {
-                    let n = e.file_name().to_string_lossy().to_string();
-                    let len = std::fs::read_to_string(&draft)
-                        .map(|t| t.chars().count())
-                        .unwrap_or(0);
-                    chapters.push(json!({"dir": n, "draft_chars": len}));
+                let gz = e.path().join("draft.md.gz");
+                let stub = e.path().join("draft.md.stub");
+                if !(draft.exists() || gz.exists() || stub.exists()) {
+                    continue;
                 }
+                let n = e.file_name().to_string_lossy().to_string();
+                let ch_num = n.parse::<u32>().unwrap_or(0);
+                let len = if ch_num > 0 {
+                    read_chapter_draft_resolved(&dir, ch_num)
+                        .or_else(|| read_chapter_draft(&dir, ch_num))
+                        .map(|t| t.chars().count())
+                        .unwrap_or(0)
+                } else {
+                    std::fs::read_to_string(&draft)
+                        .map(|t| t.chars().count())
+                        .unwrap_or(0)
+                };
+                chapters.push(json!({"dir": n, "draft_chars": len}));
             }
         }
         chapters.sort_by(|a, b| {
-            a["dir"]
+            let na = a["dir"]
                 .as_str()
-                .unwrap_or("")
-                .cmp(b["dir"].as_str().unwrap_or(""))
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+            let nb = b["dir"]
+                .as_str()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+            na.cmp(&nb)
         });
-        let output = format!(
+        let mut output = format!(
             "《{}》题材={} 下一章={} 已发布={} setup={} volume={} brief={} agents={:?} 草稿章数={}",
             state.name,
             state.genre,
@@ -3427,6 +3792,39 @@ impl ToolHandler for GetProjectStatus {
             state.active_agents,
             chapters.len()
         );
+        if let Some(cost) = format_cost_status_line(&dir) {
+            output.push_str(&format!("\n{cost}"));
+        }
+        if let Some(by_agent) = format_cost_by_agent_line(&dir) {
+            output.push_str(&format!("\n{by_agent}"));
+        }
+        let health = longform_health_snapshot(&dir);
+        if let Some(fs) = health.get("foreshadow") {
+            let total = fs.get("dangling_total").and_then(|v| v.as_u64()).unwrap_or(0);
+            let cold = fs.get("open_cold").and_then(|v| v.as_u64()).unwrap_or(0);
+            if total > 0 {
+                output.push_str(&format!(
+                    "\n伏笔债务：未收 {total} 条（冷归档 {cold}）"
+                ));
+            }
+        }
+        if let Some(vol) = health.get("volume") {
+            let idx = vol.get("active_index").and_then(|v| v.as_u64()).unwrap_or(0);
+            let n = vol
+                .get("chapters_in_volume")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let thick = vol
+                .get("thick_volume_warning")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if idx > 0 {
+                output.push_str(&format!("\n卷健康：第{idx}卷已写 {n} 章"));
+                if thick {
+                    output.push_str(" ⚠厚卷（建议结卷/audit）");
+                }
+            }
+        }
         // Progress authority: disk chapters + counters — strip stale state.extra.chapters.
         let mut state_json = serde_json::to_value(&state).unwrap_or(json!({}));
         if let Some(obj) = state_json.as_object_mut() {
@@ -3435,10 +3833,18 @@ impl ToolHandler for GetProjectStatus {
             obj.insert("next_chapter".into(), json!(state.next_chapter));
         }
         let (ee_pending, ee_approved, ee_due) = novelx_pipeline::count_by_status(&dir);
+        let qa_hints = novelx_pipeline::studio_activation_hints_for_project(
+            &ctx.config_root,
+            &dir,
+            project,
+        );
+        let qa_block = novelx_pipeline::format_studio_activation_hints_block(&qa_hints);
+        output = format!("{output} 预期(待={ee_pending}/批={ee_approved}/到期={ee_due})");
+        if let Some(block) = qa_block {
+            output = format!("{output}\n\n{block}");
+        }
         Ok(ToolResult {
-            output: format!(
-                "{output} 预期(待={ee_pending}/批={ee_approved}/到期={ee_due})"
-            ),
+            output,
             data: json!({
                 "state": state_json,
                 "chapters": chapters,
@@ -3448,6 +3854,12 @@ impl ToolHandler for GetProjectStatus {
                 "deferred_pending": ee_pending,
                 "deferred_approved": ee_approved,
                 "deferred_due": ee_due,
+                "longform_health": health,
+                "studio_activation_hints": qa_hints.iter().map(|h| json!({
+                    "agent": h.agent,
+                    "reason": h.reason,
+                    "tool_hint": h.tool_hint,
+                })).collect::<Vec<_>>(),
             }),
         })
     }
@@ -4092,6 +4504,8 @@ pub fn all_tools() -> Vec<Arc<dyn ToolHandler>> {
     vec![
         Arc::new(ListProjects),
         Arc::new(ContinueWriting),
+        Arc::new(ContinueWritingBatch),
+        Arc::new(ReplanVolume),
         Arc::new(ReviseChapter),
         Arc::new(ReviseOutline),
         Arc::new(AuditChapter),
@@ -4430,6 +4844,9 @@ mod outline_scale_tests {
     #[test]
     fn parses_volume_ranges() {
         assert_eq!(parse_volume_range_hint("覆盖8-10卷"), Some((8, 10)));
+        assert_eq!(parse_volume_range_hint("约25-35卷"), Some((25, 35)));
+        assert_eq!(parse_volume_range_hint("20-40卷"), Some((20, 40)));
+        assert_eq!(parse_volume_range_hint("20-41卷"), None);
     }
 
     #[test]
@@ -4437,6 +4854,25 @@ mod outline_scale_tests {
         let h = longform_scale_hint(900, "800-1000章，8-10卷");
         assert!(h.contains("分卷"), "{h}");
         assert!(h.contains("8-10"), "{h}");
+        assert!(h.contains("软预算"), "{h}");
+    }
+
+    #[test]
+    fn longform_hint_includes_soft_per_volume() {
+        let h = longform_scale_hint(900, "800-1000章");
+        assert!(h.contains("分卷"), "{h}");
+        assert!(h.contains("软预算"), "{h}");
+        assert!(h.contains("章"), "{h}");
+        assert!(h.contains("20-"), "{h}");
+    }
+
+    #[test]
+    fn longform_hint_500_keeps_product_near_target() {
+        let h = longform_scale_hint(500, "约500章");
+        // ~12–14 vols × ~30–40 ch ≈ 500; must not force 20×30 (=600+).
+        assert!(h.contains("12-") || h.contains("13-") || h.contains("14-"), "{h}");
+        assert!(!h.contains("20-22"), "{h}");
+        assert!(h.contains("软预算"), "{h}");
     }
 }
 

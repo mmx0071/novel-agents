@@ -17,7 +17,10 @@ pub use chapter_outline::{
     display_chapter_outline, outline_entity_roster, parse_chapter_outline_text,
     validate_chapter_outline, ChapterOutline, OutlineEntityRoster,
 };
-pub use draft::{display_draft, normalize_draft_best_effort, validate_draft, MIN_DRAFT_BODY_CHARS};
+pub use draft::{
+    display_draft, draft_body_chars, normalize_draft_best_effort, validate_draft,
+    MIN_DRAFT_BODY_CHARS,
+};
 pub use entity::{
     display_entity_card, minimal_entity_skeleton, validate_entity_body_edit, validate_entity_card,
     EntityKind,

@@ -102,14 +102,34 @@ impl Default for ContinuityBudget {
                     bridge_chars: 1000,
                 },
                 ContinuityTier {
-                    max_published: 0,
-                    memory_section: 2800,
+                    max_published: 200,
+                    memory_section: 3000,
                     dangling_show: 12,
                     archive_thread_recall: 4,
                     summary_recall: 6,
-                    asserted_facts: 10,
+                    asserted_facts: 12,
                     volume_rollups: 4,
                     bridge_chars: 1100,
+                },
+                ContinuityTier {
+                    max_published: 500,
+                    memory_section: 3400,
+                    dangling_show: 14,
+                    archive_thread_recall: 5,
+                    summary_recall: 8,
+                    asserted_facts: 22,
+                    volume_rollups: 8,
+                    bridge_chars: 1200,
+                },
+                ContinuityTier {
+                    max_published: 0,
+                    memory_section: 4200,
+                    dangling_show: 16,
+                    archive_thread_recall: 8,
+                    summary_recall: 12,
+                    asserted_facts: 36,
+                    volume_rollups: 12,
+                    bridge_chars: 1300,
                 },
             ],
         }
@@ -173,7 +193,13 @@ mod tests {
         let b = ContinuityBudget::default();
         assert_eq!(b.for_published(10).summary_recall, 2);
         assert_eq!(b.for_published(50).summary_recall, 4);
+        assert_eq!(b.for_published(150).summary_recall, 6);
         assert_eq!(b.for_published(200).summary_recall, 6);
+        assert_eq!(b.for_published(300).summary_recall, 8);
+        assert_eq!(b.for_published(600).summary_recall, 12);
+        assert_eq!(b.for_published(150).asserted_facts, 12);
+        assert_eq!(b.for_published(300).asserted_facts, 22);
+        assert_eq!(b.for_published(600).asserted_facts, 36);
     }
 
     #[test]

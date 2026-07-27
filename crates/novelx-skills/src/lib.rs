@@ -86,6 +86,13 @@ fn collect_skills(
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
+            // Studio root owns top-level shared *.md only; agent SKILLs live under
+            // skills/agents/ and are loaded with SkillScope::Agent — don't retag them.
+            if matches!(scope, SkillScope::Studio | SkillScope::System)
+                && path.file_name().and_then(|n| n.to_str()) == Some("agents")
+            {
+                continue;
+            }
             collect_skills(&path, scope, _root, depth + 1, skills, errors, seen);
             continue;
         }
@@ -230,6 +237,17 @@ const CONTENT_FORMATS_AGENTS: &[&str] = &[
     "entity-designer",
     "world-architect",
     "summarizer",
+    "nomenclature-curator",
+    "setting-auditor",
+];
+
+/// Chapter / plot roles that need volume phase + bridge-chapter alignment.
+const VOLUME_LIFECYCLE_AGENTS: &[&str] = &[
+    "writer",
+    "chapter-planner",
+    "plot-acceptor",
+    "plot-designer",
+    "arc-planner",
 ];
 
 fn wants_prose_pitfalls(agent: &str) -> bool {
@@ -240,6 +258,11 @@ fn wants_prose_pitfalls(agent: &str) -> bool {
 fn wants_content_formats(agent: &str) -> bool {
     let key = agent.replace('_', "-");
     CONTENT_FORMATS_AGENTS.iter().any(|a| *a == key)
+}
+
+fn wants_volume_lifecycle(agent: &str) -> bool {
+    let key = agent.replace('_', "-");
+    VOLUME_LIFECYCLE_AGENTS.iter().any(|a| *a == key)
 }
 
 fn strip_md_frontmatter(content: &str) -> &str {
@@ -270,13 +293,15 @@ fn load_shared_skill_body(skills: &[SkillMetadata], name: &str) -> Option<String
 }
 
 /// Load full skill bodies for activated names.
-/// Format producers get `content-formats`; prose agents also get `prose-pitfalls`.
+/// Format producers get `content-formats`; prose agents get `prose-pitfalls`;
+/// chapter/plot roles also get `volume-lifecycle`.
 pub fn build_skill_injections(
     skills: &[SkillMetadata],
     activate: &[String],
 ) -> Vec<SkillInjection> {
     let pitfalls = load_shared_skill_body(skills, "prose-pitfalls");
     let formats = load_shared_skill_body(skills, "content-formats");
+    let volume_lc = load_shared_skill_body(skills, "volume-lifecycle");
     let mut out = Vec::new();
     for name in activate {
         if let Some(meta) = skills.iter().find(|s| s.name == *name || s.name.replace('_', "-") == *name)
@@ -292,6 +317,11 @@ pub fn build_skill_injections(
                     if wants_prose_pitfalls(&meta.name) {
                         if let Some(ref p) = pitfalls {
                             prefixes.push(p.as_str());
+                        }
+                    }
+                    if wants_volume_lifecycle(&meta.name) {
+                        if let Some(ref v) = volume_lc {
+                            prefixes.push(v.as_str());
                         }
                     }
                     let body = if prefixes.is_empty() {
@@ -439,6 +469,103 @@ mod tests {
             inj[0].body.chars().take(200).collect::<String>()
         );
         assert!(inj[0].body.contains("# Writer"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn studio_scan_skips_agents_subdir() {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("novelx_skills_scope_{ts}"));
+        let agents = dir.join("agents/writer");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(
+            dir.join("studio.md"),
+            "---\nname: studio\ndescription: Root.\n---\n\n# Studio\n",
+        )
+        .unwrap();
+        fs::write(
+            agents.join("SKILL.md"),
+            "---\nname: writer\ndescription: Write.\n---\n\n# Writer\n",
+        )
+        .unwrap();
+        let outcome = load_skills(&[
+            (SkillScope::Studio, dir.clone()),
+            (SkillScope::Agent, dir.join("agents")),
+        ]);
+        let studio = outcome.skills.iter().find(|s| s.name == "studio").unwrap();
+        let writer = outcome.skills.iter().find(|s| s.name == "writer").unwrap();
+        assert_eq!(studio.scope, SkillScope::Studio);
+        assert_eq!(writer.scope, SkillScope::Agent);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn injects_volume_lifecycle_for_plot_acceptor() {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("novelx_skills_vol_{ts}"));
+        let agents = dir.join("agents/plot-acceptor");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(
+            agents.join("SKILL.md"),
+            "---\nname: plot-acceptor\ndescription: Accept.\n---\n\n# Acceptor\n\nBody.\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("volume-lifecycle.md"),
+            "---\nname: volume-lifecycle\ndescription: Vol.\n---\n\n# 卷生命周期与衔接章（短约定）\n\n桥接。\n",
+        )
+        .unwrap();
+        let outcome = load_skills(&[
+            (SkillScope::Studio, dir.clone()),
+            (SkillScope::Agent, dir.join("agents")),
+        ]);
+        let inj = build_skill_injections(&outcome.skills, &["plot-acceptor".into()]);
+        assert_eq!(inj.len(), 1);
+        assert!(
+            inj[0].body.contains("卷生命周期与衔接章"),
+            "missing volume-lifecycle prepend: {}",
+            inj[0].body.chars().take(200).collect::<String>()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn injects_content_formats_for_setting_auditor() {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("novelx_skills_sa_fmt_{ts}"));
+        let agents = dir.join("agents/setting-auditor");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(
+            agents.join("SKILL.md"),
+            "---\nname: setting-auditor\ndescription: Audit.\n---\n\n# Auditor\n\nBody.\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("content-formats.md"),
+            "---\nname: content-formats\ndescription: Formats.\n---\n\n# 内容格式契约（生成锚定）\n\n双层原则。\n",
+        )
+        .unwrap();
+
+        let outcome = load_skills(&[
+            (SkillScope::Studio, dir.clone()),
+            (SkillScope::Agent, dir.join("agents")),
+        ]);
+        let inj = build_skill_injections(&outcome.skills, &["setting-auditor".into()]);
+        assert_eq!(inj.len(), 1);
+        assert!(
+            inj[0].body.contains("内容格式契约"),
+            "missing formats prepend: {}",
+            inj[0].body.chars().take(200).collect::<String>()
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

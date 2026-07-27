@@ -4,7 +4,7 @@ use super::error::SchemaError;
 use super::md::normalize_blank_lines;
 
 /// Publish/schema floor for draft body (chars after the title line).
-/// This is a minimum shape gate — not the writer target (see `config/chapter.yaml`, typically 3000–5000).
+/// This is a minimum shape gate — not the writer target (see `config/chapter.yaml`, typically 5000–6000).
 pub const MIN_DRAFT_BODY_CHARS: usize = 800;
 
 /// Strict schema check for Web PUT / publish gates.
@@ -70,6 +70,28 @@ pub fn normalize_draft_best_effort(chapter: u32, text: &str) -> (String, Vec<Str
 
 pub fn display_draft(text: &str) -> String {
     normalize_blank_lines(text.trim())
+}
+
+/// Char count of body after the first (title) line. Empty/missing title → whole text.
+pub fn draft_body_chars(text: &str) -> usize {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+    let mut lines = trimmed.lines();
+    let _first = lines.next();
+    lines.collect::<Vec<_>>().join("\n").trim().chars().count()
+}
+
+#[cfg(test)]
+mod body_chars_tests {
+    use super::draft_body_chars;
+
+    #[test]
+    fn counts_after_title() {
+        let text = "# 第1章 标题\n\n正文一二三四五六七八";
+        assert_eq!(draft_body_chars(text), 10);
+    }
 }
 
 /// Force first line to `# 第{chapter}章 …`, preserving title suffix / body when possible.

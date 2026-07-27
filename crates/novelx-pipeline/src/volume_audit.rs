@@ -79,65 +79,40 @@ pub fn gather_volume_audit_pack(project_dir: &Path, volume: &VolumeBound) -> Res
     } else {
         max_chapter_with_content(project_dir).max(1)
     };
-    let (from, to) = volume_chapter_span(volume, upto);
-    let mut parts = Vec::new();
-    parts.push(format!(
-        "# 卷范围\nvolume_index={} 章 {}–{}\ngoal: {}\nending_conditions:\n{}",
-        volume.volume_index,
-        from,
-        to,
-        volume.goal,
-        if volume.ending_conditions.is_empty() {
-            "- （无）".into()
-        } else {
-            volume
-                .ending_conditions
-                .iter()
-                .map(|c| format!("- {c}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
-    ));
+    let heuristic = heuristic_deep_audit_chapters(project_dir, volume);
+    let pack = crate::volume_pack::gather_volume_layered_pack(
+        project_dir,
+        volume,
+        upto,
+        &heuristic,
+    )?;
+    Ok(pack.text)
+}
 
-    let mut summary_parts = Vec::new();
-    for ch in from..=to {
-        let path = project_dir
-            .join("chapters")
-            .join(format!("{ch:03}"))
-            .join("summary.json");
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            let excerpt: String = text.chars().take(900).collect();
-            summary_parts.push(format!("## 第{ch}章\n{excerpt}"));
-        } else if project_dir
-            .join("chapters")
-            .join(format!("{ch:03}"))
-            .join("draft.md")
-            .exists()
-        {
-            summary_parts.push(format!("## 第{ch}章\n（有正文但无 summary.json）"));
-        }
-    }
-    if summary_parts.is_empty() {
-        summary_parts.push("（本卷尚无章节摘要）".into());
-    }
-    parts.push(format!("# 各章摘要\n{}", summary_parts.join("\n\n")));
+/// Path for persisted L1 volume audit report.
+pub fn volume_audit_report_path(project_dir: &Path, volume_index: u32) -> std::path::PathBuf {
+    project_dir
+        .join("artifacts/volume_audits")
+        .join(format!("{volume_index:02}.md"))
+}
 
-    let arc_vol = volume.volume_index.max(1);
-    let arc = crate::volume::read_arc_outline_text(project_dir, arc_vol)
-        .or_else(|| std::fs::read_to_string(project_dir.join("artifacts/arc_outline.md")).ok())
-        .unwrap_or_default();
-    if arc.trim().chars().count() > 20 {
-        let excerpt: String = arc.chars().take(1800).collect();
-        parts.push(format!("# 卷纲节选\n{excerpt}"));
-    }
+pub fn volume_has_audit_report(project_dir: &Path, volume_index: u32) -> bool {
+    let path = volume_audit_report_path(project_dir, volume_index);
+    std::fs::read_to_string(path)
+        .map(|t| t.trim().chars().count() > 40)
+        .unwrap_or(false)
+}
 
-    let mem = crate::memory::load_memory(project_dir);
-    if let Ok(s) = serde_json::to_string_pretty(&mem) {
-        let excerpt: String = s.chars().take(1800).collect();
-        parts.push(format!("# 滚动记忆\n{excerpt}"));
+pub fn persist_volume_audit_report(
+    project_dir: &Path,
+    report: &VolumeAuditReport,
+) -> Result<std::path::PathBuf> {
+    let path = volume_audit_report_path(project_dir, report.volume_index);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
-
-    Ok(parts.join("\n\n"))
+    std::fs::write(&path, &report.report_markdown)?;
+    Ok(path)
 }
 
 pub async fn run_volume_audit(
@@ -301,7 +276,7 @@ pub async fn run_volume_audit(
         }
     ));
 
-    Ok(VolumeAuditReport {
+    let report = VolumeAuditReport {
         volume_index: volume.volume_index,
         from,
         to,
@@ -309,7 +284,9 @@ pub async fn run_volume_audit(
         report_markdown: md,
         suggested_chapters: suggested,
         issues,
-    })
+    };
+    let _ = persist_volume_audit_report(project_dir, &report);
+    Ok(report)
 }
 
 fn max_chapter_with_content(project_dir: &Path) -> u32 {

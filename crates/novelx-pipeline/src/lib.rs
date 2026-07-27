@@ -1,8 +1,11 @@
 //! Chapter pipeline — Codex-style step events, local-patch-first revision.
 
+pub mod activation_hints;
+pub mod batch;
 pub mod body_state;
 pub mod cards;
 pub mod chapter_gate;
+pub mod chapter_index;
 pub mod context;
 pub mod expected_events;
 pub mod foreshadow;
@@ -18,11 +21,21 @@ pub mod setting_audit;
 pub mod setting_pass;
 pub mod volume;
 pub mod volume_audit;
+pub mod volume_drift;
+pub mod volume_pack;
 pub mod volume_sync;
+pub mod lore_index;
+pub mod cold_archive;
+pub mod cost_log;
+pub mod volume_audit_gate;
+pub mod volume_checklist;
 
 pub use cards::{
     collect_entity_gaps, entity_names_equivalent, entity_status_is_active, load_markdown_cards,
     normalize_entity_status, read_arc_outline_excerpt, resolve_entity_card_path, MarkdownCard,
+};
+pub use batch::{
+    run_continue_batch, BatchChapterResult, BatchContinueOpts, BatchContinueResult,
 };
 pub use body_state::{format_body_state_board, format_body_state_board_for_character};
 pub use chapter_gate::{check_chapter_order, check_revise_target, ChapterOrderBlock};
@@ -42,11 +55,24 @@ pub use foreshadow::{
     format_dangling_for_context, format_dangling_for_tracker, load_foreshadow_index,
     rebuild_foreshadow_index, ForeshadowIndex,
 };
+pub use activation_hints::{
+    collect_studio_activation_hints, format_studio_activation_hints_block,
+    studio_activation_hints_for_project, StudioActivationHint,
+};
+pub use chapter_index::{
+    bm25_recall, list_indexed_chapters, load_index, rebuild_index, remove_chapter,
+    upsert_chapter_summary, ChapterIndex,
+};
 pub use memory::{
     apply_summary_json, build_volume_rollup_from_summaries, confirm_volume_memory,
-    format_volume_memory_preview, load_memory, prune_open_threads_into_archive,
-    recall_archived_summaries, recall_archived_summaries_with, recall_archived_threads, save_memory,
-    select_asserted_facts_for_context, upsert_volume_rollup, ProjectMemory, VolumeRollup,
+    format_volume_memory_preview, load_all_volume_rollups, load_facts_archive,
+    load_foreshadow_archive, load_memory, longform_health_snapshot,
+    prune_asserted_facts_to_archive, prune_open_threads_into_archive, recall_archived_summaries,
+    recall_archived_summaries_with, recall_archived_threads, recall_archived_threads_in,
+    foreshadow_already_known, resolve_foreshadow_archive, save_memory,
+    select_asserted_facts_for_context, select_asserted_facts_for_context_in,
+    select_dangling_age_boosted, select_entity_timeline_for_context, upsert_volume_rollup,
+    EntityTimelineFact, ProjectMemory, VolumeRollup, HOT_ENTITY_TIMELINE_LIMIT, HOT_FACTS_LIMIT,
 };
 pub use plots::{
     accept_verdict_is_pass, accept_verdict_is_pass_against, active_plot_exit_context,
@@ -77,7 +103,7 @@ pub use project::{
 };
 pub use schemas::{
     display_arc_outline, display_bible, display_chapter_outline, display_draft, display_entity_card,
-    display_entity_gaps, display_master_outline, display_plot_card_body,
+    display_entity_gaps, display_master_outline, display_plot_card_body, draft_body_chars,
     migrate_project_reader_formats, outline_entity_roster, parse_chapter_outline_text,
     validate_arc_outline, validate_bible,
     normalize_draft_best_effort, normalize_plot_card_best_effort, validate_chapter_outline,
@@ -102,12 +128,37 @@ pub use volume::{
     volume_chapter_span, volume_just_ended, write_arc_outline_text, VolumeBound, VolumeEndDecision,
 };
 pub use volume_audit::{
-    gather_volume_audit_pack, heuristic_deep_audit_chapters, run_volume_audit, VolumeAuditReport,
+    gather_volume_audit_pack, heuristic_deep_audit_chapters, persist_volume_audit_report,
+    run_volume_audit, volume_audit_report_path, volume_has_audit_report, VolumeAuditReport,
+};
+pub use volume_audit_gate::{
+    check_volume_audit_for_continue, check_volume_audit_for_sync, find_config_root,
+    mid_audit_threshold_resolved, thick_volume_threshold_resolved, VolumeAuditGateBlock,
+};
+pub use volume_checklist::{
+    run_volume_memory_checklist, ChecklistItem, VolumeMemoryChecklist,
+};
+pub use volume_drift::{
+    run_volume_drift_check, run_volume_drift_check_with, DriftCheckOpts, DriftNote,
+    VolumeDriftReport,
+};
+pub use volume_pack::{gather_volume_layered_pack, LayeredVolumePack, VOLUME_PACK_CHAR_CAP};
+pub use lore_index::{
+    ensure_lore_index, list_chapters_from_index, query_entities_from_index,
+    query_open_foreshadow_from_index, remove_chapter_index_row, upsert_chapter_index_row,
+    upsert_entity_index_row, upsert_foreshadow_index_row, LoreIndex,
+};
+pub use cold_archive::{
+    maybe_cold_archive_volume, read_chapter_draft_resolved, ColdArchiveResult,
+};
+pub use cost_log::{
+    append_cost_entry, format_cost_by_agent_line, format_cost_status_line, load_recent_entries,
+    summarize_cost_by_agent, CostEntry, CostAgentSummary,
 };
 pub use impact::{
     impact_source_arc, impact_source_bible, impact_source_draft, impact_source_entity,
-    impact_source_master, impact_source_outline, scan_impact, ImpactHit, ImpactReport,
-    ImpactSource, ImpactSourceKind, ImpactTargetKind,
+    impact_source_master, impact_source_outline, scan_impact, scan_impact_with_opts, ImpactHit,
+    ImpactReport, ImpactScanOpts, ImpactSource, ImpactSourceKind, ImpactTargetKind,
 };
 pub use setting_audit::{
     build_setting_audit_pack, build_structure_audit_candidate, run_setting_audit,

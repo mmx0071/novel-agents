@@ -5,7 +5,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::response::{Html, IntoResponse, Json, Response};
 use axum::http::{header, HeaderValue, StatusCode};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{get, post, put};
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
 use novelx_core::NovelxCore;
@@ -27,9 +27,9 @@ use novelx_pipeline::{
 };
 use novelx_pipeline::schemas::{
     display_bible, display_chapter_outline, display_draft, display_entity_card,
-    display_entity_gaps, display_master_outline, display_plot_card_body, parse_chapter_outline_text,
-    validate_arc_outline, validate_bible, validate_draft, validate_entity_body_edit,
-    validate_master_outline, validate_plot_card_body_edit, EntityKind,
+    display_entity_gaps, display_master_outline, display_plot_card_body, draft_body_chars,
+    parse_chapter_outline_text, validate_arc_outline, validate_bible, validate_draft,
+    validate_entity_body_edit, validate_master_outline, validate_plot_card_body_edit, EntityKind,
 };
 use novelx_protocol::{EventMsg, Op};
 use serde::{Deserialize, Serialize};
@@ -153,7 +153,7 @@ pub async fn serve(repo_root: PathBuf, addr: SocketAddr) -> Result<()> {
         .route("/api/projects/{name}/content", put(project_content_put))
         .route(
             "/api/projects/{name}/chapters/{chapter}",
-            delete(chapter_delete),
+            get(chapter_get).delete(chapter_delete),
         )
         .route("/ws/thread/{id}", get(ws_thread))
         .with_state(state);
@@ -878,6 +878,7 @@ async fn skill_put(
         .into_response()
 }
 
+/// Lightweight chapter list for preview (no full draft bodies — fetch via GET chapter).
 fn build_preview(repo_root: &std::path::Path, name: &str) -> serde_json::Value {
     let dir = repo_root.join("projects").join(name);
     let st = load_project_state(&dir).ok();
@@ -897,22 +898,41 @@ fn build_preview(repo_root: &std::path::Path, name: &str) -> serde_json::Value {
                 .collect();
             nums.sort_unstable();
             for n in nums {
-                let draft_raw = read_chapter_draft(&dir, n).unwrap_or_default();
-                let draft = if draft_raw.trim().is_empty() {
-                    String::new()
+                let draft_raw = read_chapter_draft(&dir, n)
+                    .or_else(|| novelx_pipeline::read_chapter_draft_resolved(&dir, n))
+                    .unwrap_or_default();
+                let body_chars = if draft_raw.trim().is_empty() {
+                    0usize
                 } else {
-                    display_draft(&draft_raw)
+                    draft_body_chars(&draft_raw)
                 };
-                let outline_raw = read_chapter_outline(&dir, n).unwrap_or_default();
-                let outline = match parse_chapter_outline_text(&outline_raw) {
-                    Ok(o) => display_chapter_outline(&o),
-                    Err(_) => outline_raw,
-                };
+                let has_outline = dir
+                    .join("chapters")
+                    .join(format!("{n:03}"))
+                    .join("outline.json")
+                    .exists()
+                    || dir
+                        .join("chapters")
+                        .join(format!("{n:03}"))
+                        .join("outline.md")
+                        .exists();
+                // Title: first markdown heading if present, else 第N章.
+                let title = draft_raw
+                    .lines()
+                    .next()
+                    .map(|l| l.trim().trim_start_matches('#').trim())
+                    .filter(|t| !t.is_empty() && t.chars().count() < 80)
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| format!("第{n}章"));
                 chapters.push(serde_json::json!({
                     "number": n,
-                    "title": format!("第{n}章"),
-                    "draft": draft,
-                    "outline": outline,
+                    "title": title,
+                    "has_draft": body_chars > 0,
+                    "has_outline": has_outline,
+                    "body_chars": body_chars,
+                    // Bodies loaded on demand via GET /chapters/{n} (longform-safe).
+                    "draft": "",
+                    "outline": "",
                 }));
             }
         }
@@ -1087,6 +1107,8 @@ fn build_preview(repo_root: &std::path::Path, name: &str) -> serde_json::Value {
         "volume_phase": volume_phase.as_str(),
         "has_master_outline": has_master,
         "has_arc_outline": has_arc,
+        "longform_health": novelx_pipeline::longform_health_snapshot(&dir),
+        "cost_by_agent": novelx_pipeline::summarize_cost_by_agent(&dir, 400),
     })
 }
 
@@ -1412,6 +1434,54 @@ async fn library_delete(State(state): State<AppState>, Path(name): Path<String>)
         let _ = std::fs::remove_dir_all(&dir);
     }
     Json(serde_json::json!({"ok": true, "deleted": name}))
+}
+
+/// On-demand chapter body (preview lists omit full drafts for longform scale).
+async fn chapter_get(
+    State(state): State<AppState>,
+    Path((name, chapter)): Path<(String, u32)>,
+) -> impl IntoResponse {
+    let projects_root = state.repo_root.join("projects");
+    let dir = project_dir(&projects_root, &name);
+    if !dir.exists() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"ok": false, "error": format!("项目「{name}」不存在")})),
+        )
+            .into_response();
+    }
+    let draft_raw = read_chapter_draft(&dir, chapter)
+        .or_else(|| novelx_pipeline::read_chapter_draft_resolved(&dir, chapter))
+        .unwrap_or_default();
+    let draft = if draft_raw.trim().is_empty() {
+        String::new()
+    } else {
+        display_draft(&draft_raw)
+    };
+    let outline_raw = read_chapter_outline(&dir, chapter).unwrap_or_default();
+    let outline = match parse_chapter_outline_text(&outline_raw) {
+        Ok(o) => display_chapter_outline(&o),
+        Err(_) => outline_raw,
+    };
+    let title = draft_raw
+        .lines()
+        .next()
+        .map(|l| l.trim().trim_start_matches('#').trim())
+        .filter(|t| !t.is_empty() && t.chars().count() < 80)
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| format!("第{chapter}章"));
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "number": chapter,
+            "title": title,
+            "draft": draft,
+            "outline": outline,
+            "body_chars": draft_body_chars(&draft_raw),
+        })),
+    )
+        .into_response()
 }
 
 async fn chapter_delete(

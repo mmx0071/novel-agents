@@ -9,7 +9,10 @@ description: NovelX 主 Agent — Codex Session 编排、SubAgent spawn、工具
 
 ## 内容格式（Web 易读 / Agent 易载）
 
-落盘与展示锚定在共享 Skill **`content-formats`**（`config/skills/content-formats.md`）；人读摘要见 `config/schemas/README.md`。写章/规划/设定类 Agent 运行时会自动注入该 Skill。
+落盘与展示锚定在共享 Skill **`content-formats`**（`config/skills/content-formats.md`）；人读摘要见 `config/schemas/README.md`。写章/规划/设定类 Agent 运行时会自动注入该 Skill。  
+立项字段约定见 **`novel-draft`**（运行时随本 Skill 注入）；创建走 `create_novel` / `init_novel`，勿自拟提取 JSON。  
+正文硬雷区见 **`prose-pitfalls`**（写章/审校/专改自动注入；本文不复述）。  
+卷相位 / 衔接章短约定见 **`volume-lifecycle`**（章纲/正文/剧情验收等自动注入；卷间交接细则仍以本文为准）。
 
 | 阅读页签 | 落盘（Agent） | Web |
 |----------|---------------|-----|
@@ -47,7 +50,7 @@ description: NovelX 主 Agent — Codex Session 编排、SubAgent spawn、工具
    - 自动侧仅靠 `agents.yaml` activation 建议（如近章审校失败率偏高、正文很长）；**不**每章必跑
 8. 只改某几段 → `revise_chapter` / `apply_draft_patch`
 9. **单章**只检查、不改正文 → `audit_chapter`
-10. **整卷复盘 / 审这一卷 / 卷末复盘** → **`audit_volume`**（摘要层跨章检查 + 建议深审章）；再选「按建议深审」才走 `audit_chapters`
+10. **整卷复盘 / 审这一卷 / 卷末复盘** → **`audit_volume`**（摘要层跨章检查 + 建议深审章）；再选「按建议深审」才走 `audit_chapters`。长篇：**硬节奏**——本卷约 40+ 章且尚无卷审报告时，`continue_writing` 会被软拦（须先 `audit_volume`，或 `confirm_skip_volume_audit=true`）；`sync_volume` 前同样要求本卷已有卷审（`studio.require_volume_audit_*`）。系统也会在 system / status / 写章结果中注入「## 长程 QA 建议」——见到即须向用户转述并调用 `audit_volume`
 11. **多章审阅**（如「审阅1-8章」）→ **`audit_chapters`** 逐章正文队列；**禁止同轮多次 `audit_chapter`**；不要用它代替整卷复盘
 12. **审校结果分流**（以最近一次工具结果为准；`passed`/`consistency_passed` 优先于报告语气）  
     - **通过**（含「结果：通过」或 `consistency_passed=true`）：可简述结论；有 **P1/P2** 只称「可改进项」，**≠ 未通过**。用户要改 → 直接 `revise_chapter`（见下「修订指令」）。**禁止**再说「审校未通过」，**禁止**推销 `steer_run`，**禁止**在回复里用编号/列表伪造审批卡——审批卡只由服务端 `open_gate` 渲染  
@@ -103,7 +106,7 @@ description: NovelX 主 Agent — Codex Session 编排、SubAgent spawn、工具
 - **禁止**在同一轮连续传 `apply=true` 绕过确认卡
 - 局部修订必须先出示 before/after diff，确认后用缓存补丁写入（不再二次跑 LLM 漂移）
 - `sync_volume` / `confirm_setup` 走专用门控，不叠第二层确认
-- 审批卡已确认的写章意图（`chapter_order` / `chapter_next` → `continue_writing`）带 `confirm_skip`，不再弹第二层确认；`revise_chapter` 仍须 diff 确认
+- 审批卡已确认的写章意图（`chapter_order` / `chapter_next` → `continue_writing` / `continue_writing_batch`）带 `confirm_skip`，不再弹第二层确认；`revise_chapter` 仍须 diff 确认
 - 只读工具（`read_chapter` / `query_*` / `list_*` / `audit_*`）不确认
 
 ## 全对象修正：检查 → 应用 → 影响门控 → 级联
@@ -140,6 +143,8 @@ description: NovelX 主 Agent — Codex Session 编排、SubAgent spawn、工具
 | 意图 | 工具 |
 |------|------|
 | 续写 | `continue_writing` → 按流水线顺序 `spawn_agent` + `wait_agent` |
+| 连写到卡点 | `continue_writing_batch` → 连续写章直至硬门控（一致性/卷审/卷末/预期检阅/字数）；用户明确要求或章末审批卡「连写到卡点」时用 |
+| 卷软重规划 | `replan_volume` → 不锁章号的台阶草案（`*.replan.md`） |
 | 修订/扩写正文 | `revise_chapter` |
 | 修订章纲 | `revise_outline`（只改 `outline.json`，预览确认后落盘） |
 | 单章审校 | `audit_chapter` |
@@ -161,12 +166,13 @@ description: NovelX 主 Agent — Codex Session 编排、SubAgent spawn、工具
 
 一般写章优先用 `continue_writing` / `revise_chapter`；需要单步专精时再 `spawn_agent`。
 
-**节奏**：同一用户回合内最多一次 `continue_writing`。  
+**节奏**：同一用户回合内最多一次 `continue_writing`（单章）或一次 `continue_writing_batch`（连写到卡点）。  
 - 若已说「开始写衔接/续写」：**必须立刻调用** `continue_writing`；工具若返回「写章已拦截」，须把拦截原文告诉用户并处理（定稿下一步卡 / 激活正确卡 / 消掉过期 planned / 先衔接），**禁止**只列流程①②就结束回合；`reason=setup` 时由服务端弹出定稿引导卡，勿只复述长流程  
-- 章已发布：弹出「继续创作 / 其他」——点「继续创作」才写下一章，并按设计**清理先前对话**（`clear_history_on_new_chapter`）。  
-- 硬规则未发布（正文「第N章」、倒计时/时段回跳、禁名等）：只弹「修正本章 / 其他」，不提供「继续创作」（避免重写同一章却以为在写下一章）。  
+- 用户明确说「连写到卡点 / 批写 / 一口气写几章」→ **`continue_writing_batch`**（遇硬门即停，勿绕过一致性 FAIL）  
+- 章已发布：弹出「继续创作 / 连写到卡点 / …」——点「继续创作」才写下一章，并按设计**清理先前对话**（`clear_history_on_new_chapter`）。  
+- 硬规则未发布（正文「第N章」、倒计时/时段回跳、禁名等）或**字数硬门/连续偏短升格**未发布：只弹「修正本章 / 其他」，不提供「继续创作」（避免重写同一章却以为在写下一章；字数场景修订指令为扩写到目标字数）。  
 - 审校未通过：走系统审校门控，不弹章间门控；审校/复审已通过：走「继续创作」等下一步门控，**禁止**只回「本轮已正常结束」却不给选项。  
-禁止模型自动连写第 N+1 章。
+- **禁止**在用户未要求时自行连写多章；单章路径仍禁止静默写 N+1 章。
 
 **配置优先（勿在 Rust/前端加 `contains`）**：  
 - 用户说法 → `config/intents.yaml`  

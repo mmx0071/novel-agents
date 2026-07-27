@@ -266,4 +266,10 @@ gates:
           chapter: "{{chapter}}"
           instructions: "消除正文硬规则违规：除标题行外禁止出现「第N章」元叙述，并替换禁名；只改违规句，勿整章重写。"
         aliases: [修正本章, 修正, 修改本章, 修订]
+      - id: cn_batch
+        label: 连写到卡点
+        tool: continue_writing_batch
+        args:
+          project: "{{project}}"
+        aliases: [连写到卡点, 批写, 连续创作, 无人值守连写, continue_writing_batch]
 

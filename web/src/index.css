@@ -340,6 +340,65 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   flex-shrink: 0;
 }
 
+.longform-health {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 8px;
+  padding: 0 12px 10px;
+}
+
+.longform-health-card {
+  background: #151a24;
+  border: 1px solid #2a3142;
+  border-radius: 10px;
+  padding: 8px 10px;
+  min-width: 0;
+}
+
+.longform-health-title {
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #8b95a8;
+  margin-bottom: 4px;
+}
+
+.longform-health-body {
+  font-size: 0.82rem;
+  color: #e6e9f0;
+  line-height: 1.35;
+}
+
+.longform-health-sub,
+.longform-health-cost {
+  margin-top: 4px;
+  font-size: 0.72rem;
+  color: #9aa3b5;
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.longform-health-warn {
+  color: #e0a35a;
+  font-weight: 600;
+}
+
+.longform-health-list {
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 0.7rem;
+  color: #a8b0c0;
+  line-height: 1.35;
+}
+
+.longform-health-list li {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .reader-volume-strip {
   display: flex;
   flex-wrap: wrap;

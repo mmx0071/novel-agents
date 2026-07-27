@@ -124,6 +124,29 @@ intents:
       - 审这一卷
       - 复盘
 
+  # 「连写到卡点 / 批写 / 连续写几章」→ continue_writing_batch（遇硬门控停）
+  - id: write_batch
+    tool: continue_writing_batch
+    priority: 75
+    require_project: true
+    extract: none
+    any_keywords:
+      - 连写到卡点
+      - 无人值守连写
+      - continue_writing_batch
+      - 批写
+    all_keyword_groups:
+      - [连写, 卡点]
+      - [连续, 写, 章]
+      - [一口气, 写]
+      - [自动, 连写]
+    none_keywords:
+      - 审这一卷
+      - 复盘
+      - design_plot
+      - 到哪了
+      - 进度
+
   # 「写第10章 / 续写 / 写下一章」→ continue_writing
   # 衔接章由剧情卡 needs_bridge（Agent）决定，0 或 1 章，用户无需声明
   # 复合任务（去重/卷纲/design_plot…再写第N章）勿命中：应交 LLM 分步执行
@@ -155,6 +178,9 @@ intents:
       - 到哪了
       - 进度
       - 对照
+      - 连写到卡点
+      - 批写
+      - 一口气
 
   # 「重建总纲 / 生成总纲」→ design_master_outline（ready 项目也可确定性重入）
   - id: design_master_outline
@@ -294,5 +320,5 @@ intents:
       - 章纲
       - outline
     default_instructions: >-
-      扩写/重写本章至约 3000–5000 字，按章纲补足情节与细节，保持与前后章衔接。
+      扩写/重写本章至约 5000–6000 字，按章纲补足情节与细节，保持与前后章衔接。
     instructions_min_chars: 24

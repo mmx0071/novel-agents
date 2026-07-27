@@ -64,7 +64,8 @@ agents:
     name: 设定检索
     layer: world
     tier: mvp
-    description: 维护结构化知识库，章纲后 query、摘要后 assert
+    description: >-
+      Lore 确定性 query/assert（非 LLM）。章纲后切片注入 Writer；摘要后入库。
     depends_on: [chapter_planner]
     activation:
       - condition: entity_count_gt
@@ -73,6 +74,19 @@ agents:
       - condition: chapter_count_gt
         threshold: 5
         reason: 已发布超过 5 章，需要 RAG 检索
+
+  volume_auditor:
+    name: 卷级复盘
+    layer: qa
+    tier: extended
+    description: >-
+      摘要层跨章复盘（audit_volume）；不进章流水线 order，由 Studio 工具调用
+    activation:
+      - condition: chapters_in_arc_gt
+        threshold: 40
+        reason: 本卷已写 40+ 章，建议 Studio 调用 audit_volume 做卷中复盘
+      - condition: volume_handoff
+        reason: 卷交接/待同步阶段，建议跑 audit_volume 再开下卷
 
   nomenclature_curator:
     name: 名词管理
@@ -155,8 +169,8 @@ agents:
     description: 检查节奏与信息密度（MVP 每章必跑；节奏 P0 不阻断发布）
     activation:
       - condition: word_count_gt
-        threshold: 5000
-        reason: 本章超过 5000 字（提示加严节奏审，非启用门槛）
+        threshold: 6000
+        reason: 本章超过 6000 字（提示加严节奏审，非启用门槛）
       - condition: audit_fail_rate_gt
         threshold: 0.2
         reason: 近 5 章质检 FAIL 率超过 20%（提示加严节奏审）

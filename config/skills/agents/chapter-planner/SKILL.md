@@ -65,7 +65,7 @@ description: 输出单章详细章纲（JSON），含冲突波峰、钩子类型
 
 - 必须遵循注入的大纲规划（chapter_blueprint）
 - 若有【剧情卡】：goal/conflict/key_events/characters 须覆盖相关卡的概览与走向；点名人物/物品/地点分别写入 `characters` / `items` / `locations`
-- 若有【衔接章】：goal 为消化上一剧情余波；key_events 勿开全新主线高潮；cliffhanger 导向下一剧情卡
+- 若有【衔接章】/桥接章（见注入的 `volume-lifecycle`）：`goal` 为消化上一剧情余波与落点；`key_events` **勿开全新主线高潮**；`cliffhanger` 导向下一剧情卡进入条件，禁止写成「伪完成下一卡收束」；`scene_tags` 可含 `bridge`（若适用）
 - 若有【设定缺口】：`lore_queries` 优先覆盖缺口实体；勿另起缺口外新主要实体；可在本章场面中自然补全薄卡信息
 - CanonContext 未收录或标注 `status=exited|consumed` 的角色/物品，不得安排常规出场（闪回须注明）
 - 使用规范名，禁止自造与能力无关的名字；名单合计宜控制在约 8 个实体以内

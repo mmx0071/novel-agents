@@ -31,3 +31,17 @@ features:
   # status/holdings sync so the next chapter reads up-to-date setting cards.
   # Skipped when plot just completed (plot_setting_pass covers it) or volume end.
   studio.chapter_setting_pass: true
+  # When false (default): non-setting impact draft scans limited to active volume.
+  studio.impact_scan_all_drafts: false
+  # When true: Entity/Bible mutations scan ALL published drafts (expensive at 800–1000 ch).
+  # Default false — prefer config/longform.yaml impact_scan_mode: indexed|volume|all.
+  studio.impact_scan_all_on_setting: false
+  # Longform lean pipeline: foreshadow / specialist filtering (refined by longform.quality_tier).
+  pipeline.longform_lean: true
+  # Soft-block continue_writing when active volume chapter count ≥ mid_audit_chapter_threshold
+  # (config/volume.yaml, default 20) and no audit_volume report yet.
+  studio.require_volume_audit_mid: true
+  # Block sync_volume until this volume has an audit_volume report (or confirm_skip).
+  studio.require_volume_audit_handoff: true
+  # When true, completed-volume drafts may be gzip-archived off the hot path.
+  studio.cold_archive_drafts: true

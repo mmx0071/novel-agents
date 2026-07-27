@@ -30,7 +30,7 @@ fn default_genre() -> String {
     "未定".into()
 }
 fn default_chapters() -> u32 {
-    100
+    900
 }
 fn default_next() -> u32 {
     1
@@ -277,6 +277,10 @@ pub fn chapter_dir(project_dir: &Path, chapter: u32) -> PathBuf {
 }
 
 pub fn read_chapter_draft(project_dir: &Path, chapter: u32) -> Option<String> {
+    // Prefer resolved draft (handles cold-archive gzip / stub).
+    if let Some(t) = crate::cold_archive::read_chapter_draft_resolved(project_dir, chapter) {
+        return Some(t);
+    }
     let path = chapter_dir(project_dir, chapter).join("draft.md");
     fs::read_to_string(path).ok()
 }
@@ -285,6 +289,9 @@ pub fn write_chapter_draft(project_dir: &Path, chapter: u32, draft: &str) -> Res
     let dir = chapter_dir(project_dir, chapter);
     fs::create_dir_all(&dir)?;
     fs::write(dir.join("draft.md"), draft)?;
+    // Invalidate cold-archive pointers so subsequent reads use the live draft.
+    let _ = fs::remove_file(dir.join("draft.md.stub"));
+    let _ = fs::remove_file(dir.join("draft.md.gz"));
     Ok(())
 }
 
@@ -346,26 +353,26 @@ pub fn list_projects(projects_root: &Path) -> Result<Vec<String>> {
 }
 
 /// List chapter numbers that have a folder under `chapters/`.
+/// Disk directories are authoritative — indexes must not resurrect deleted chapters.
 pub fn list_chapter_numbers(project_dir: &Path) -> Vec<u32> {
     let root = project_dir.join("chapters");
-    let mut out = Vec::new();
-    let Ok(rd) = fs::read_dir(&root) else {
-        return out;
-    };
-    for e in rd.flatten() {
-        if !e.path().is_dir() {
-            continue;
-        }
-        if let Some(n) = e
-            .file_name()
-            .to_str()
-            .and_then(|s| s.parse::<u32>().ok())
-        {
-            out.push(n);
+    let mut disk = Vec::new();
+    if let Ok(rd) = fs::read_dir(&root) {
+        for e in rd.flatten() {
+            if !e.path().is_dir() {
+                continue;
+            }
+            if let Some(n) = e
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                disk.push(n);
+            }
         }
     }
-    out.sort_unstable();
-    out
+    disk.sort_unstable();
+    disk
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -387,6 +394,9 @@ pub fn delete_chapter(project_dir: &Path, chapter: u32) -> Result<DeleteChapterR
     }
     fs::remove_dir_all(&dir)
         .with_context(|| format!("删除 {}", dir.display()))?;
+
+    let _ = crate::chapter_index::remove_chapter(project_dir, chapter);
+    let _ = crate::lore_index::remove_chapter_index_row(project_dir, chapter);
 
     let remaining = list_chapter_numbers(project_dir);
     let max = remaining.iter().copied().max().unwrap_or(0);
@@ -427,16 +437,32 @@ fn prune_legacy_chapters_array(project_dir: &Path, chapter: u32) -> Result<()> {
 }
 
 fn prune_memory_chapter_refs(project_dir: &Path, chapter: u32) -> Result<()> {
-    let path = project_dir.join("lore/memory.json");
-    if !path.exists() {
+    use crate::memory::{
+        load_memory, rebuild_rolling_summary, save_memory, ROLLING_SUMMARY_LIMIT,
+    };
+    if !project_dir.join("lore/memory.json").exists() {
         return Ok(());
     }
-    let mut root: Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
-    let Some(obj) = root.as_object_mut() else {
-        return Ok(());
-    };
+    let mut mem = load_memory(project_dir);
+    mem.recent_digests.retain(|d| d.chapter != chapter);
+    mem.asserted_facts.retain(|f| f.chapter != chapter);
+    mem.entity_timeline.retain(|f| f.chapter != chapter);
+    // Drop foreshadows planted only in the deleted chapter (still open).
+    mem.open_threads
+        .retain(|t| !(t.planted_chapter == chapter && (t.status == "open" || t.status.is_empty())));
+    mem.archived_threads
+        .retain(|t| !(t.planted_chapter == chapter && (t.status == "open" || t.status.is_empty())));
+    mem.rolling_summary = rebuild_rolling_summary(&mem.recent_digests, ROLLING_SUMMARY_LIMIT);
+    mem.last_chapter = mem
+        .recent_digests
+        .iter()
+        .map(|d| d.chapter)
+        .max()
+        .unwrap_or(0);
+    mem.extra.remove("last_chapter");
+    // Strip legacy array keys if older dumps used them.
     for key in ["digests", "chapter_digests", "summaries"] {
-        if let Some(arr) = obj.get_mut(key).and_then(|v| v.as_array_mut()) {
+        if let Some(Value::Array(arr)) = mem.extra.get_mut(key) {
             arr.retain(|c| {
                 c.get("chapter")
                     .and_then(|n| n.as_u64())
@@ -445,7 +471,8 @@ fn prune_memory_chapter_refs(project_dir: &Path, chapter: u32) -> Result<()> {
             });
         }
     }
-    fs::write(path, serde_json::to_string_pretty(&root)?)?;
+    save_memory(project_dir, &mem)?;
+    let _ = crate::foreshadow::rebuild_foreshadow_index(project_dir);
     Ok(())
 }
 
@@ -500,6 +527,68 @@ mod tests {
         let raw: Value =
             serde_json::from_str(&fs::read_to_string(proj.join("state.json")).unwrap()).unwrap();
         assert_eq!(raw["chapters"].as_array().unwrap().len(), 1);
+        let _ = fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn delete_chapter_prunes_recent_digests() {
+        let proj = std::env::temp_dir().join(format!(
+            "novelx-del-mem-{}",
+            uuid_like()
+        ));
+        let _ = fs::remove_dir_all(&proj);
+        fs::create_dir_all(proj.join("chapters/001")).unwrap();
+        fs::create_dir_all(proj.join("chapters/002")).unwrap();
+        fs::create_dir_all(proj.join("lore")).unwrap();
+        fs::write(proj.join("chapters/001/draft.md"), "# 1\n正文\n").unwrap();
+        fs::write(proj.join("chapters/002/draft.md"), "# 2\n正文\n").unwrap();
+        let state = ProjectState {
+            name: "book".into(),
+            genre: "未定".into(),
+            target_chapters: 100,
+            published_count: 2,
+            next_chapter: 3,
+            active_agents: vec![],
+            meta: HashMap::new(),
+            extra: HashMap::new(),
+        };
+        save_project_state(&proj, &state).unwrap();
+        let mem = crate::memory::ProjectMemory {
+            recent_digests: vec![
+                crate::memory::ChapterDigest {
+                    chapter: 1,
+                    event_summary: "第一章事件".into(),
+                    ..Default::default()
+                },
+                crate::memory::ChapterDigest {
+                    chapter: 2,
+                    event_summary: "第二章事件".into(),
+                    ..Default::default()
+                },
+            ],
+            last_chapter: 2,
+            open_threads: vec![crate::memory::OpenThread {
+                id: "t2".into(),
+                text: "第二章才埋的线".into(),
+                status: "open".into(),
+                planted_chapter: 2,
+                resolved_chapter: 0,
+            }],
+            ..Default::default()
+        };
+        crate::memory::save_memory(&proj, &mem).unwrap();
+        delete_chapter(&proj, 2).unwrap();
+        let mem = crate::memory::load_memory(&proj);
+        assert!(
+            !mem.recent_digests.iter().any(|d| d.chapter == 2),
+            "recent_digests must drop deleted chapter: {:?}",
+            mem.recent_digests
+        );
+        assert_eq!(mem.last_chapter, 1);
+        assert!(
+            !mem.open_threads.iter().any(|t| t.planted_chapter == 2),
+            "open foreshadow planted in deleted chapter must drop"
+        );
         let _ = fs::remove_dir_all(&proj);
     }
 

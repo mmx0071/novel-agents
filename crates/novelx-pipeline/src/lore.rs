@@ -12,6 +12,30 @@ pub fn lore_query(project_dir: &Path, chapter: u32, outline: &str, draft: &str) 
     let mem = load_memory(project_dir);
     let mut parts = Vec::new();
 
+    // Prefer SQLite entity hits when index is warm; needle from roster / lore_queries.
+    let mut index_hits: Vec<(String, String, String)> = Vec::new();
+    let mut seen_names = std::collections::HashSet::new();
+    for needle in lore_index_needles(outline) {
+        if let Some(hits) = crate::lore_index::query_entities_from_index(project_dir, &needle, 6) {
+            for h in hits {
+                if seen_names.insert(h.1.clone()) {
+                    index_hits.push(h);
+                }
+            }
+        }
+        if index_hits.len() >= 8 {
+            break;
+        }
+    }
+    if !index_hits.is_empty() {
+        let lines: Vec<String> = index_hits
+            .into_iter()
+            .take(8)
+            .map(|(kind, name, status)| format!("- [{kind}] {name}（{status}）"))
+            .collect();
+        parts.push(format!("## Lore·实体索引\n{}", lines.join("\n")));
+    }
+
     if !mem.rolling_summary.is_empty() {
         parts.push(format!(
             "## Lore·滚动摘要\n{}",
@@ -201,19 +225,25 @@ pub fn lore_assert_from_summary(
                 continue;
             }
         }
+        let entity = text
+            .split('：')
+            .next()
+            .map(str::trim)
+            .filter(|s| (2..=12).contains(&s.chars().count()))
+            .unwrap_or("")
+            .to_string();
         mem.asserted_facts.push(AssertedFact {
             id: format!("fact_{}", &Uuid::new_v4().simple().to_string()[..10]),
-            text,
+            text: text.clone(),
             chapter,
             source: "summarizer".into(),
+            entity,
+            confidence: 0.9,
         });
         added += 1;
     }
 
-    if mem.asserted_facts.len() > 200 {
-        let skip = mem.asserted_facts.len() - 200;
-        mem.asserted_facts = mem.asserted_facts.split_off(skip);
-    }
+    crate::memory::prune_asserted_facts_to_archive(project_dir, &mut mem)?;
     save_memory(project_dir, &mem)?;
     Ok((added, conflicts))
 }
@@ -234,6 +264,35 @@ fn looks_conflicting(a: &str, b: &str) -> bool {
         }
     }
     false
+}
+
+/// Needles for SQLite entity lookup: outline roster names + lore_queries keywords.
+fn lore_index_needles(outline: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut push = |s: &str| {
+        let t = s.trim();
+        if t.chars().count() >= 2 && !out.iter().any(|x: &String| x == t) {
+            out.push(t.to_string());
+        }
+    };
+    let roster = crate::schemas::outline_entity_roster(outline);
+    for n in roster
+        .characters
+        .iter()
+        .chain(roster.items.iter())
+        .chain(roster.locations.iter())
+    {
+        push(n);
+    }
+    if let Ok(parsed) = crate::schemas::parse_chapter_outline_text(outline) {
+        for q in &parsed.lore_queries {
+            // Prefer short keyword from query (first 8 chars / first token-ish).
+            let key: String = q.chars().take(8).collect();
+            push(&key);
+            push(q);
+        }
+    }
+    out
 }
 
 #[cfg(test)]

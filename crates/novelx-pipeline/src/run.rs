@@ -7,9 +7,8 @@ use novelx_harness::{
     check_draft_with, collect_signals, evaluate_activation, has_blocking_violation,
     ContentRulesConfig, has_timeline_p0,
     consistency_human_option_labels, merge_verify_audit, normalize_consistency_issues,
-    on_consistency_result, on_pacing_result, with_issue_ids,
-    resolve_pipeline_agents, should_publish,
-    ChapterBudget, GateDecision, HandlerKind, NamingRules, PipelineConfig,
+    on_consistency_result, on_pacing_result, with_issue_ids, should_publish,
+    ChapterBudget, GateDecision, HandlerKind, LengthAssessment, NamingRules, PipelineConfig,
 };
 use novelx_llm::LlmClient;
 use novelx_skills::{build_skill_injections, load_skills, SkillScope};
@@ -28,7 +27,9 @@ use crate::project::{
     load_project_state, read_chapter_draft, read_chapter_outline, save_project_state,
     write_chapter_draft, write_chapter_outline, ProjectState,
 };
-use crate::schemas::{normalize_draft_best_effort, validate_draft, MIN_DRAFT_BODY_CHARS};
+use crate::schemas::{
+    draft_body_chars, normalize_draft_best_effort, validate_draft, MIN_DRAFT_BODY_CHARS,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -126,6 +127,12 @@ pub struct PipelineRun {
     /// Rationale when plot accept failed (for gate revise instructions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plot_accept_rationale: Option<String>,
+    /// Layered audit used light (Pacing) consistency context.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub consistency_light: bool,
+    /// Length gate outcome: ok | soft_short | hard_short | soft_short_escalated
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub length_status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,8 +164,33 @@ pub fn plan_chapter_steps_with_activation(
     state: &ProjectState,
     draft: &str,
 ) -> Vec<String> {
+    plan_chapter_steps_with_activation_for(config_root, project_dir, state, draft, state.next_chapter.max(1))
+}
+
+/// Plan chapter steps for a specific chapter (activation uses that chapter for lean/arc counts).
+pub fn plan_chapter_steps_with_activation_for(
+    config_root: &Path,
+    project_dir: &Path,
+    state: &ProjectState,
+    draft: &str,
+    chapter: u32,
+) -> Vec<String> {
     let pipe = PipelineConfig::load(config_root);
-    let signals = collect_signals(project_dir, state.published_count, draft);
+    let mut signals = collect_signals(project_dir, state.published_count, draft);
+    signals.chapter = chapter;
+    if let Some(vol) = crate::volume::active_volume_for_chapter(project_dir, chapter) {
+        let (start, end) = crate::volume::volume_chapter_span(&vol, chapter);
+        signals.chapters_in_current_arc = end.saturating_sub(start).saturating_add(1);
+    } else {
+        signals.chapters_in_current_arc = state.published_count.min(chapter);
+    }
+    let phase = crate::phases::resolve_volume_phase(project_dir);
+    signals.volume_handoff = matches!(
+        phase,
+        crate::phases::VolumePhase::AwaitingSync
+            | crate::phases::VolumePhase::AwaitingNextArc
+            | crate::phases::VolumePhase::AwaitingNextPlot
+    );
     let suggestions = evaluate_activation(config_root, &signals);
     if !suggestions.is_empty() {
         tracing::info!(
@@ -166,7 +198,52 @@ pub fn plan_chapter_steps_with_activation(
             "agent activation suggestions"
         );
     }
-    resolve_pipeline_agents(&state.active_agents, &pipe, &suggestions)
+    let lean = longform_lean_enabled(config_root).then_some(&signals);
+    let tier = novelx_harness::LongformConfig::load_from_config_root(config_root).quality_tier;
+    novelx_harness::resolve_pipeline_agents_with_tier(
+        &state.active_agents,
+        &pipe,
+        &suggestions,
+        lean,
+        tier,
+    )
+}
+
+fn longform_lean_enabled(config_root: &Path) -> bool {
+    let path = config_root.join("features.yaml");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return true; // default on for longform cost control
+    };
+    #[derive(Deserialize)]
+    struct FeaturesFile {
+        #[serde(default)]
+        features: std::collections::HashMap<String, bool>,
+    }
+    serde_yaml::from_str::<FeaturesFile>(&raw)
+        .ok()
+        .and_then(|f| f.features.get("pipeline.longform_lean").copied())
+        .unwrap_or(true)
+}
+
+fn use_layered_consistency_light(
+    config_root: &Path,
+    chapter: u32,
+    outline: &str,
+    verify_previous: bool,
+) -> bool {
+    if verify_previous {
+        return false;
+    }
+    let lf = novelx_harness::LongformConfig::load_from_config_root(config_root);
+    if !matches!(lf.audit_tier, novelx_harness::AuditTier::Layered) {
+        return false;
+    }
+    let tags = outline.to_lowercase();
+    let climax = ["战斗", "高潮", "决战", "对决", "battle", "climax", "confrontation"]
+        .iter()
+        .any(|t| tags.contains(t));
+    // Full audit on odd chapters and climax-tagged outlines; light on routine even chapters.
+    !(chapter % 2 == 1 || climax)
 }
 
 pub fn plan_revision_steps_with(pipe: &PipelineConfig, local_patch: bool) -> Vec<String> {
@@ -205,11 +282,12 @@ pub fn plan_steps_for_mode(
             if revision.revision_mode && !existing_draft.is_empty() {
                 plan_revision_steps_with(&pipe, true)
             } else {
-                plan_chapter_steps_with_activation(
+                plan_chapter_steps_with_activation_for(
                     config_root,
                     &project_dir,
                     &state,
                     &existing_draft,
+                    chapter,
                 )
             }
         }
@@ -292,6 +370,7 @@ pub async fn execute_pipeline_with_steps(
     let project_dir = projects_root.join(project);
     let mut state = load_project_state(&project_dir)?;
     let run_id = format!("run_{}", Uuid::new_v4().simple());
+    let pipeline_started = std::time::Instant::now();
 
     let emit = |tx: &Option<mpsc::UnboundedSender<PipelineEvent>>, ev: PipelineEvent| {
         if let Some(tx) = tx {
@@ -353,6 +432,8 @@ pub async fn execute_pipeline_with_steps(
         plot_setting_blocker: false,
         plot_accept_passed: None,
         plot_accept_rationale: None,
+        consistency_light: false,
+        length_status: String::new(),
     };
     let audit_only = matches!(mode, RunMode::AuditOnly);
     let mut report_parts: Vec<String> = Vec::new();
@@ -662,7 +743,20 @@ pub async fn execute_pipeline_with_steps(
             }
             Some(HandlerKind::Consistency) => {
                 tracing::info!(chapter, "audit: consistency_auditor start");
-                let canon = rebuild_canon(&draft, &outline, ContextProfile::Full);
+                let light = use_layered_consistency_light(
+                    config_root,
+                    chapter,
+                    &outline,
+                    revision.verify_previous,
+                );
+                run.consistency_light = light;
+                let profile = if light {
+                    tracing::info!(chapter, "audit: layered light consistency context");
+                    ContextProfile::Pacing
+                } else {
+                    ContextProfile::Full
+                };
+                let canon = rebuild_canon(&draft, &outline, profile);
                 let audit_path = project_dir
                     .join("chapters")
                     .join(format!("{chapter:03}"))
@@ -1068,6 +1162,72 @@ pub async fn execute_pipeline_with_steps(
         }
     }
 
+    // Length budget: hard short blocks; soft short warns; streak may escalate SoftShort.
+    let mut length_soft_short = false;
+    let mut length_ok = false;
+    if !draft.is_empty() {
+        let body_n = draft_body_chars(&draft);
+        match chapter_budget.assess_body_chars(body_n) {
+            LengthAssessment::HardShort => {
+                has_blocking = true;
+                run.length_status = "hard_short".into();
+                // Surface chapter_next「修正本章」even when consistency passed.
+                run.needs_user_choice = true;
+                let msg = chapter_budget.hard_short_message(body_n);
+                tracing::warn!(chapter, body_chars = body_n, "{msg}");
+                report_parts.push(format!("## 字数门控（阻断发布）\n{msg}"));
+                if run.message.is_empty() {
+                    run.message = format!("完成，但{msg}");
+                } else {
+                    run.message = format!("{}\n\n{msg}", run.message);
+                }
+            }
+            LengthAssessment::SoftShort => {
+                length_soft_short = true;
+                let prev_streak =
+                    novelx_harness::consecutive_soft_short_from_meta(&state.meta);
+                let next_streak = prev_streak.saturating_add(1);
+                let threshold = chapter_budget.soft_short_auto_revise_after;
+                if threshold > 0 && next_streak >= threshold {
+                    has_blocking = true;
+                    run.length_status = "soft_short_escalated".into();
+                    let msg =
+                        chapter_budget.soft_short_escalate_message(body_n, next_streak);
+                    tracing::warn!(chapter, body_chars = body_n, streak = next_streak, "{msg}");
+                    report_parts.push(format!("## 字数门控（连续偏短·阻断发布）\n{msg}"));
+                    if run.message.is_empty() {
+                        run.message = format!("完成，但{msg}");
+                    } else {
+                        run.message = format!("{}\n\n{msg}", run.message);
+                    }
+                    run.needs_user_choice = true;
+                } else {
+                    run.length_status = "soft_short".into();
+                    let msg = chapter_budget.soft_short_message(body_n);
+                    tracing::info!(
+                        chapter,
+                        body_chars = body_n,
+                        streak = next_streak,
+                        "{msg}"
+                    );
+                    report_parts.push(format!(
+                        "## 字数门控（软警告 · 连续偏短 {next_streak}/{}）\n{msg}",
+                        if threshold == 0 { 0 } else { threshold }
+                    ));
+                    if run.message.is_empty() {
+                        run.message = format!("完成，另有{msg}");
+                    } else {
+                        run.message = format!("{}\n\n{msg}", run.message);
+                    }
+                }
+            }
+            LengthAssessment::Ok => {
+                length_ok = true;
+                run.length_status = "ok".into();
+            }
+        }
+    }
+
     let banned_blocking = has_blocking_violation(&violations);
     run.content_rule_blocked = banned_blocking;
     let publish_ok = allow_publish
@@ -1103,6 +1263,18 @@ pub async fn execute_pipeline_with_steps(
         run.plot_setting_blocker = fin.plot_setting_blocker;
         run.plot_accept_passed = fin.plot_accept_passed;
         run.plot_accept_rationale = fin.plot_accept_rationale;
+        // Track consecutive SoftShort for longform length discipline.
+        if fin.published {
+            if length_ok {
+                novelx_harness::set_consecutive_soft_short(&mut state.meta, 0);
+                let _ = save_project_state(&project_dir, &state);
+            } else if length_soft_short {
+                let n = novelx_harness::consecutive_soft_short_from_meta(&state.meta)
+                    .saturating_add(1);
+                novelx_harness::set_consecutive_soft_short(&mut state.meta, n);
+                let _ = save_project_state(&project_dir, &state);
+            }
+        }
         if fin.await_human {
             await_human = true;
         }
@@ -1140,6 +1312,49 @@ pub async fn execute_pipeline_with_steps(
         run.needs_user_choice = true;
     }
     run.report = report_parts.join("\n\n---\n\n");
+    // Per-agent cost visibility (approx): log each step, then a pipeline rollup.
+    {
+        use crate::cost_log::{append_cost_entry, approx_tokens_from_chars, CostEntry};
+        let draft_chars = draft.chars().count();
+        let total_ms = pipeline_started.elapsed().as_millis() as u64;
+        let step_n = run.steps.len().max(1) as u64;
+        let per_step_ms = total_ms / step_n;
+        let mut sum_tok = 0u32;
+        for step in &run.steps {
+            let summary_chars = step.summary.chars().count();
+            let base = if step.agent == "writer" || step.agent.contains("writer") {
+                draft_chars.saturating_add(summary_chars)
+            } else if step.agent == "lore_librarian" {
+                // Deterministic query — tiny.
+                summary_chars.max(64)
+            } else {
+                // Context in + report out (rough).
+                summary_chars.saturating_add(1200)
+            };
+            let tok = approx_tokens_from_chars(base);
+            sum_tok = sum_tok.saturating_add(tok);
+            let _ = append_cost_entry(
+                &project_dir,
+                &CostEntry {
+                    chapter,
+                    agent: step.agent.clone(),
+                    approx_tokens: tok,
+                    elapsed_ms: per_step_ms,
+                    note: step.status.clone(),
+                },
+            );
+        }
+        let _ = append_cost_entry(
+            &project_dir,
+            &CostEntry {
+                chapter,
+                agent: "pipeline".into(),
+                approx_tokens: sum_tok,
+                elapsed_ms: total_ms,
+                note: format!("steps={} (sum of agent rows)", run.steps.len()),
+            },
+        );
+    }
     if audit_only {
         let base = if run.report.is_empty() {
             format!("第{chapter}章审校完成（无报告正文）")
@@ -1190,6 +1405,30 @@ pub async fn execute_pipeline_with_steps(
             }
         }
     }
+
+    // Surface non-pipeline activation (e.g. volume_auditor) in tool output for Studio.
+    let state_now = load_project_state(&project_dir).unwrap_or(state);
+    let hints = crate::activation_hints::collect_studio_activation_hints(
+        config_root,
+        &project_dir,
+        &state_now,
+        chapter,
+        &draft,
+        project,
+    );
+    if let Some(block) = crate::activation_hints::format_studio_activation_hints_block(&hints) {
+        if !run.message.contains("## 长程 QA 建议") {
+            run.message = format!("{}\n\n{block}", run.message);
+        }
+        if !run.report.contains("## 长程 QA 建议") {
+            if run.report.is_empty() {
+                run.report = block;
+            } else {
+                run.report = format!("{}\n\n---\n\n{block}", run.report);
+            }
+        }
+    }
+
     emit(
         &tx,
         PipelineEvent::RunCompleted {
@@ -2354,6 +2593,7 @@ async fn stream_agent_llm(
 }
 
 /// Sample head + middle + tail so long chapters don't lose ending facts/hooks.
+/// Prefer full draft when within max_chars; otherwise head/mid/tail sample.
 fn summarizer_excerpt(draft: &str, max_chars: usize) -> String {
     let chars: Vec<char> = draft.chars().collect();
     if chars.len() <= max_chars {
@@ -2560,16 +2800,19 @@ fn apply_foreshadow_report(project_dir: &Path, chapter: u32, report: &str) -> Re
             if text.is_empty() {
                 continue;
             }
-            if mem.open_threads.iter().any(|t| t.text == text)
-                || mem.archived_threads.iter().any(|t| t.text == text)
-            {
-                continue;
-            }
             let id = item
                 .get("id")
                 .and_then(|x| x.as_str())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| format!("fs_{}", &Uuid::new_v4().simple().to_string()[..10]));
+            if crate::memory::foreshadow_already_known(
+                project_dir,
+                &mem,
+                Some(id.as_str()),
+                &text,
+            ) {
+                continue;
+            }
             mem.open_threads.push(OpenThread {
                 id,
                 text,
@@ -2582,6 +2825,8 @@ fn apply_foreshadow_report(project_dir: &Path, chapter: u32, report: &str) -> Re
     }
 
     if let Some(arr) = v.get("resolved").and_then(|x| x.as_array()) {
+        let mut cold_ids = Vec::new();
+        let mut cold_texts = Vec::new();
         for item in arr {
             let id = item.get("id").and_then(|x| x.as_str()).unwrap_or("");
             let text = item
@@ -2591,6 +2836,12 @@ fn apply_foreshadow_report(project_dir: &Path, chapter: u32, report: &str) -> Re
                 .unwrap_or("");
             if id.is_empty() && text.is_empty() {
                 continue;
+            }
+            if !id.is_empty() {
+                cold_ids.push(id.to_string());
+            }
+            if !text.is_empty() {
+                cold_texts.push(text.to_string());
             }
             for t in mem
                 .open_threads
@@ -2605,8 +2856,24 @@ fn apply_foreshadow_report(project_dir: &Path, chapter: u32, report: &str) -> Re
                     t.status = "resolved".into();
                     t.resolved_chapter = chapter;
                     n += 1;
+                    let kw: String = t.text.chars().take(40).collect();
+                    let _ = crate::lore_index::upsert_foreshadow_index_row(
+                        project_dir,
+                        &t.id,
+                        t.planted_chapter,
+                        "resolved",
+                        &kw,
+                    );
                 }
             }
+        }
+        if let Ok(cold_n) = crate::memory::resolve_foreshadow_archive(project_dir, chapter, |t| {
+            cold_ids.iter().any(|id| t.id == *id)
+                || cold_texts
+                    .iter()
+                    .any(|text| t.text.contains(text) || text.contains(&t.text))
+        }) {
+            n += cold_n;
         }
     }
 
@@ -2617,14 +2884,26 @@ fn apply_foreshadow_report(project_dir: &Path, chapter: u32, report: &str) -> Re
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .to_string();
+            let id = item
+                .get("id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
             if text.is_empty()
-                || mem.open_threads.iter().any(|t| t.text == text)
-                || mem.archived_threads.iter().any(|t| t.text == text)
+                || crate::memory::foreshadow_already_known(
+                    project_dir,
+                    &mem,
+                    if id.is_empty() { None } else { Some(id) },
+                    &text,
+                )
             {
                 continue;
             }
             mem.open_threads.push(OpenThread {
-                id: format!("fs_{}", &Uuid::new_v4().simple().to_string()[..10]),
+                id: if id.is_empty() {
+                    format!("fs_{}", &Uuid::new_v4().simple().to_string()[..10])
+                } else {
+                    id.to_string()
+                },
                 text,
                 status: "open".into(),
                 planted_chapter: chapter,
@@ -2634,7 +2913,7 @@ fn apply_foreshadow_report(project_dir: &Path, chapter: u32, report: &str) -> Re
         }
     }
 
-    crate::memory::prune_open_threads_into_archive(&mut mem);
+    let _ = crate::memory::prune_open_threads_into_archive(Some(project_dir), &mut mem);
     save_memory(project_dir, &mem)?;
     let _ = crate::foreshadow::rebuild_foreshadow_index(project_dir);
     Ok(n)
@@ -2756,6 +3035,10 @@ pub async fn finalize_chapter_publish(
     }
     let _ = crate::project::refresh_meta_flags(project_dir);
     let _ = crate::project::sync_records_novel_json(project_dir, state);
+    // Longform: every 10 published chapters, append a cheap drift sample note.
+    if chapter > 0 && chapter % 10 == 0 {
+        let _ = append_drift_sample(project_dir, chapter);
+    }
 
     let mut plot_events = Vec::new();
     match crate::plots::advance_plots_for_published_chapter(project_dir, chapter) {
@@ -3105,6 +3388,46 @@ pub fn apply_cached_local_patches(
     }
     write_chapter_draft(&project_dir, chapter, &draft)?;
     Ok(applied)
+}
+
+/// Cheap longform drift sample every N chapters (deterministic, no LLM).
+fn append_drift_sample(project_dir: &Path, chapter: u32) -> anyhow::Result<()> {
+    let mem = crate::memory::load_memory(project_dir);
+    let open = mem
+        .open_threads
+        .iter()
+        .filter(|t| t.status == "open" || t.status.is_empty())
+        .count();
+    let soft = novelx_harness::consecutive_soft_short_from_meta(
+        &crate::project::load_project_state(project_dir)
+            .map(|s| s.meta)
+            .unwrap_or_default(),
+    );
+    let exit = crate::plots::active_plot_exit_context(project_dir)
+        .map(|(_, e, _)| {
+            e.chars().take(80).collect::<String>()
+        })
+        .unwrap_or_default();
+    let body = crate::body_state::format_body_state_board(project_dir, chapter);
+    let line = serde_json::json!({
+        "chapter": chapter,
+        "open_threads": open,
+        "consecutive_soft_short": soft,
+        "active_exit": exit,
+        "body_state_chars": body.chars().count(),
+        "facts_hot": mem.asserted_facts.len(),
+    });
+    let path = project_dir.join("lore/drift_samples.jsonl");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(f, "{}", serde_json::to_string(&line)?)?;
+    Ok(())
 }
 
 #[cfg(test)]

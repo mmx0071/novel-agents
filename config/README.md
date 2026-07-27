@@ -12,6 +12,9 @@
 | `skills/**` | Web「Skills」（仅框架 skill） | Agent 提示正文；PUT 后 `reload_skills` |
 | `llm.yaml` | Web「模型」结构化表单或手工编辑 | Provider / 任务模型 / profile / 重试；PUT 后热重载 |
 | `gates.yaml` / `features.yaml` / `intents.yaml` | 磁盘编辑（本期无表单） | 门控、特性开关、意图路由 |
+| `chapter.yaml` | 磁盘编辑 | 章长目标 / 硬门 / 连续偏短升格 |
+| `longform.yaml` | 磁盘编辑 | 超长篇：`quality_tier` / `audit_tier` / `impact_scan_mode` / `batch_max_chapters`；`audit_tier: layered` 常规章用轻量一致性上下文（高潮/奇数章/复审仍 full），省 token，偶发漏检风险略高于 `full` |
+| `continuity.yaml` / `volume.yaml` | 磁盘编辑 | CanonContext 预算、薄卷阈值 |
 
 API Key 只写入仓库根 `.env`（gitignore），**不进** `llm.yaml`。`GET /api/config/llm` 只返回 `has_api_key` 与末 4 位 suffix，永不回传明文 Key；PUT 时 `api_key` 留空表示不修改。
 

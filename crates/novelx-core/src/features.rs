@@ -46,6 +46,13 @@ impl FeatureFlags {
         m.insert("studio.require_mutation_confirm".into(), true);
         m.insert("studio.impact_cascade".into(), true);
         m.insert("studio.impact_llm_refine".into(), false);
+        m.insert("studio.impact_scan_all_drafts".into(), false);
+        // Default false: use longform.yaml impact_scan_mode (indexed) instead of full-book scan.
+        m.insert("studio.impact_scan_all_on_setting".into(), false);
+        m.insert("pipeline.longform_lean".into(), true);
+        m.insert("studio.require_volume_audit_mid".into(), true);
+        m.insert("studio.require_volume_audit_handoff".into(), true);
+        m.insert("studio.cold_archive_drafts".into(), true);
         Self { map: Arc::new(m) }
     }
 

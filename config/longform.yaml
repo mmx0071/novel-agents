@@ -1,0 +1,27 @@
+# Ultra-longform knobs (800–1000 chapters × 5–6k).
+# String/enum settings live here; boolean toggles stay in features.yaml.
+version: 1
+
+# economy | balanced | quality
+# economy: aggressive lean (skip specialists when unneeded; foreshadow cadence)
+# balanced: lean but keep foreshadow when open threads remain; specialists on tags
+# quality: no lean filtering (activation suggestions always kept)
+quality_tier: balanced
+
+# full | layered
+# layered: routine chapters use lighter consistency context; climax / odd / reaudit → full.
+# Trade-off: fewer tokens / faster routine audits; slightly higher miss risk vs full.
+audit_tier: layered
+
+# volume | indexed | all
+# volume: active volume drafts only (default longform-safe)
+# indexed: active volume + BM25/key-matched chapters across the book
+# all: every published draft (expensive; opt-in)
+impact_scan_mode: indexed
+
+# Max chapters per continue_writing_batch / CLI --batch before hard stop
+batch_max_chapters: 20
+
+# Soft-short streak: when consecutive SoftShort publishes would reach this,
+# the current SoftShort blocks publish (force expand). See chapter.yaml hard min.
+soft_short_auto_revise_after: 3
