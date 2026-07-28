@@ -31,13 +31,18 @@ pub mod volume_audit_gate;
 pub mod volume_checklist;
 
 pub use cards::{
-    collect_entity_gaps, entity_names_equivalent, entity_status_is_active, load_markdown_cards,
-    normalize_entity_status, read_arc_outline_excerpt, resolve_entity_card_path, MarkdownCard,
+    collect_entity_gaps, detect_location_parent, entity_names_equivalent, entity_status_is_active,
+    fold_location_child_into_card, load_markdown_cards, location_name_looks_dependent,
+    location_name_looks_parent_scale, normalize_entity_status, read_arc_outline_excerpt,
+    resolve_entity_card_path, resolve_location_write_target, MarkdownCard,
 };
 pub use batch::{
     run_continue_batch, BatchChapterResult, BatchContinueOpts, BatchContinueResult,
 };
-pub use body_state::{format_body_state_board, format_body_state_board_for_character};
+pub use body_state::{
+    check_body_state_conflicts, check_body_state_locus_conflicts, check_body_state_side_conflicts,
+    format_body_state_board, format_body_state_board_for_character,
+};
 pub use chapter_gate::{check_chapter_order, check_revise_target, ChapterOrderBlock};
 pub use context::{
     build_chapter_context, format_chapter_bridge, read_world_doc, ChapterContextPack, ContextProfile,
@@ -96,10 +101,11 @@ pub use phases::{
     SetupPhase, VolumePhase,
 };
 pub use project::{
-    chapter_dir, delete_chapter, init_project, list_chapter_numbers, list_projects,
-    load_project_state, project_dir, read_chapter_draft, read_chapter_outline, refresh_meta_flags,
-    save_project_state, sync_records_novel_json, update_target_chapters, write_chapter_draft,
-    write_chapter_outline, DeleteChapterResult, ProjectState,
+    chapter_dir, chapter_memory_artifact_matches_draft, delete_chapter, draft_fingerprint,
+    init_project, list_chapter_numbers, list_projects, load_project_state, project_dir,
+    read_chapter_draft, read_chapter_outline, refresh_meta_flags, save_project_state,
+    sync_records_novel_json, update_target_chapters, write_chapter_draft,
+    write_chapter_memory_artifact, write_chapter_outline, DeleteChapterResult, ProjectState,
 };
 pub use schemas::{
     display_arc_outline, display_bible, display_chapter_outline, display_draft, display_entity_card,

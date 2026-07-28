@@ -4,6 +4,11 @@ version: 1
 features:
   # Match config/intents.yaml before the LLM tool loop.
   studio.deterministic_intents: true
+  # After a clean published write/revise: pause immediately (true) or allow one
+  # narration follow-up round then pause for chapter_next (false = more agentic).
+  studio.pause_after_clean_write: false
+  # Stream model reasoning_content into the UI as a「思考」card.
+  studio.stream_reasoning: true
   # Clear prior chat when continue_writing actually starts (plot gate Allow; keep current turn).
   studio.clear_history_on_new_chapter: true
   # After steer_run revise, auto re-audit (queue continue or audit_chapter).

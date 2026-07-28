@@ -340,22 +340,53 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   flex-shrink: 0;
 }
 
+.side-health {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid #2a3142;
+}
+
 .longform-health {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   gap: 8px;
-  padding: 0 12px 10px;
+}
+
+.longform-health--side {
+  grid-template-columns: 1fr;
+  gap: 6px;
+  margin-top: 8px;
 }
 
 .longform-health-card {
   background: #151a24;
   border: 1px solid #2a3142;
+  border-left-width: 3px;
   border-radius: 10px;
   padding: 8px 10px;
   min-width: 0;
 }
 
+.longform-health-card.level-ok {
+  border-left-color: #3dba7a;
+  background: linear-gradient(90deg, rgba(61, 186, 122, 0.1), #151a24 40%);
+}
+
+.longform-health-card.level-warn {
+  border-left-color: #e0a35a;
+  background: linear-gradient(90deg, rgba(224, 163, 90, 0.12), #151a24 40%);
+}
+
+.longform-health-card.level-bad {
+  border-left-color: #e05a6a;
+  background: linear-gradient(90deg, rgba(224, 90, 106, 0.14), #151a24 40%);
+}
+
 .longform-health-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
   font-size: 0.68rem;
   font-weight: 700;
   letter-spacing: 0.04em;
@@ -364,10 +395,48 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   margin-bottom: 4px;
 }
 
+.longform-health-badge {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: none;
+  line-height: 1.4;
+}
+
+.longform-health-badge.level-ok {
+  color: #1f7a4a;
+  background: rgba(61, 186, 122, 0.22);
+}
+
+.longform-health-badge.level-warn {
+  color: #8a5a18;
+  background: rgba(224, 163, 90, 0.28);
+}
+
+.longform-health-badge.level-bad {
+  color: #9a2434;
+  background: rgba(224, 90, 106, 0.28);
+}
+
 .longform-health-body {
   font-size: 0.82rem;
   color: #e6e9f0;
   line-height: 1.35;
+}
+
+.longform-health-card.level-ok .longform-health-body {
+  color: #c8efd8;
+}
+
+.longform-health-card.level-warn .longform-health-body {
+  color: #f0d7b0;
+}
+
+.longform-health-card.level-bad .longform-health-body {
+  color: #f0c0c6;
 }
 
 .longform-health-sub,
@@ -377,11 +446,6 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   color: #9aa3b5;
   line-height: 1.35;
   word-break: break-word;
-}
-
-.longform-health-warn {
-  color: #e0a35a;
-  font-weight: 600;
 }
 
 .longform-health-list {
@@ -397,6 +461,40 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.longform-health-list.is-expanded {
+  max-height: min(36vh, 280px);
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.longform-health-list.is-expanded li {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: unset;
+  padding: 3px 0;
+  border-bottom: 1px solid #222836;
+}
+
+.longform-health-list.is-expanded li:last-child {
+  border-bottom: 0;
+}
+
+.longform-health-more {
+  margin-top: 6px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: #8fa4ff;
+  font-size: 0.72rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.longform-health-more:hover {
+  color: #b4c2ff;
+  text-decoration: underline;
 }
 
 .reader-volume-strip {

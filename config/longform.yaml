@@ -25,3 +25,6 @@ batch_max_chapters: 20
 # Soft-short streak: when consecutive SoftShort publishes would reach this,
 # the current SoftShort blocks publish (force expand). See chapter.yaml hard min.
 soft_short_auto_revise_after: 3
+
+# Pause batch when open foreshadow debt (dangling_total) exceeds this. 0 = off.
+batch_max_dangling_foreshadow: 40

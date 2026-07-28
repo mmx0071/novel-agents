@@ -27,8 +27,11 @@ const VOLUME_SYNC_SYSTEM: &str = r#"你是小说设定库卷末「状态」同�
 - **实体以 status / holdings 为准**直接同步终态；不要写长篇摘要。可选 note 仅作一句备注。
 - 兼容旧字段 summary：若出现则当作 note。
 - 必须覆盖本卷终态：主角与主要配角、关键地点/物品均须给出 status（及人物 holdings）；勿因「已有卡片」而输出空 entities。
+- **name 必须复用 Entities 列表中的规范名**（物品/地点同理）；括号别名视为同一实体。说明性备注写入 note，禁止写进 name。
+- 地点层级：母地点（小区/园区等）已存在时，楼栋/树阵/楼梯/房间一律 name=母地点，勿为分区另建 name。
+- **物品门槛**：仅同步有实质用途/特性或后续还会再用的道具；气氛物/一次性照明等不要新建 item。
 - status：人物/地点用 active|background|exited；物品用 active|consumed。已退场角色、已消耗物品必须标 exited/consumed。
-- holdings：人物当前持有关键物品（规范名，逗号分隔）；无则 ""。
+- holdings：人物当前持有**关键**物品（规范名，逗号分隔）；无则 ""。
 - master_revision：本卷兑现后，全书后续卷需要怎么改（目标偏移/新悬念）；只写要点，勿重写全文。
 - 人物名遵守禁名与已有命名。
 - 只输出 JSON，不要解释。"#;
@@ -158,7 +161,12 @@ const PLOT_SYNC_SYSTEM: &str = r#"你是小说设定库「剧情收束」同步�
 规则：
 - 禁止输出 plots / relation_graph / arc_progress / master_revision。
 - 只写本剧情期间确实变化的实体/名词/世界观补丁；无变化可少写，勿编造。
-- 实体 summary 写收束后的最新状态；新建卡会标为 stub 待补全。
+- **name 必须优先复用 Entities 列表中的规范名**（人物/物品/地点同理）。括号别名、正式名与别名对调均视为同一实体。
+- 说明性备注（如「新」「第五棵」「顶层房间」）写入 summary，**禁止**写进 name（否则会重复建卡）。
+- **地点层级**：先母卡。楼栋/树阵/楼梯/房间若依赖已有母地点，**name 仍可写子区名**（系统会折入母卡），summary 写分区细节；禁止在无母卡时先建子区独立卡。
+- **物品门槛**：仅输出有实质用途/特性或后续还会再用的 item；气氛物/一次性道具不要新建。
+- 仅当 Entities 中确实没有对应实体时才用新 name；新建卡会标为 stub 待补全。
+- 实体 summary 写收束后的最新状态。
 - 只输出 JSON。"#;
 
 const CHAPTER_SYNC_SYSTEM: &str = r#"你是小说设定库「章后」同步员。根据刚发布的本章摘要，输出 JSON（不要 Markdown 围栏），增量更新设定库。
@@ -171,7 +179,11 @@ const CHAPTER_SYNC_SYSTEM: &str = r#"你是小说设定库「章后」同步员�
 规则：
 - 只写本章正文/摘要里**确实发生变化**的实体状态（伤势、持有物、位置、退场/消耗等）；无变化则 entities 可为空数组。
 - status / holdings 必须反映本章结束后的最新态，供下一章设定卡读取。
-- 勿编造未出现的人物/物品；新建卡会标为 stub 待补全。
+- **name 必须优先复用 Entities 列表中的规范名**（物品/地点尤其容易因加括号说明而重复建卡）。
+- 说明性备注写入 summary，**禁止**把「（新）」「（第N处）」等写进 name。
+- **地点层级**：先母卡。子区可写子区 name（系统折入母卡），summary 写细节；无母卡时勿先建楼栋/树阵独立卡。
+- **物品门槛**：仅输出有实质用途/特性或后续还会再用的 item；气氛物（如随手照明的手电筒）不要新建。
+- 勿编造未出现的人物/物品；仅缺卡时才用新 name（新建 stub）。
 - 只输出 JSON。"#;
 
 /// Light setting sync after each published chapter (when the active plot did not complete).
@@ -456,17 +468,23 @@ fn gather_volume_context(project_dir: &Path, volume: &VolumeBound) -> Result<Vol
 
 fn list_entity_names(project_dir: &Path) -> Vec<String> {
     let mut names = Vec::new();
-    for group in ["characters", "items", "locations"] {
+    for (group, kind) in [
+        ("characters", "character"),
+        ("items", "item"),
+        ("locations", "location"),
+    ] {
         let dir = project_dir.join("entities").join(group);
         if let Ok(rd) = std::fs::read_dir(dir) {
             for e in rd.flatten() {
                 let n = e.file_name().to_string_lossy().to_string();
                 if n.ends_with(".md") {
-                    names.push(n.trim_end_matches(".md").to_string());
+                    let stem = n.trim_end_matches(".md");
+                    names.push(format!("{kind}:{stem}"));
                 }
             }
         }
     }
+    names.sort();
     names
 }
 
@@ -615,6 +633,7 @@ struct UpsertEntityOutcome {
 /// Upsert entity card from sync JSON.
 /// - VolumeEnd: write status/holdings (+ optional note) into「当前状态」; no summary stubs.
 /// - PlotLight: keep short sync notes for plot/chapter light sync.
+/// - Reuses existing cards via alias / paren-name equivalence (items & locations included).
 fn upsert_entity_card(
     project_dir: &Path,
     ent: &Value,
@@ -668,12 +687,27 @@ fn upsert_entity_card(
     };
     let folder = project_dir.join("entities").join(group);
     std::fs::create_dir_all(&folder)?;
-    let path = folder.join(format!("{name}.md"));
-    let existed = path.exists();
+    // Locations: alias hit or fold into mother card; others: alias / paren twins.
+    let (path, existing_card, canonical_name, folded_child) = if kind == "location" {
+        let (p, card, write_name, child) =
+            crate::cards::resolve_location_write_target(&folder, name, &note);
+        (p, card, write_name, child)
+    } else {
+        let (p, card) = crate::cards::resolve_entity_card_path(&folder, group, name);
+        let write_name = card
+            .as_ref()
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| name.to_string());
+        (p, card, write_name, None)
+    };
+    let existed = existing_card.is_some() || path.exists();
 
     if mode == SyncApplyMode::VolumeEnd {
         if existed {
             let mut existing = std::fs::read_to_string(&path)?;
+            if let Some(ref child) = folded_child {
+                existing = crate::cards::fold_location_child_into_card(&existing, child, &note);
+            }
             existing = mark_frontmatter_sync_fields(
                 &existing,
                 &status,
@@ -683,8 +717,9 @@ fn upsert_entity_card(
             );
             existing = upsert_current_state_section(&existing, &status, &holdings, &note);
             std::fs::write(&path, existing)?;
+            remove_equivalent_entity_duplicates(&folder, group, &path, &canonical_name, name);
             return Ok(Some(UpsertEntityOutcome {
-                name: name.to_string(),
+                name: canonical_name,
                 incomplete: false,
             }));
         }
@@ -695,11 +730,11 @@ fn upsert_entity_card(
         };
         let state_body = format_current_state_section(&status, &holdings, &note);
         let body = format!(
-            "---\nname: {name}\nkind: {kind}\ncomplete: false\nsource: {source}\nstatus: {status}\n{hold_line}---\n\n# {name}\n\n- 类型：{kind}\n\n{state_body}\n"
+            "---\nname: {canonical_name}\nkind: {kind}\ncomplete: false\nsource: {source}\nstatus: {status}\n{hold_line}---\n\n# {canonical_name}\n\n- 类型：{kind}\n\n{state_body}\n"
         );
         std::fs::write(&path, body)?;
         return Ok(Some(UpsertEntityOutcome {
-            name: name.to_string(),
+            name: canonical_name,
             incomplete: true,
         }));
     }
@@ -712,6 +747,9 @@ fn upsert_entity_card(
     };
     if existed {
         let mut existing = std::fs::read_to_string(&path)?;
+        if let Some(ref child) = folded_child {
+            existing = crate::cards::fold_location_child_into_card(&existing, child, &note);
+        }
         existing = mark_frontmatter_sync_fields(&existing, &status, &holdings, source, true);
         if existing.contains(&format!("## {section_h2}"))
             || existing.contains("## 卷末同步摘要")
@@ -723,8 +761,9 @@ fn upsert_entity_card(
             existing.push_str(&format!("\n\n## {section_h2}\n\n{note}\n"));
         }
         std::fs::write(&path, existing)?;
+        remove_equivalent_entity_duplicates(&folder, group, &path, &canonical_name, name);
         return Ok(Some(UpsertEntityOutcome {
-            name: name.to_string(),
+            name: canonical_name,
             incomplete: false,
         }));
     }
@@ -734,13 +773,36 @@ fn upsert_entity_card(
         format!("holdings: {holdings}\n")
     };
     let body = format!(
-        "---\nname: {name}\nkind: {kind}\ncomplete: false\nsource: {source}\nstatus: {status}\n{hold_line}---\n\n# {name}\n\n- 类型：{kind}\n\n## {section_h2}\n\n{note}\n"
+        "---\nname: {canonical_name}\nkind: {kind}\ncomplete: false\nsource: {source}\nstatus: {status}\n{hold_line}---\n\n# {canonical_name}\n\n- 类型：{kind}\n\n## {section_h2}\n\n{note}\n"
     );
     std::fs::write(&path, body)?;
     Ok(Some(UpsertEntityOutcome {
-        name: name.to_string(),
+        name: canonical_name,
         incomplete: true,
     }))
+}
+
+/// Drop near-duplicate filenames after writing the canonical card (same as design_entity).
+fn remove_equivalent_entity_duplicates(
+    folder: &Path,
+    group: &str,
+    keep_path: &Path,
+    canonical_name: &str,
+    requested_name: &str,
+) {
+    for other in crate::cards::load_markdown_cards(folder, group) {
+        let other_path = folder.join(format!("{}.md", other.slug));
+        if other_path == keep_path {
+            continue;
+        }
+        if crate::cards::entity_names_equivalent(&other.name, requested_name)
+            || crate::cards::entity_names_equivalent(&other.name, canonical_name)
+            || crate::cards::entity_names_equivalent(&other.slug, requested_name)
+            || crate::cards::entity_names_equivalent(&other.slug, canonical_name)
+        {
+            let _ = std::fs::remove_file(&other_path);
+        }
+    }
 }
 
 fn format_current_state_section(status: &str, holdings: &str, note: &str) -> String {
@@ -1524,6 +1586,150 @@ mod tests {
         let gaps = crate::cards::collect_entity_gaps(&root);
         assert!(gaps.iter().any(|g| g.contains("待补全") && g.contains("旧钥")));
         assert!(gaps.iter().any(|g| g.contains("疑似重复")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sync_upsert_merges_item_paren_alias_onto_existing() {
+        let root = std::env::temp_dir().join(format!(
+            "novelx_item_merge_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(root.join("entities/items")).unwrap();
+        std::fs::create_dir_all(root.join("artifacts")).unwrap();
+        std::fs::write(
+            root.join("entities/items/旧钥.md"),
+            "---\nname: 旧钥\nkind: item\ncomplete: true\nstatus: active\n---\n\n# 旧钥\n\n## Origin\n遗物。\n\n## Usage\n开门。\n\n## Current status\n在手。\n",
+        )
+        .unwrap();
+        let vol = VolumeBound {
+            volume_index: 1,
+            start_chapter: 1,
+            end_chapter: 10,
+            name: "试卷".into(),
+            ending_conditions: vec![],
+            goal: String::new(),
+            completed: false,
+        };
+        let report = apply_sync_json(
+            &root,
+            &vol,
+            &json!({
+                "entities":[{
+                    "kind":"item",
+                    "name":"旧钥（入门引导）",
+                    "summary":"本章用于开启地下室",
+                    "status":"active",
+                    "source":"chapter_sync"
+                }]
+            }),
+            SyncApplyMode::PlotLight,
+        )
+        .unwrap();
+        assert_eq!(report.entities_upserted, 1);
+        assert!(report.incomplete_entities.is_empty());
+        let canonical = root.join("entities/items/旧钥.md");
+        let twin = root.join("entities/items/旧钥（入门引导）.md");
+        assert!(canonical.exists(), "should update canonical card");
+        assert!(!twin.exists(), "must not create paren twin");
+        let body = std::fs::read_to_string(&canonical).unwrap();
+        assert!(body.contains("章后同步摘要") || body.contains("本章用于开启地下室"), "{body}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sync_upsert_folds_dependent_location_into_parent() {
+        let root = std::env::temp_dir().join(format!(
+            "novelx_loc_parent_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(root.join("entities/locations")).unwrap();
+        std::fs::create_dir_all(root.join("artifacts")).unwrap();
+        std::fs::write(
+            root.join("entities/locations/样例小区.md"),
+            "---\nname: 样例小区\nkind: location\ncomplete: true\nstatus: active\n---\n\n# 样例小区\n\n## Overview\n\n社区。\n\n## Factions\n\n无。\n\n## Production\n\n无。\n",
+        )
+        .unwrap();
+        let vol = VolumeBound {
+            volume_index: 1,
+            start_chapter: 1,
+            end_chapter: 10,
+            name: "试卷".into(),
+            ending_conditions: vec![],
+            goal: String::new(),
+            completed: false,
+        };
+        let report = apply_sync_json(
+            &root,
+            &vol,
+            &json!({
+                "entities":[{
+                    "kind":"location",
+                    "name":"九号楼",
+                    "summary":"样例小区内新出现的异常楼栋",
+                    "status":"active",
+                    "source":"chapter_sync"
+                }]
+            }),
+            SyncApplyMode::PlotLight,
+        )
+        .unwrap();
+        assert_eq!(report.entities_upserted, 1);
+        assert!(!root.join("entities/locations/九号楼.md").exists());
+        let body = std::fs::read_to_string(root.join("entities/locations/样例小区.md")).unwrap();
+        assert!(body.contains("九号楼"), "{body}");
+        assert!(body.contains("### 九号楼") || body.contains("aliases:"), "{body}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sync_upsert_merges_location_paren_alias_onto_existing() {
+        let root = std::env::temp_dir().join(format!(
+            "novelx_loc_merge_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(root.join("entities/locations")).unwrap();
+        std::fs::create_dir_all(root.join("artifacts")).unwrap();
+        std::fs::write(
+            root.join("entities/locations/银杏树阵.md"),
+            "---\nname: 银杏树阵\nkind: location\ncomplete: true\nstatus: active\n---\n\n# 银杏树阵\n\n## Overview\n小区绿化。\n\n## Factions\n无。\n\n## Production\n无。\n",
+        )
+        .unwrap();
+        // Pre-existing twin that should be cleaned up after merge.
+        std::fs::write(
+            root.join("entities/locations/银杏树阵（第五棵银杏）.md"),
+            "---\nname: 银杏树阵（第五棵银杏）\nkind: location\ncomplete: false\n---\n\n# 银杏树阵（第五棵银杏）\n\nstub\n",
+        )
+        .unwrap();
+        let vol = VolumeBound {
+            volume_index: 1,
+            start_chapter: 1,
+            end_chapter: 10,
+            name: "试卷".into(),
+            ending_conditions: vec![],
+            goal: String::new(),
+            completed: false,
+        };
+        let report = apply_sync_json(
+            &root,
+            &vol,
+            &json!({
+                "entities":[{
+                    "kind":"location",
+                    "name":"银杏树阵（第五棵银杏）",
+                    "summary":"铁盒出土点",
+                    "status":"active",
+                    "source":"chapter_sync"
+                }]
+            }),
+            SyncApplyMode::PlotLight,
+        )
+        .unwrap();
+        assert_eq!(report.entities_upserted, 1);
+        assert!(root.join("entities/locations/银杏树阵.md").exists());
+        assert!(!root.join("entities/locations/银杏树阵（第五棵银杏）.md").exists());
+        let body = std::fs::read_to_string(root.join("entities/locations/银杏树阵.md")).unwrap();
+        assert!(body.contains("铁盒出土点"), "{body}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

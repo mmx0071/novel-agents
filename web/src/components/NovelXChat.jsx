@@ -145,6 +145,10 @@ function readerHintFromPipelineDelta(delta) {
   ) {
     return { focusLatestChapter: true, readerTab: 'draft' }
   }
+  // 批写章横幅：切到最新章，便于阅读区跟上连写进度。
+  if (/▶\s*批写第\d+章/i.test(t) || /✓\s*第\d+章已发布/i.test(t)) {
+    return { focusLatestChapter: true, readerTab: 'draft' }
+  }
   return null
 }
 
@@ -958,14 +962,16 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
           ) {
             if (PREVIEW_MUTATING_TOOLS.has(item.name)) {
               const writing = item.name === 'continue_writing' || item.name === 'revise_chapter'
+              const batching = item.name === 'continue_writing_batch'
               const outlining = item.name === 'revise_outline'
               const ch = Number(item.arguments?.chapter) || undefined
               syncPreview({
-                keepSelection: !(writing || outlining),
-                chapter: outlining ? ch : undefined,
-                focusLatestChapter: writing,
-                readerTab: writing ? 'draft' : outlining ? 'outline' : undefined,
-                immediate: writing || outlining,
+                keepSelection: !(writing || outlining || batching),
+                // Invalidate chapterCache so outline-first cache doesn't keep empty draft.
+                chapter: (writing || outlining) ? ch : undefined,
+                focusLatestChapter: writing || batching,
+                readerTab: (writing || batching) ? 'draft' : outlining ? 'outline' : undefined,
+                immediate: writing || outlining || batching,
               })
             } else if (isBulkContextTool(item.name)) {
               const tab = readerTabForBulkTool(item.name, item.arguments)
@@ -979,6 +985,32 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
               })
             }
           }
+          break
+        }
+        case 'reasoning_content_delta': {
+          const delta = stripToolMarkup(ev.delta || '')
+          if (!delta) break
+          upsertTurn(ev.turn_id, (t) => {
+            const items = [...t.items]
+            const i = items.findIndex((x) => x.id === ev.item_id)
+            if (i >= 0) {
+              const prev = items[i]
+              items[i] = {
+                ...prev,
+                type: 'reasoning',
+                text: String(prev.text || '') + delta,
+                status: prev.status === 'completed' ? 'completed' : 'in_progress',
+              }
+            } else {
+              items.push({
+                id: ev.item_id,
+                type: 'reasoning',
+                text: delta,
+                status: 'in_progress',
+              })
+            }
+            return { ...t, items }
+          })
           break
         }
         case 'agent_message_content_delta': {
@@ -1079,8 +1111,9 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
             })()
             const revising = activeTool === 'revise_chapter' || activeTool === 'steer_run'
               || /整章修订|局部修订/.test(d)
-            // Only continue_writing is「写作中」; steer/revise (incl. full rewrite) is「修订中」.
+            // continue_writing / batch are「写作中」; steer/revise (incl. full rewrite) is「修订中」.
             const writingNew = activeTool === 'continue_writing'
+              || activeTool === 'continue_writing_batch'
             const stepName = (step?.[1] || done?.[1] || '').trim()
             const stepZh = stepLabelZh(stepName)
             const localRev = /local_reviser|局部修订/i.test(stepName) || /局部修订/.test(d)
@@ -1123,6 +1156,8 @@ export default function NovelXChat({ project, onPreviewRefresh, sendRef, onSetup
           }
           // Mid-pipeline: chapter/card files land before the whole tool finishes.
           // Jump reader to latest chapter + 章纲/正文 so creation is visible live.
+          // Cache refresh relies on App.jsx body_chars staleness (outline-first
+          // cache must not block draft fetch after 「正文已写入」).
           const hint = readerHintFromPipelineDelta(ev.delta)
           if (hint) {
             const liveFlush = /正文已写入|↻\s*draft/i.test(String(ev.delta || ''))

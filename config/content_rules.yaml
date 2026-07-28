@@ -38,6 +38,25 @@ rules:
     rewrite_replacement: "此前"
     message: "正文出现章号元叙述「{match}」（约第{line}行）：角色不应知道「第N章」；改用故事内时间/事件指称（如「上次会面时」「那次事故之后」）"
 
+  # Deterministic leak of writing-pipeline jargon into prose (authorial meta).
+  pipeline_meta_leak:
+    enabled: true
+    title: 管线元叙述泄露
+    description: 正文不得出现章纲/大纲/设定文档对读等写作管线用语。
+    blocking: true
+    patterns:
+      - 章纲里
+      - 章纲写
+      - 章纲中
+      - 按大纲
+      - 大纲里
+      - 大纲写
+      - 设定上
+      - 设定文档
+      - 写作说明
+      - 按章纲
+    message: "正文出现管线元叙述「{match}」（约第{line}行）：禁止章纲/大纲/设定对读；写前自行对齐后只写场面"
+
   timeline_countdown_jump:
     enabled: true
     title: 倒计时回跳
@@ -66,7 +85,9 @@ rules:
   timeline_daypart_regression:
     enabled: true
     title: 时段叙述回跳
-    description: 同日时段词不得明显回跳；须有跨日标记。对话引号内与「到凌晨」类区间不计入。
+    description: >-
+      同日时段词不得明显回跳；须有跨日标记。对话引号内与「到凌晨」类区间不计入。
+      凌晨/夜晚/夜里等均计入；勿把时段词当修辞（当前凌晨却写「……的夜晚」）。
     blocking: true
     regression_gap: 2
     dayparts:

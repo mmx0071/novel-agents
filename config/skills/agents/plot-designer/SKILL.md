@@ -79,7 +79,7 @@ Frontmatter 必填：`title`, `scope`, `plot_type`, `status`, `needs_bridge`。
 
 **必填决策**：`needs_bridge`（bool）——落点后要不要 1 章过渡；最多 1 章，可为 0。
 
-人物/物品名尽量与实体卡、名词表一致；新实体在 `notes` 提示需先 `design_entity`。
+人物/物品名尽量与实体卡、名词表一致；新实体在 `notes` 提示需先 `design_entity`。物品仅当有实质用途/特性或后续还会再用时才提示建卡；气氛物勿建卡。
 
 ## 收束后节奏（系统执行，非用户点选）
 

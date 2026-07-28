@@ -483,9 +483,8 @@ impl ToolHandler for ContinueWritingBatch {
         ) {
             return Ok(prev);
         }
-        let result = run_continue_batch(
-            &ctx.projects_root,
-            &ctx.config_root,
+        let result = run_continue_batch_streaming(
+            ctx,
             BatchContinueOpts {
                 project,
                 max_chapters,
@@ -494,11 +493,15 @@ impl ToolHandler for ContinueWritingBatch {
                 confirm_skip_expected: skip_expected,
                 auto_length_revise,
             },
-            ctx.llm.clone(),
         )
         .await?;
+        let output = if ctx.progress.is_some() {
+            format!("\n——\n{}", result.summary_text())
+        } else {
+            result.summary_text()
+        };
         Ok(ToolResult {
-            output: result.summary_text(),
+            output,
             data: result.to_json(),
         })
     }
@@ -1715,7 +1718,7 @@ impl ToolHandler for DesignEntity {
         "design_entity"
     }
     fn description(&self) -> &'static str {
-        "新增或补全人物/物品/地点设定卡（写入 entities/）"
+        "新增或更新人物/物品/地点设定卡（写入 entities/）。地点先母卡（有依赖则收录子区）；物品仅录有实质用途/特性或后续会再用的道具，气氛物勿建卡；别名命中则更新原卡"
     }
     fn parameters(&self) -> Value {
         json!({
@@ -1726,6 +1729,8 @@ impl ToolHandler for DesignEntity {
                 "name":{"type":"string"},
                 "brief":{"type":"string","description":"一句话设定或要点"},
                 "role":{"type":"string","description":"可选：protagonist / supporting 等"},
+                "parent":{"type":"string","description":"地点专用：显式母地点规范名；有依赖时更新该母卡并收录 name 为子区"},
+                "independent":{"type":"boolean","description":"地点专用：true=确认独立无上级依赖，允许新建母卡；默认 false"},
                 "force":{"type":"boolean","description":"忽略设定审计 BLOCKER 强制写入"},
                 "apply":{"type":"boolean","description":"true=确认落盘；默认预览"},
                 "mutation_id":{"type":"string"},
@@ -1740,6 +1745,8 @@ impl ToolHandler for DesignEntity {
         let name = args["name"].as_str().unwrap_or("未命名").trim();
         let brief = args["brief"].as_str().unwrap_or("").trim();
         let role = args["role"].as_str().unwrap_or("");
+        let parent_arg = args["parent"].as_str().unwrap_or("").trim();
+        let independent = args["independent"].as_bool().unwrap_or(false);
         if project.is_empty() || name.is_empty() {
             anyhow::bail!("project 与 name 必填");
         }
@@ -1751,11 +1758,66 @@ impl ToolHandler for DesignEntity {
         };
         let folder = dir.join("entities").join(group);
         let force = args["force"].as_bool().unwrap_or(false);
-        // Reuse existing card when name is an alias / paren swap (避免「老严」与「严国栋（老严）」各一张).
-        let (path, existing) =
-            novelx_pipeline::resolve_entity_card_path(&folder, group, name);
+        // Locations: mother-first. Alias hit → update; else fold into parent; else new mother only if independent.
+        let (path, existing, write_name, folded_child) = if kind == "location" {
+            if !parent_arg.is_empty() {
+                let (pp, parent_card) =
+                    novelx_pipeline::resolve_entity_card_path(&folder, group, parent_arg);
+                if parent_card.is_none() && !pp.exists() {
+                    return Ok(ToolResult {
+                        output: format!(
+                            "指定母地点「{parent_arg}」不存在。请先 design_entity(kind=location, name={parent_arg}, independent=true) 建母卡，再收录子区「{name}」。"
+                        ),
+                        data: json!({
+                            "blocked": true,
+                            "need_parent": true,
+                            "parent": parent_arg,
+                            "child": name,
+                        }),
+                    });
+                }
+                let parent_name = parent_card
+                    .as_ref()
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| parent_arg.to_string());
+                let child = if novelx_pipeline::entity_names_equivalent(&parent_name, name) {
+                    None
+                } else {
+                    Some(name.to_string())
+                };
+                (pp, parent_card, parent_name, child)
+            } else {
+                let (p, card, wname, child) =
+                    novelx_pipeline::resolve_location_write_target(&folder, name, brief);
+                if card.is_none()
+                    && novelx_pipeline::location_name_looks_dependent(name)
+                    && !independent
+                {
+                    return Ok(ToolResult {
+                        output: format!(
+                            "地点「{name}」疑似依赖上级场景（楼栋/树阵/房间等）。\
+                             请先建母地点卡（小区/园区等，independent=true），\
+                             或传 parent=母地名以收录为子区；若确认独立无依赖则传 independent=true。"
+                        ),
+                        data: json!({
+                            "blocked": true,
+                            "need_parent": true,
+                            "child": name,
+                        }),
+                    });
+                }
+                (p, card, wname, child)
+            }
+        } else {
+            let (p, card) = novelx_pipeline::resolve_entity_card_path(&folder, group, name);
+            let wname = card
+                .as_ref()
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| name.to_string());
+            (p, card, wname, None::<String>)
+        };
         if let Some(card) = existing.as_ref() {
-            if brief.is_empty() {
+            if brief.is_empty() && folded_child.is_none() {
                 return Ok(ToolResult {
                     output: format!("设定卡已存在 {}", path.display()),
                     data: json!({
@@ -1781,9 +1843,31 @@ impl ToolHandler for DesignEntity {
         } else {
             None
         };
+        // Prefer full on-disk card (with frontmatter) when folding a location child.
+        let existing_md_owned = if kind == "location" && path.exists() {
+            std::fs::read_to_string(&path).unwrap_or_default()
+        } else {
+            existing
+                .as_ref()
+                .map(|c| c.markdown.clone())
+                .unwrap_or_default()
+        };
+        let existing_md = existing_md_owned.as_str();
         let generated = match generated {
             Some(cached) => cached,
-            None => generate_entity_card(ctx, project, kind, name, brief, role).await?,
+            None => {
+                generate_entity_card(
+                    ctx,
+                    project,
+                    kind,
+                    &write_name,
+                    brief,
+                    role,
+                    existing_md,
+                    folded_child.as_deref(),
+                )
+                .await?
+            }
         };
         let ek = EntityKind::from_group(group).unwrap_or(EntityKind::Character);
         let generated = match validate_entity_card(ek, &generated) {
@@ -1795,20 +1879,26 @@ impl ToolHandler for DesignEntity {
                 });
             }
         };
-        let audit = tool_setting_audit(ctx, project, "拟新增实体卡", &generated).await?;
+        let audit_label = if existing.is_some() || folded_child.is_some() {
+            "拟更新实体卡"
+        } else {
+            "拟新增实体卡"
+        };
+        let audit = tool_setting_audit(ctx, project, audit_label, &generated).await?;
         if let Some(blocked) = mutation_gate::require_audit_pass(&audit, force) {
             return Ok(blocked);
         }
-        let write_name = existing
-            .as_ref()
-            .map(|c| c.name.as_str())
-            .unwrap_or(name);
-        let before_body = existing
-            .as_ref()
-            .map(|c| c.markdown.clone())
-            .or_else(|| std::fs::read_to_string(&path).ok())
-            .unwrap_or_default();
-        let summary = if existing.is_some() {
+        let before_body = if path.exists() {
+            std::fs::read_to_string(&path).unwrap_or_default()
+        } else {
+            existing
+                .as_ref()
+                .map(|c| c.markdown.clone())
+                .unwrap_or_default()
+        };
+        let summary = if let Some(ref child) = folded_child {
+            format!("将更新母地点「{write_name}」，收录子区「{child}」（请求名「{name}」）")
+        } else if existing.is_some() {
             format!("将更新已有{kind}设定卡「{write_name}」（请求名「{name}」）")
         } else {
             format!("将写入{kind}设定卡「{name}」")
@@ -1823,7 +1913,8 @@ impl ToolHandler for DesignEntity {
                 "name": write_name,
                 "path": path,
                 "markdown": generated,
-                "merged_from": if existing.is_some() { name } else { "" },
+                "merged_from": if existing.is_some() || folded_child.is_some() { name } else { "" },
+                "folded_child": folded_child,
                 "audit": mutation_gate::audit_preview_value(&audit),
             }),
             "design_entity",
@@ -1833,6 +1924,8 @@ impl ToolHandler for DesignEntity {
                 "name": name,
                 "brief": brief,
                 "role": role,
+                "parent": parent_arg,
+                "independent": independent,
                 "force": force,
                 "cached_body": generated,
             }),
@@ -1851,7 +1944,7 @@ impl ToolHandler for DesignEntity {
                 }
             };
             let audit_apply =
-                tool_setting_audit(ctx, project, "拟新增实体卡", &generated_check).await?;
+                tool_setting_audit(ctx, project, audit_label, &generated_check).await?;
             if let Some(blocked) = mutation_gate::require_audit_pass(&audit_apply, force) {
                 return Ok(blocked);
             }
@@ -1873,26 +1966,37 @@ impl ToolHandler for DesignEntity {
                 }
             }
         }
-        std::fs::write(&path, &generated)?;
+        let mut to_write = generated;
+        if let Some(ref child) = folded_child {
+            // Ensure aliases + ### child survive even if the model omitted them.
+            to_write =
+                novelx_pipeline::fold_location_child_into_card(&to_write, child, brief);
+        }
+        std::fs::write(&path, &to_write)?;
         let keys = novelx_pipeline::load_markdown_cards(&folder, group)
             .into_iter()
-            .find(|c| novelx_pipeline::entity_names_equivalent(&c.name, write_name))
+            .find(|c| novelx_pipeline::entity_names_equivalent(&c.name, &write_name))
             .map(|c| c.match_keys())
-            .unwrap_or_else(|| vec![write_name.to_string()]);
+            .unwrap_or_else(|| vec![write_name.clone()]);
         Ok(ToolResult {
-            output: format!("已写入设定卡 {}", path.display()),
+            output: if let Some(ref child) = folded_child {
+                format!("已更新母地点 {}（收录子区「{child}」）", path.display())
+            } else {
+                format!("已写入设定卡 {}", path.display())
+            },
             data: json!({
                 "path": path,
                 "kind": kind,
                 "name": write_name,
-                "preview": generated.chars().take(400).collect::<String>(),
+                "folded_child": folded_child,
+                "preview": to_write.chars().take(400).collect::<String>(),
                 "audit": mutation_gate::audit_preview_value(&audit),
                 "impact_source": impact_source_entity(
                     kind,
-                    write_name,
+                    &write_name,
                     keys,
                     &before_body,
-                    &generated,
+                    &to_write,
                 ),
             }),
         })
@@ -2190,7 +2294,7 @@ impl ToolHandler for ListPlots {
         // Human / plot_status intent → Chinese progress report.
         // Status-filtered queries keep a compact machine list for agents.
         // Note: volume-only filter (e.g.「第三卷进行到哪了」) must stay human-readable.
-        let output = if status.is_none() {
+        let mut output = if status.is_none() {
             format_plot_progress_report_for(&dir, volume)
         } else if plots.is_empty() {
             "尚无剧情卡（或过滤结果为空）".into()
@@ -2210,6 +2314,28 @@ impl ToolHandler for ListPlots {
                 .collect();
             format!("剧情卡 {} 张：\n{}", lines.len(), lines.join("\n"))
         };
+        // Progress intents often only hit list_plots — append compact project status.
+        if status.is_none() {
+            if let Ok(state) = load_project_state(&dir) {
+                let setup = resolve_setup_phase(&dir);
+                let vol = resolve_volume_phase(&dir);
+                let health = longform_health_snapshot(&dir);
+                let dangling = health
+                    .pointer("/foreshadow/dangling_total")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                output.push_str(&format!(
+                    "\n\n——\n项目状态：下一章={} 已发布={} setup={} volume={}",
+                    state.next_chapter,
+                    state.published_count,
+                    setup.as_str(),
+                    vol.as_str(),
+                ));
+                if dangling > 0 {
+                    output.push_str(&format!(" 伏笔未收={dangling}"));
+                }
+            }
+        }
         Ok(ToolResult { output, data })
     }
 }
@@ -2674,6 +2800,8 @@ impl ToolHandler for DesignArcOutline {
                      若已有本卷卷纲：只按用户补充改冲突点，禁止整卷无故重写。\
                      **命名硬约束**：组织/阵营/主角名必须以用户补充、总纲与世界观 Bible 为准；\
                      禁止把外勤代号或内部分支写成独立阵营；禁止沿用已被 brief 废止的旧组织名。\
+                     **输出硬约束**：只输出纯卷纲 Markdown 正文；禁止前言寒暄、禁止 ```markdown 代码围栏、\
+                     禁止「修订影响声明」或落盘路径说明。\n\
                      用户补充：{brief}\n\n总纲节选：\n{}\n\n世界观节选：\n{}\n\n{current_block}\n\n{prior}",
                     state.name,
                     master.chars().take(2500).collect::<String>(),
@@ -3077,6 +3205,8 @@ async fn generate_entity_card(
     name: &str,
     brief: &str,
     role: &str,
+    existing_md: &str,
+    folded_child: Option<&str>,
 ) -> Result<String> {
     let role_line = if role.is_empty() {
         String::new()
@@ -3089,11 +3219,36 @@ async fn generate_entity_card(
         "location" => "## Overview / ## Factions / ## Production（中英标题均可）",
         _ => "## History / ## Personality / ## Core events / ## Current status（中英标题均可）",
     };
+    let existing_block = if existing_md.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n【已有设定卡——请在此基础上修订，规范名保持「{name}」，勿另起新名或新卡；未冲突内容尽量保留】\n{}\n",
+            existing_md.chars().take(3500).collect::<String>()
+        )
+    };
+    let fold_block = if let Some(child) = folded_child.filter(|s| !s.is_empty()) {
+        format!(
+            "\n【地点子区收录】不要新建「{child}」文件。在母卡「{name}」的 ## Overview 下增加 `### {child}`，\
+             并把「{child}」写入 frontmatter aliases；要点：{brief}\n"
+        )
+    } else if kind == "location" && existing_md.trim().is_empty() {
+        "\n【独立母地点】确认本卡无上级依赖；楼栋/树阵/房间等子区日后写入本卡 Overview，勿另建卡。\n"
+            .into()
+    } else {
+        String::new()
+    };
     let prompt = format!(
-        "为项目《{project}》设计{kind}「{name}」设定卡。要点：{brief}\n\
-         输出 Markdown，含 YAML frontmatter：name；status=active|background|exited|consumed（默认 active）；\
+        "为项目《{project}》{}{kind}「{name}」设定卡。要点：{brief}\n\
+         {existing_block}{fold_block}\
+         输出 Markdown，含 YAML frontmatter：name 必须为「{name}」；status=active|background|exited|consumed（默认 active）；\
          人物可填 holdings（持有物品，逗号分隔）；aliases 可选。\n\
-         正文必须含固定节：{sections}。"
+         正文必须含固定节：{sections}。",
+        if existing_md.trim().is_empty() {
+            "设计"
+        } else {
+            "更新"
+        }
     );
     let body = ctx
         .llm
@@ -3715,7 +3870,7 @@ impl ToolHandler for GetProjectStatus {
     }
     fn description(&self) -> &'static str {
         "查看项目进度、setup/volume 阶段、active_agents、已有章节草稿；\
-         若触发长程 QA（如本卷 40+ 章 / 卷交接）会附带 volume_auditor → audit_volume 建议"
+         若触发长程 QA（如本卷 20+ 章 / 卷交接）会附带 volume_auditor → audit_volume 建议"
     }
     fn parameters(&self) -> Value {
         json!({
@@ -4623,33 +4778,16 @@ fn audit_tool_coda(run: &novelx_pipeline::PipelineRun, chapter: u32) -> String {
     format!("\n——\n第{chapter}章审校完成")
 }
 
-/// Pipeline run that forwards step / LLM deltas into `ctx.progress` when set.
-/// Public for studio/core callers that must avoid spawn/wait_agent.
-pub async fn run_pipeline_streaming(
-    ctx: &ToolContext,
-    project: &str,
-    chapter: u32,
-    mode: RunMode,
-    revision: RevisionOptions,
-) -> Result<novelx_pipeline::PipelineRun> {
+/// Forward pipeline events into a tool progress string channel (sparse timeline).
+fn spawn_pipeline_progress_forwarder(
+    progress: mpsc::UnboundedSender<String>,
+) -> (
+    mpsc::UnboundedSender<novelx_pipeline::PipelineEvent>,
+    tokio::task::JoinHandle<()>,
+) {
     use novelx_pipeline::PipelineEvent;
 
-    if ctx.progress.is_none() {
-        return execute_pipeline(
-            &ctx.projects_root,
-            &ctx.config_root,
-            project,
-            chapter,
-            mode,
-            revision,
-            ctx.llm.clone(),
-            None,
-        )
-        .await;
-    }
-
     let (tx, mut rx) = mpsc::unbounded_channel::<PipelineEvent>();
-    let progress = ctx.progress.clone();
     let forward = tokio::spawn(async move {
         // Sparse step timeline — avoid flooding WS (which also drops ▶/✓ under lag).
         let mut prose_chars: std::collections::HashMap<String, usize> =
@@ -4661,10 +4799,14 @@ pub async fn run_pipeline_streaming(
         let mut draft_backed = false;
         let mut last_draft_chars: usize = 0;
         while let Some(ev) = rx.recv().await {
-            let Some(p) = progress.as_ref() else {
-                continue;
-            };
             let chunk = match ev {
+                PipelineEvent::BatchProgress { message } => {
+                    let t = message.trim();
+                    if t.is_empty() {
+                        continue;
+                    }
+                    format!("\n{t}\n")
+                }
                 PipelineEvent::StepStarted { agent } => {
                     prose_chars.remove(&agent);
                     last_emit_chars.remove(&agent);
@@ -4760,12 +4902,39 @@ pub async fn run_pipeline_streaming(
                 PipelineEvent::Error { message } => format!("\n✕ {message}\n"),
                 _ => continue,
             };
-            if p.send(chunk).is_err() {
+            if progress.send(chunk).is_err() {
                 break;
             }
         }
     });
+    (tx, forward)
+}
 
+/// Pipeline run that forwards step / LLM deltas into `ctx.progress` when set.
+/// Public for studio/core callers that must avoid spawn/wait_agent.
+pub async fn run_pipeline_streaming(
+    ctx: &ToolContext,
+    project: &str,
+    chapter: u32,
+    mode: RunMode,
+    revision: RevisionOptions,
+) -> Result<novelx_pipeline::PipelineRun> {
+    if ctx.progress.is_none() {
+        return execute_pipeline(
+            &ctx.projects_root,
+            &ctx.config_root,
+            project,
+            chapter,
+            mode,
+            revision,
+            ctx.llm.clone(),
+            None,
+        )
+        .await;
+    }
+
+    let progress = ctx.progress.clone().expect("checked above");
+    let (tx, forward) = spawn_pipeline_progress_forwarder(progress);
     let run = execute_pipeline(
         &ctx.projects_root,
         &ctx.config_root,
@@ -4779,6 +4948,36 @@ pub async fn run_pipeline_streaming(
     .await;
     let _ = forward.await;
     run
+}
+
+/// Batch continue with the same live progress stream as single-chapter writing.
+pub async fn run_continue_batch_streaming(
+    ctx: &ToolContext,
+    opts: BatchContinueOpts,
+) -> Result<novelx_pipeline::BatchContinueResult> {
+    if ctx.progress.is_none() {
+        return run_continue_batch(
+            &ctx.projects_root,
+            &ctx.config_root,
+            opts,
+            ctx.llm.clone(),
+            None,
+        )
+        .await;
+    }
+
+    let progress = ctx.progress.clone().expect("checked above");
+    let (tx, forward) = spawn_pipeline_progress_forwarder(progress);
+    let result = run_continue_batch(
+        &ctx.projects_root,
+        &ctx.config_root,
+        opts,
+        ctx.llm.clone(),
+        Some(tx),
+    )
+    .await;
+    let _ = forward.await;
+    result
 }
 
 enum LlmProgressKind {

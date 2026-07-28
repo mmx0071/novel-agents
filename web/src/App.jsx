@@ -213,6 +213,7 @@ export default function App() {
   const [readerSaving, setReaderSaving] = useState(false)
   const [readerEditError, setReaderEditError] = useState('')
   const [chatSetupGateOpen, setChatSetupGateOpen] = useState(false)
+  const [foreshadowDebtExpanded, setForeshadowDebtExpanded] = useState(false)
   const chatSendRef = useRef(null)
   const workspacesRef = useRef(initialCache.projectSessions || {})
   const currentProjectRef = useRef(initialProject)
@@ -311,6 +312,7 @@ export default function App() {
     persistCurrentWorkspace()
     const ok = await fetchNovelPreview(name, tabHint)
     if (!ok) return
+    setForeshadowDebtExpanded(false)
     const projectKey = workspaceKey(name)
     const ws = workspacesRef.current[projectKey] || emptyWorkspace(name)
     workspacesRef.current[projectKey] = ws
@@ -421,7 +423,13 @@ export default function App() {
     if (meta.draft || meta.outline) return // embedded (legacy servers)
     if (!meta.has_draft && !meta.has_outline) return
     const hit = chapterCacheRef.current[ch]
-    if (hit?.draft || hit?.outline) return // keep showing cached body across preview refresh
+    const metaChars = Number(meta.body_chars) || 0
+    const cachedChars = Number(hit?.body_chars) || 0
+    // Outline often lands first and caches { draft: '', outline }. Do not skip
+    // refetch solely because outline exists — draft can appear/grow later.
+    const draftStale = meta.has_draft && (!hit?.draft || metaChars > cachedChars)
+    const outlineStale = meta.has_outline && !hit?.outline
+    if (hit && !draftStale && !outlineStale) return
     let cancelled = false
     setChapterLoading(true)
     api(`/projects/${encodeURIComponent(proj)}/chapters/${ch}`)
@@ -621,6 +629,42 @@ export default function App() {
         ? ` · 连短 ${lengthHealth.consecutive_soft_short}`
         : '')
     : ''
+
+  // 长篇健康交通灯：ok 绿 / warn 黄 / bad 红
+  const foreshadowLevel = (() => {
+    const n = foreshadowDebt?.dangling_total ?? 0
+    const cold = foreshadowDebt?.open_cold ?? 0
+    if (n > 24 || cold > 40) return 'bad'
+    if (n > 8 || cold > 0) return 'warn'
+    return 'ok'
+  })()
+  const volumeLevel = (() => {
+    if (!volumeHealth?.active_index) return 'warn'
+    if (volumeHealth.thick_volume_warning) return 'bad'
+    const ch = volumeHealth.chapters_in_volume || 0
+    const mid = volumeHealth.mid_audit_threshold || 0
+    if (mid > 0 && ch >= mid && !volumeHealth.has_audit_report) return 'warn'
+    return 'ok'
+  })()
+  const lengthLevel = (() => {
+    if (!lengthHealth) return 'ok'
+    const rate = lengthHealth.soft_short_rate || 0
+    const streak = lengthHealth.consecutive_soft_short || 0
+    const hard = lengthHealth.recent_hard_short || 0
+    if (streak >= 3 || rate > 0.4 || hard >= 2) return 'bad'
+    if (streak >= 1 || rate > 0.15 || hard >= 1) return 'warn'
+    return 'ok'
+  })()
+  const longformLevel = (() => {
+    if (!longformTier) return 'ok'
+    const q = String(longformTier.quality_tier || '').toLowerCase()
+    const impact = String(longformTier.impact_scan_mode || '').toLowerCase()
+    const drift = longformTier.drift_samples ?? 0
+    if (impact === 'all' || drift > 80) return 'bad'
+    if (q === 'economy' || drift > 20) return 'warn'
+    return 'ok'
+  })()
+  const healthLevelLabel = { ok: '正常', warn: '警告', bad: '异常' }
 
   const hasReaderMaterial = Boolean(
     chapterList.length
@@ -987,6 +1031,131 @@ export default function App() {
                   ))
                 )}
               </ul>
+              {project && longformHealth && (
+                <div className="side-health" aria-label="超长篇健康">
+                  <h2 className="side-title">长篇健康</h2>
+                  <p className="side-hint">伏笔与卷况，不占阅读区</p>
+                  <div className="longform-health longform-health--side">
+                    <div
+                      className={`longform-health-card longform-health-card--foreshadow level-${foreshadowLevel}${
+                        foreshadowDebtExpanded ? ' is-expanded' : ''
+                      }`}
+                    >
+                      <div className="longform-health-title">
+                        <span>伏笔债务</span>
+                        <span className={`longform-health-badge level-${foreshadowLevel}`}>
+                          {healthLevelLabel[foreshadowLevel]}
+                        </span>
+                      </div>
+                      <div className="longform-health-body">
+                        未收 {foreshadowDebt?.dangling_total ?? 0}
+                        {foreshadowDebt?.open_cold ? ` · 冷档 ${foreshadowDebt.open_cold}` : ''}
+                      </div>
+                      {Array.isArray(foreshadowDebt?.oldest) && foreshadowDebt.oldest.length > 0 && (
+                        <>
+                          <ul
+                            className={`longform-health-list${
+                              foreshadowDebtExpanded ? ' is-expanded' : ''
+                            }`}
+                          >
+                            {(foreshadowDebtExpanded
+                              ? foreshadowDebt.oldest
+                              : foreshadowDebt.oldest.slice(0, 5)
+                            ).map((t) => (
+                              <li key={t.id || `${t.planted_chapter}-${t.text}`}>
+                                第{t.planted_chapter || '?'}章 · {t.text}
+                              </li>
+                            ))}
+                          </ul>
+                          {foreshadowDebt.oldest.length > 5 && (
+                            <button
+                              type="button"
+                              className="longform-health-more"
+                              onClick={() => setForeshadowDebtExpanded((v) => !v)}
+                            >
+                              {foreshadowDebtExpanded
+                                ? '收起'
+                                : `展开全部 ${foreshadowDebt.dangling_total ?? foreshadowDebt.oldest.length}`}
+                            </button>
+                          )}
+                        </>
+                      )}
+                    </div>
+                    <div className={`longform-health-card level-${volumeLevel}`}>
+                      <div className="longform-health-title">
+                        <span>卷健康</span>
+                        <span className={`longform-health-badge level-${volumeLevel}`}>
+                          {healthLevelLabel[volumeLevel]}
+                        </span>
+                      </div>
+                      <div className="longform-health-body">
+                        {volumeHealth?.active_index
+                          ? `第${volumeHealth.active_index}卷 · ${volumeHealth.chapters_in_volume || 0}章`
+                          : '尚无进行中卷'}
+                        {volumeHealth?.has_audit_report ? ' · 已复盘' : ''}
+                        {volumeHealth?.thick_volume_warning ? ' · 厚卷' : ''}
+                      </div>
+                      <div className="longform-health-sub">
+                        rollup {volumeHealth?.rollup_total ?? 0}
+                        {volumeHealth?.mid_audit_threshold
+                          ? ` · 中卷审≥${volumeHealth.mid_audit_threshold}章`
+                          : ''}
+                      </div>
+                    </div>
+                    {lengthHealth ? (
+                      <div className={`longform-health-card level-${lengthLevel}`}>
+                        <div className="longform-health-title">
+                          <span>篇幅</span>
+                          <span className={`longform-health-badge level-${lengthLevel}`}>
+                            {healthLevelLabel[lengthLevel]}
+                          </span>
+                        </div>
+                        <div className="longform-health-body">
+                          {lengthChip || '—'}
+                          {lengthHealth.word_hard_min
+                            ? ` · 硬门 ${lengthHealth.word_hard_min}`
+                            : ''}
+                        </div>
+                        <div className="longform-health-sub">
+                          目标 {lengthHealth.word_min}–{lengthHealth.word_max}
+                          {lengthHealth.target_chapters
+                            ? ` · 规划 ${lengthHealth.target_chapters} 章`
+                            : ''}
+                        </div>
+                      </div>
+                    ) : null}
+                    {longformTier ? (
+                      <div className={`longform-health-card level-${longformLevel}`}>
+                        <div className="longform-health-title">
+                          <span>长篇档</span>
+                          <span className={`longform-health-badge level-${longformLevel}`}>
+                            {healthLevelLabel[longformLevel]}
+                          </span>
+                        </div>
+                        <div className="longform-health-body">
+                          {longformTier.quality_tier || '—'}
+                          {longformTier.audit_tier ? ` · 审 ${longformTier.audit_tier}` : ''}
+                        </div>
+                        <div className="longform-health-sub">
+                          impact {longformTier.impact_scan_mode || '—'}
+                          {longformTier.drift_samples != null
+                            ? ` · 漂移抽样 ${longformTier.drift_samples}`
+                            : ''}
+                        </div>
+                      </div>
+                    ) : null}
+                    {costTop ? (
+                      <div className="longform-health-card level-ok">
+                        <div className="longform-health-title">
+                          <span>成本（近录）</span>
+                          <span className="longform-health-badge level-ok">参考</span>
+                        </div>
+                        <div className="longform-health-body longform-health-cost">{costTop}</div>
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+              )}
             </>
           ) : (
             <>
@@ -1033,83 +1202,6 @@ export default function App() {
               </div>
             )}
           </div>
-
-          {project && longformHealth && (
-            <div className="longform-health" aria-label="超长篇健康">
-              <div className="longform-health-card">
-                <div className="longform-health-title">伏笔债务</div>
-                <div className="longform-health-body">
-                  未收 {foreshadowDebt?.dangling_total ?? 0}
-                  {foreshadowDebt?.open_cold ? ` · 冷档 ${foreshadowDebt.open_cold}` : ''}
-                </div>
-                {Array.isArray(foreshadowDebt?.oldest) && foreshadowDebt.oldest.length > 0 && (
-                  <ul className="longform-health-list">
-                    {foreshadowDebt.oldest.slice(0, 3).map((t) => (
-                      <li key={t.id || `${t.planted_chapter}-${t.text}`}>
-                        第{t.planted_chapter || '?'}章 · {t.text}
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-              <div className="longform-health-card">
-                <div className="longform-health-title">卷健康</div>
-                <div className="longform-health-body">
-                  {volumeHealth?.active_index
-                    ? `第${volumeHealth.active_index}卷 · ${volumeHealth.chapters_in_volume || 0}章`
-                    : '尚无进行中卷'}
-                  {volumeHealth?.has_audit_report ? ' · 已复盘' : ''}
-                  {volumeHealth?.thick_volume_warning ? (
-                    <span className="longform-health-warn"> · 厚卷</span>
-                  ) : null}
-                </div>
-                <div className="longform-health-sub">
-                  rollup {volumeHealth?.rollup_total ?? 0}
-                  {volumeHealth?.mid_audit_threshold
-                    ? ` · 中卷审≥${volumeHealth.mid_audit_threshold}章`
-                    : ''}
-                </div>
-              </div>
-              {lengthHealth ? (
-                <div className="longform-health-card">
-                  <div className="longform-health-title">篇幅</div>
-                  <div className="longform-health-body">
-                    {lengthChip || '—'}
-                    {lengthHealth.word_hard_min
-                      ? ` · 硬门 ${lengthHealth.word_hard_min}`
-                      : ''}
-                  </div>
-                  <div className="longform-health-sub">
-                    目标 {lengthHealth.word_min}–{lengthHealth.word_max}
-                    {lengthHealth.target_chapters
-                      ? ` · 规划 ${lengthHealth.target_chapters} 章`
-                      : ''}
-                  </div>
-                </div>
-              ) : null}
-              {longformTier ? (
-                <div className="longform-health-card">
-                  <div className="longform-health-title">长篇档</div>
-                  <div className="longform-health-body">
-                    {longformTier.quality_tier || '—'}
-                    {longformTier.audit_tier ? ` · 审 ${longformTier.audit_tier}` : ''}
-                  </div>
-                  <div className="longform-health-sub">
-                    impact {longformTier.impact_scan_mode || '—'}
-                    {longformTier.drift_samples != null
-                      ? ` · 漂移抽样 ${longformTier.drift_samples}`
-                      : ''}
-                  </div>
-                </div>
-              ) : null}
-              {costTop ? (
-                <div className="longform-health-card">
-                  <div className="longform-health-title">成本（近录）</div>
-                  <div className="longform-health-body longform-health-cost">{costTop}</div>
-                </div>
-              ) : null}
-            </div>
-          )}
 
           {!hasReaderMaterial ? (
             <div className="empty small">在 NovelX 创建小说后，卷大纲、设定卡与正文将显示在此</div>

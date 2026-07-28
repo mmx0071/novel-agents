@@ -17,6 +17,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::Path;
 use std::sync::Arc;
+use tokio::sync::mpsc;
+
+use crate::run::PipelineEvent;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchContinueOpts {
@@ -61,6 +64,9 @@ pub struct BatchChapterResult {
     pub message: String,
     #[serde(default)]
     pub length_auto_revised: bool,
+    /// One-shot hard-rule revise attempted for an existing draft (not a length expand).
+    #[serde(default)]
+    pub hard_rule_auto_revised: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run: Option<PipelineRun>,
 }
@@ -151,12 +157,24 @@ pub(crate) fn should_batch_auto_length_revise(
     matches!(length_status, "hard_short" | "soft_short_escalated") || length_blocks
 }
 
+fn emit_batch(tx: &Option<mpsc::UnboundedSender<PipelineEvent>>, message: impl Into<String>) {
+    if let Some(tx) = tx {
+        let _ = tx.send(PipelineEvent::BatchProgress {
+            message: message.into(),
+        });
+    }
+}
+
 /// Run continue_writing in a loop until a gate, max, or until_chapter.
+///
+/// When `tx` is set, chapter banners and inner pipeline step/draft events are
+/// forwarded so Studio can show live progress on the batch tool card.
 pub async fn run_continue_batch(
     projects_root: &Path,
     config_root: &Path,
     opts: BatchContinueOpts,
     llm: Arc<LlmClient>,
+    tx: Option<mpsc::UnboundedSender<PipelineEvent>>,
 ) -> Result<BatchContinueResult> {
     let lf = LongformConfig::load_from_config_root(config_root);
     let max = opts
@@ -173,17 +191,27 @@ pub async fn run_continue_batch(
     let mut stopped = "completed".to_string();
     let budget = ChapterBudget::load_from_config_root(config_root);
 
+    emit_batch(
+        &tx,
+        format!("▶ 开始连写到卡点（最多 {max} 章，自第{started}章）"),
+    );
+
     for _ in 0..max {
         let state = load_project_state(&dir)?;
         let chapter = state.next_chapter.max(1);
         if let Some(until) = opts.until_chapter {
             if chapter > until {
                 stopped = format!("until_chapter({until})");
+                emit_batch(&tx, format!("✓ 已写到 until_chapter({until})，批写结束"));
                 break;
             }
         }
 
         attempted += 1;
+        emit_batch(
+            &tx,
+            format!("▶ 批写第{chapter}章（第 {attempted}/{max} 次尝试）"),
+        );
 
         if let Some(block) = check_volume_audit_for_continue(
             config_root,
@@ -191,6 +219,10 @@ pub async fn run_continue_batch(
             chapter,
             opts.confirm_skip_volume_audit,
         ) {
+            emit_batch(
+                &tx,
+                format!("⛔ 第{chapter}章拦截·卷审：{}", block.message),
+            );
             results.push(BatchChapterResult {
                 chapter,
                 published: false,
@@ -199,6 +231,7 @@ pub async fn run_continue_batch(
                 needs_user_choice: true,
                 message: block.message,
                 length_auto_revised: false,
+                hard_rule_auto_revised: false,
                 run: None,
             });
             stopped = "volume_audit_gate".into();
@@ -208,6 +241,7 @@ pub async fn run_continue_batch(
         if let Some((reason, message)) =
             expected_gate_message(&dir, chapter, opts.confirm_skip_expected)
         {
+            emit_batch(&tx, format!("⛔ 第{chapter}章拦截·预期检阅：{message}"));
             results.push(BatchChapterResult {
                 chapter,
                 published: false,
@@ -216,6 +250,7 @@ pub async fn run_continue_batch(
                 needs_user_choice: true,
                 message,
                 length_auto_revised: false,
+                hard_rule_auto_revised: false,
                 run: None,
             });
             stopped = reason;
@@ -225,6 +260,10 @@ pub async fn run_continue_batch(
         let enforce = PhaseEnforceFlags::load(config_root);
         if enforce.chapter_order {
             if let Some(block) = check_chapter_order(&dir, chapter) {
+                emit_batch(
+                    &tx,
+                    format!("⛔ 第{chapter}章拦截·章序：{}", block.message),
+                );
                 results.push(BatchChapterResult {
                     chapter,
                     published: false,
@@ -233,6 +272,7 @@ pub async fn run_continue_batch(
                     needs_user_choice: true,
                     message: block.message,
                     length_auto_revised: false,
+                    hard_rule_auto_revised: false,
                     run: None,
                 });
                 stopped = "chapter_order".into();
@@ -242,6 +282,7 @@ pub async fn run_continue_batch(
 
         match check_plot_write_gate_with(&dir, enforce) {
             PlotWriteGate::Block { message, reason, .. } => {
+                emit_batch(&tx, format!("⛔ 第{chapter}章拦截·剧情门：{message}"));
                 results.push(BatchChapterResult {
                     chapter,
                     published: false,
@@ -250,6 +291,7 @@ pub async fn run_continue_batch(
                     needs_user_choice: true,
                     message,
                     length_auto_revised: false,
+                    hard_rule_auto_revised: false,
                     run: None,
                 });
                 stopped = format!("plot_gate:{reason}");
@@ -258,22 +300,143 @@ pub async fn run_continue_batch(
             PlotWriteGate::Allow { .. } => {}
         }
 
-        // Skip rewrite of existing long draft without explicit chapter (batch always uses next).
+        // Foreshadow debt brake for unattended batch.
+        let debt_cap = lf.batch_max_dangling_foreshadow;
+        if debt_cap > 0 {
+            let health = crate::memory::longform_health_snapshot(&dir);
+            let dangling = health
+                .pointer("/foreshadow/dangling_total")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            if dangling > debt_cap {
+                let message = format!(
+                    "伏笔债务过高（未收 {dangling} 条 > 上限 {debt_cap}）。批写暂停；请先兑现/清理伏笔后再连写。"
+                );
+                emit_batch(&tx, format!("⛔ {message}"));
+                results.push(BatchChapterResult {
+                    chapter,
+                    published: false,
+                    blocked: true,
+                    reason: Some("foreshadow_debt".into()),
+                    needs_user_choice: true,
+                    message,
+                    length_auto_revised: false,
+                    hard_rule_auto_revised: false,
+                    run: None,
+                });
+                stopped = "foreshadow_debt".into();
+                break;
+            }
+        }
+
+        // Existing long draft: try audit-only publish once before hard-stopping.
         let existing = read_chapter_draft(&dir, chapter).unwrap_or_default();
         let min_chars = novelx_harness::StudioPolicies::load(config_root).draft_min_chars();
         if existing.chars().count() >= min_chars {
+            emit_batch(
+                &tx,
+                format!(
+                    "⚙ 第{chapter}章已有未发布正文（约 {} 字），先尝试审校发布…",
+                    existing.chars().count()
+                ),
+            );
+            let mut audit_run = execute_pipeline(
+                projects_root,
+                config_root,
+                &opts.project,
+                chapter,
+                RunMode::AuditOnly,
+                RevisionOptions::default(),
+                llm.clone(),
+                tx.clone(),
+            )
+            .await?;
+            let mut length_auto_revised = false;
+            let mut hard_rule_auto_revised = false;
+            // One-shot auto-revise for hard-rule / length blocks before hard-stopping.
+            if !audit_run.published
+                && (audit_run.content_rule_blocked
+                    || matches!(
+                        audit_run.length_status.as_str(),
+                        "hard_short" | "soft_short_escalated"
+                    ))
+            {
+                let for_hard_rule = audit_run.content_rule_blocked;
+                let instr = if for_hard_rule {
+                    let detail = audit_run.message.clone();
+                    format!(
+                        "消除正文硬规则违规；只改违规句，勿整章重写。参考：{}",
+                        detail.chars().take(400).collect::<String>()
+                    )
+                } else {
+                    format!(
+                        "扩写到{}字完整一章；保持情节与人物一致，补足场景与对话，勿注水。",
+                        budget.range_label()
+                    )
+                };
+                emit_batch(
+                    &tx,
+                    format!("⚙ 第{chapter}章已有草稿未发布，自动修订一次后重试…"),
+                );
+                audit_run = execute_pipeline(
+                    projects_root,
+                    config_root,
+                    &opts.project,
+                    chapter,
+                    RunMode::Revise,
+                    RevisionOptions {
+                        prefer_local_patch: false,
+                        revision_mode: true,
+                        user_instructions: Some(instr),
+                        audit_issues: vec![],
+                        pacing_suggestions: vec![],
+                        verify_previous: false,
+                        full_rescan: false,
+                    },
+                    llm.clone(),
+                    tx.clone(),
+                )
+                .await?;
+                if for_hard_rule {
+                    hard_rule_auto_revised = true;
+                } else {
+                    length_auto_revised = true;
+                }
+            }
+            if audit_run.published {
+                published_n += 1;
+                emit_batch(
+                    &tx,
+                    format!("✓ 第{chapter}章已有草稿经审校发布（本批累计 {published_n} 章）"),
+                );
+                results.push(BatchChapterResult {
+                    chapter,
+                    published: true,
+                    blocked: false,
+                    reason: None,
+                    needs_user_choice: false,
+                    message: audit_run.message.clone(),
+                    length_auto_revised,
+                    hard_rule_auto_revised,
+                    run: Some(audit_run),
+                });
+                continue;
+            }
+            let message = format!(
+                "第{chapter}章已有未发布正文（约 {} 字），审校/自动修订后仍未发布。批写暂停；请 revise_chapter 或按审批卡修正。",
+                existing.chars().count()
+            );
+            emit_batch(&tx, format!("⛔ {message}"));
             results.push(BatchChapterResult {
                 chapter,
                 published: false,
                 blocked: true,
                 reason: Some("draft_exists".into()),
                 needs_user_choice: true,
-                message: format!(
-                    "第{chapter}章已有未发布正文（约 {} 字）。批写暂停；请 revise_chapter 或 audit_chapter。",
-                    existing.chars().count()
-                ),
-                length_auto_revised: false,
-                run: None,
+                message,
+                length_auto_revised,
+                hard_rule_auto_revised,
+                run: Some(audit_run),
             });
             stopped = "draft_exists".into();
             break;
@@ -287,7 +450,7 @@ pub async fn run_continue_batch(
             RunMode::Continue,
             RevisionOptions::default(),
             llm.clone(),
-            None,
+            tx.clone(),
         )
         .await?;
 
@@ -303,6 +466,10 @@ pub async fn run_continue_batch(
             length_blocks_publish(&dir, config_root, chapter),
         ) {
             tracing::info!(chapter, "batch: auto length revise once");
+            emit_batch(
+                &tx,
+                format!("⚙ 第{chapter}章字数不足，自动扩写一次…"),
+            );
             let instr = format!(
                 "扩写到{}字完整一章；保持情节与人物一致，补足场景与对话，勿注水。",
                 budget.range_label()
@@ -323,7 +490,7 @@ pub async fn run_continue_batch(
                     full_rescan: false,
                 },
                 llm.clone(),
-                None,
+                tx.clone(),
             )
             .await?;
             length_auto_revised = true;
@@ -347,6 +514,16 @@ pub async fn run_continue_batch(
 
         if run.published {
             published_n += 1;
+            emit_batch(
+                &tx,
+                format!("✓ 第{chapter}章已发布（本批累计 {published_n} 章）"),
+            );
+        } else if blocked {
+            let why = reason.as_deref().unwrap_or("gate");
+            emit_batch(
+                &tx,
+                format!("⛔ 第{chapter}章未发布（{why}），批写暂停"),
+            );
         }
 
         let msg = run.message.clone();
@@ -358,6 +535,7 @@ pub async fn run_continue_batch(
             needs_user_choice: run.needs_user_choice,
             message: msg,
             length_auto_revised,
+            hard_rule_auto_revised: false,
             run: Some(run),
         });
 
@@ -369,17 +547,28 @@ pub async fn run_continue_batch(
         let vp = resolve_volume_phase(&dir);
         if !matches!(vp, VolumePhase::DraftingVolume) {
             stopped = format!("volume_phase:{}", vp.as_str());
+            emit_batch(
+                &tx,
+                format!("⏸ 卷阶段变为 {}，批写结束", vp.as_str()),
+            );
             break;
         }
         let sp = resolve_setup_phase(&dir);
         if sp.as_str() != "ready" && enforce.setup {
             stopped = format!("setup_phase:{}", sp.as_str());
+            emit_batch(
+                &tx,
+                format!("⏸ setup 阶段变为 {}，批写结束", sp.as_str()),
+            );
             break;
         }
     }
 
     if attempted >= max && stopped == "completed" {
         stopped = format!("max_chapters({max})");
+        emit_batch(&tx, format!("✓ 已达批写上限 max_chapters({max})"));
+    } else if stopped == "completed" {
+        emit_batch(&tx, "✓ 批写循环正常结束");
     }
 
     Ok(BatchContinueResult {
@@ -412,6 +601,8 @@ impl BatchContinueResult {
             };
             let auto = if r.length_auto_revised {
                 " ·已自动扩写"
+            } else if r.hard_rule_auto_revised {
+                " ·已自动修订硬规则"
             } else {
                 ""
             };
@@ -494,6 +685,7 @@ mod tests {
                 needs_user_choice: true,
                 message: "paused".into(),
                 length_auto_revised: false,
+                hard_rule_auto_revised: false,
                 run: None,
             }],
         };

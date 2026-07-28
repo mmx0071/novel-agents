@@ -133,6 +133,39 @@ fn default_meta_msg() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineMetaLeakRule {
+    #[serde(flatten)]
+    pub meta: RuleMeta,
+    #[serde(default = "default_pipeline_meta_patterns")]
+    pub patterns: Vec<String>,
+    #[serde(default = "default_pipeline_meta_msg")]
+    pub message: String,
+}
+
+fn default_pipeline_meta_patterns() -> Vec<String> {
+    [
+        "章纲里",
+        "章纲写",
+        "章纲中",
+        "按大纲",
+        "大纲里",
+        "大纲写",
+        "设定上",
+        "设定文档",
+        "写作说明",
+        "按章纲",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn default_pipeline_meta_msg() -> String {
+    "正文出现管线元叙述「{match}」（约第{line}行）：禁止章纲/大纲/设定对读；写前自行对齐后只写场面"
+        .into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CountdownJumpRule {
     #[serde(flatten)]
     pub meta: RuleMeta,
@@ -253,6 +286,8 @@ pub struct ContentRulesBundle {
     pub too_many_new_facts: TooManyNewFactsRule,
     #[serde(default = "default_meta_rule")]
     pub meta_chapter_ref: MetaChapterRule,
+    #[serde(default = "default_pipeline_meta_rule")]
+    pub pipeline_meta_leak: PipelineMetaLeakRule,
     #[serde(default = "default_countdown_rule")]
     pub timeline_countdown_jump: CountdownJumpRule,
     #[serde(default = "default_daypart_rule")]
@@ -304,6 +339,17 @@ fn default_meta_rule() -> MetaChapterRule {
         message: default_meta_msg(),
     }
 }
+fn default_pipeline_meta_rule() -> PipelineMetaLeakRule {
+    PipelineMetaLeakRule {
+        meta: RuleMeta {
+            title: "管线元叙述泄露".into(),
+            description: "正文不得出现章纲/大纲/设定文档对读等写作管线用语。".into(),
+            ..RuleMeta::default()
+        },
+        patterns: default_pipeline_meta_patterns(),
+        message: default_pipeline_meta_msg(),
+    }
+}
 fn default_countdown_rule() -> CountdownJumpRule {
     CountdownJumpRule {
         meta: RuleMeta {
@@ -338,6 +384,7 @@ impl Default for ContentRulesBundle {
             contradiction_marker: default_contradiction_rule(),
             too_many_new_facts: default_new_facts_rule(),
             meta_chapter_ref: default_meta_rule(),
+            pipeline_meta_leak: default_pipeline_meta_rule(),
             timeline_countdown_jump: default_countdown_rule(),
             timeline_daypart_regression: default_daypart_rule(),
         }
@@ -421,6 +468,7 @@ impl ContentRulesConfig {
             "contradiction_marker",
             "too_many_new_facts",
             "meta_chapter_ref",
+            "pipeline_meta_leak",
             "timeline_countdown_jump",
             "timeline_daypart_regression",
         ];
@@ -504,6 +552,23 @@ impl ContentRulesConfig {
     }
 
     /// Catalog for Web UI (id / title / description / enabled / blocking).
+    /// Display title for a rule id (Web / gate prompts). Unknown ids return the id itself.
+    pub fn title_for_rule(&self, id: &str) -> String {
+        let b = &self.rules;
+        match id {
+            "banned_name" => b.banned_name.meta.title.clone(),
+            "contradiction_marker" => b.contradiction_marker.meta.title.clone(),
+            "too_many_new_facts" => b.too_many_new_facts.meta.title.clone(),
+            "meta_chapter_ref" => b.meta_chapter_ref.meta.title.clone(),
+            "pipeline_meta_leak" => b.pipeline_meta_leak.meta.title.clone(),
+            "timeline_countdown_jump" => b.timeline_countdown_jump.meta.title.clone(),
+            "timeline_daypart_regression" => b.timeline_daypart_regression.meta.title.clone(),
+            "body_state_side" => "身体侧别".into(),
+            "body_state_locus" => "能力载体".into(),
+            _ => id.to_string(),
+        }
+    }
+
     pub fn catalog(&self) -> Vec<serde_json::Value> {
         use serde_json::json;
         let b = &self.rules;
@@ -535,6 +600,13 @@ impl ContentRulesConfig {
                 "description": b.meta_chapter_ref.meta.description,
                 "enabled": b.meta_chapter_ref.meta.enabled,
                 "blocking": b.meta_chapter_ref.meta.blocking,
+            }),
+            json!({
+                "id": "pipeline_meta_leak",
+                "title": b.pipeline_meta_leak.meta.title,
+                "description": b.pipeline_meta_leak.meta.description,
+                "enabled": b.pipeline_meta_leak.meta.enabled,
+                "blocking": b.pipeline_meta_leak.meta.blocking,
             }),
             json!({
                 "id": "timeline_countdown_jump",
@@ -614,11 +686,35 @@ pub fn check_draft_with(
     if r.meta_chapter_ref.meta.enabled {
         out.extend(check_meta_chapter_refs(cfg, draft));
     }
+    if r.pipeline_meta_leak.meta.enabled {
+        out.extend(check_pipeline_meta_leak(cfg, draft));
+    }
     if r.timeline_countdown_jump.meta.enabled {
         out.extend(check_countdown_monotonicity(cfg, draft));
     }
     if r.timeline_daypart_regression.meta.enabled {
         out.extend(check_daypart_regression(cfg, draft));
+    }
+    out
+}
+
+fn check_pipeline_meta_leak(cfg: &ContentRulesConfig, draft: &str) -> Vec<ContentRuleViolation> {
+    let rule = &cfg.rules.pipeline_meta_leak;
+    let mut out = Vec::new();
+    for (idx, line) in draft.lines().enumerate() {
+        for pat in &rule.patterns {
+            if pat.is_empty() {
+                continue;
+            }
+            if line.contains(pat) {
+                let msg = rule
+                    .message
+                    .replace("{match}", pat)
+                    .replace("{line}", &(idx + 1).to_string());
+                out.push(violation("pipeline_meta_leak", msg, rule.meta.blocking));
+                break;
+            }
+        }
     }
     out
 }
@@ -881,6 +977,16 @@ mod tests {
         assert!(
             v.iter().any(|x| x.rule == "meta_chapter_ref"),
             "expected meta_chapter_ref, got {v:?}"
+        );
+    }
+
+    #[test]
+    fn flags_pipeline_meta_leak_outline_readback() {
+        let draft = "# 第1章\n\n章纲里写的推进路径与他听到的并不一致。\n";
+        let v = check_draft(draft, &[]);
+        assert!(
+            v.iter().any(|x| x.rule == "pipeline_meta_leak"),
+            "expected pipeline_meta_leak, got {v:?}"
         );
     }
 

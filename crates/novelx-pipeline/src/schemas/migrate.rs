@@ -36,9 +36,19 @@ pub fn migrate_project_reader_formats(project_dir: &Path) -> MigrateReport {
 
 /// Merge halfwidth/fullwidth paren twins, and swapped alias forms
 /// (`A（B）.md` + `B（A）.md` → keep the longer card).
+/// Covers characters / items / locations (items & locations often get「名（说明）」twins).
 fn merge_paren_duplicate_entities(project_dir: &Path, report: &mut MigrateReport) {
-    let dir = project_dir.join("entities/characters");
-    let Ok(rd) = fs::read_dir(&dir) else {
+    for (group, label) in [
+        ("characters", "人物"),
+        ("items", "物品"),
+        ("locations", "地点"),
+    ] {
+        merge_paren_duplicates_in_dir(&project_dir.join("entities").join(group), label, report);
+    }
+}
+
+fn merge_paren_duplicates_in_dir(dir: &Path, label: &str, report: &mut MigrateReport) {
+    let Ok(rd) = fs::read_dir(dir) else {
         return;
     };
     let names: Vec<String> = rd
@@ -79,11 +89,11 @@ fn merge_paren_duplicate_entities(project_dir: &Path, report: &mut MigrateReport
         let _ = fs::remove_file(&half_path);
         report
             .notes
-            .push(format!("合并重复人物卡：{name}.md → {full}.md"));
+            .push(format!("合并重复{label}卡：{name}.md → {full}.md"));
     }
 
-    // Swapped paren aliases: 严国栋（老严） vs 老严（严国栋）
-    let names: Vec<String> = fs::read_dir(&dir)
+    // Swapped paren aliases / bare vs `正式名（别名）`: 旧钥 vs 旧钥（入门引导）
+    let names: Vec<String> = fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
@@ -128,7 +138,7 @@ fn merge_paren_duplicate_entities(project_dir: &Path, report: &mut MigrateReport
             let _ = fs::remove_file(drop_path);
             removed.insert(drop_name.clone());
             report.notes.push(format!(
-                "合并别名重复人物卡：{drop_name}.md → {keep_name}.md"
+                "合并别名重复{label}卡：{drop_name}.md → {keep_name}.md"
             ));
         }
     }

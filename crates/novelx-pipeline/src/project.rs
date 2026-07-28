@@ -295,6 +295,47 @@ pub fn write_chapter_draft(project_dir: &Path, chapter: u32, draft: &str) -> Res
     Ok(())
 }
 
+/// Stable fingerprint of draft body for gating hot-memory artifacts.
+pub fn draft_fingerprint(draft: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    draft.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// Write a chapter-local memory artifact tied to the current draft fingerprint.
+pub fn write_chapter_memory_artifact(
+    project_dir: &Path,
+    chapter: u32,
+    name: &str,
+    content: &str,
+    draft: &str,
+) -> Result<()> {
+    let dir = chapter_dir(project_dir, chapter);
+    fs::create_dir_all(&dir)?;
+    fs::write(dir.join(name), content)?;
+    fs::write(
+        dir.join(format!("{name}.draft_fp")),
+        draft_fingerprint(draft),
+    )?;
+    Ok(())
+}
+
+/// True when `name` was generated against the current draft (missing fp ⇒ stale).
+pub fn chapter_memory_artifact_matches_draft(
+    project_dir: &Path,
+    chapter: u32,
+    name: &str,
+    draft: &str,
+) -> bool {
+    let dir = chapter_dir(project_dir, chapter);
+    let Ok(fp) = fs::read_to_string(dir.join(format!("{name}.draft_fp"))) else {
+        return false;
+    };
+    fp.trim() == draft_fingerprint(draft)
+}
+
 /// Read chapter outline as canonical JSON text (pretty). Migrates legacy `outline.md` once.
 pub fn read_chapter_outline(project_dir: &Path, chapter: u32) -> Option<String> {
     let dir = chapter_dir(project_dir, chapter);
@@ -603,6 +644,32 @@ mod tests {
         let meta: Value =
             serde_json::from_str(&fs::read_to_string(proj.join("meta.json")).unwrap()).unwrap();
         assert_eq!(meta["target_chapters"], 900);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn memory_artifact_fingerprint_gates_stale_json() {
+        let root = std::env::temp_dir().join(format!("nx_fp_{}", uuid_like()));
+        let _ = fs::remove_dir_all(&root);
+        let proj = init_project(&root, "sample-novel", "未定", 10).unwrap();
+        let draft_a = "# 第1章\n\n正文甲。\n";
+        let draft_b = "# 第1章\n\n正文乙改稿。\n";
+        write_chapter_draft(&proj, 1, draft_a).unwrap();
+        write_chapter_memory_artifact(&proj, 1, "summary.json", r#"{"event_summary":"甲"}"#, draft_a)
+            .unwrap();
+        assert!(chapter_memory_artifact_matches_draft(
+            &proj, 1, "summary.json", draft_a
+        ));
+        assert!(!chapter_memory_artifact_matches_draft(
+            &proj, 1, "summary.json", draft_b
+        ));
+        // Legacy artifact without fingerprint is treated as stale.
+        let dir = chapter_dir(&proj, 1);
+        fs::write(dir.join("foreshadow.json"), "{}").unwrap();
+        let _ = fs::remove_file(dir.join("foreshadow.json.draft_fp"));
+        assert!(!chapter_memory_artifact_matches_draft(
+            &proj, 1, "foreshadow.json", draft_a
+        ));
         let _ = fs::remove_dir_all(&root);
     }
 

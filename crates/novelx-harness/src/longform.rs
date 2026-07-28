@@ -93,6 +93,9 @@ pub struct LongformConfig {
     pub batch_max_chapters: u32,
     #[serde(default = "default_soft_short_streak")]
     pub soft_short_auto_revise_after: u32,
+    /// Pause continue_writing_batch when open foreshadow debt exceeds this (0 = disabled).
+    #[serde(default = "default_batch_max_dangling")]
+    pub batch_max_dangling_foreshadow: u32,
 }
 
 fn default_batch_max() -> u32 {
@@ -100,6 +103,9 @@ fn default_batch_max() -> u32 {
 }
 fn default_soft_short_streak() -> u32 {
     3
+}
+fn default_batch_max_dangling() -> u32 {
+    40
 }
 
 impl Default for LongformConfig {
@@ -110,6 +116,7 @@ impl Default for LongformConfig {
             impact_scan_mode: ImpactScanMode::Indexed,
             batch_max_chapters: default_batch_max(),
             soft_short_auto_revise_after: default_soft_short_streak(),
+            batch_max_dangling_foreshadow: default_batch_max_dangling(),
         }
     }
 }

@@ -22,7 +22,7 @@ pub use longform::{AuditTier, ImpactScanMode, LongformConfig, QualityTier};
 pub use continuity::{ContinuityBudget, ContinuityTier};
 pub use content_rules::{
     check_draft, check_draft_with, has_blocking_violation, rewrite_meta_chapter_refs_in_body,
-    rewrite_meta_chapter_refs_with, ContentRulesConfig,
+    rewrite_meta_chapter_refs_with, ContentRuleViolation, ContentRulesConfig,
 };
 pub use gates::{
     consistency_human_option_labels, on_consistency_result, on_pacing_result, should_publish,

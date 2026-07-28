@@ -1,11 +1,13 @@
-# Studio deterministic intents (Codex-style: data-driven, thin matcher in Rust).
-# Higher priority wins. Unmatched text falls through to the LLM tool loop.
+# Studio deterministic intents (thin matcher in Rust).
+# Higher priority wins. Unmatched / enabled:false → LLM tool loop (more agentic).
+# Keep enabled only for high-confidence write/ops; query/design/audit fall through.
 version: 1
 
 intents:
   # 「审这一卷 / 卷末复盘」→ 摘要层卷复盘（非逐章正文）
   - id: audit_volume
     tool: audit_volume
+    enabled: false
     priority: 110
     require_project: true
     extract: none
@@ -27,6 +29,7 @@ intents:
   # 「审阅1-8章 / 第1章到第8章审校」→ audit_chapters queue
   - id: audit_range
     tool: audit_chapters
+    enabled: false
     priority: 100
     require_project: true
     extract: chapter_range
@@ -63,6 +66,7 @@ intents:
   # 「审校第9章 / 检阅第九章」→ audit_chapter
   - id: audit_one
     tool: audit_chapter
+    enabled: false
     priority: 80
     require_project: true
     extract: chapter
@@ -83,9 +87,10 @@ intents:
       - 复盘
       - 继续
 
-  # 「对照剧情卡到哪了 / 剧情进度 / 第N卷进行到哪了」→ 只查卡，禁止续写
+  # 「对照剧情卡到哪了 / 剧情进度 / 第N卷进行到哪了」→ list_plots（内嵌精简项目状态），禁止续写
   - id: plot_status
     tool: list_plots
+    enabled: false
     priority: 85
     require_project: true
     extract: volume_optional
@@ -185,6 +190,7 @@ intents:
   # 「重建总纲 / 生成总纲」→ design_master_outline（ready 项目也可确定性重入）
   - id: design_master_outline
     tool: design_master_outline
+    enabled: false
     priority: 85
     require_project: true
     extract: none
@@ -205,6 +211,7 @@ intents:
   # 「生成卷纲 / 重建卷纲 / 更新卷纲」→ design_arc_outline
   - id: design_arc_outline
     tool: design_arc_outline
+    enabled: false
     priority: 84
     require_project: true
     extract: none
@@ -227,6 +234,7 @@ intents:
   # 「改第N章章纲 / 修正章纲 / 重写章纲」→ revise_outline（优先于改正文）
   - id: revise_outline
     tool: revise_outline
+    enabled: false
     priority: 65
     require_project: true
     extract: chapter
@@ -252,6 +260,7 @@ intents:
   # 「查看预期 / 列出预设事件」→ list_expected_events
   - id: list_expected_events
     tool: list_expected_events
+    enabled: false
     priority: 75
     require_project: true
     extract: none
@@ -274,6 +283,7 @@ intents:
   # 「检阅预期」→ review_expected_events
   - id: review_expected_events
     tool: review_expected_events
+    enabled: false
     priority: 76
     require_project: true
     extract: none

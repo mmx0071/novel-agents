@@ -957,17 +957,70 @@ impl LlmClient {
             .await
     }
 
+    /// Like [`Self::complete_messages_stream_limited`] plus live `reasoning_content` chunks.
+    pub async fn complete_messages_stream_limited_ex<F, Fut, R, RFut>(
+        &self,
+        messages: Vec<ChatMessage>,
+        model: Option<&str>,
+        tools: Option<&[ToolSpec]>,
+        max_tokens: Option<u32>,
+        on_delta: F,
+        on_reasoning: R,
+    ) -> Result<CompletionResult>
+    where
+        F: FnMut(String) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+        R: FnMut(String) -> RFut,
+        RFut: std::future::Future<Output = ()>,
+    {
+        self.complete_messages_stream_limited_inner(
+            messages,
+            model,
+            tools,
+            max_tokens,
+            on_delta,
+            on_reasoning,
+        )
+        .await
+    }
+
     pub async fn complete_messages_stream_limited<F, Fut>(
         &self,
         messages: Vec<ChatMessage>,
         model: Option<&str>,
         tools: Option<&[ToolSpec]>,
         max_tokens: Option<u32>,
-        mut on_delta: F,
+        on_delta: F,
     ) -> Result<CompletionResult>
     where
         F: FnMut(String) -> Fut,
         Fut: std::future::Future<Output = ()>,
+    {
+        self.complete_messages_stream_limited_inner(
+            messages,
+            model,
+            tools,
+            max_tokens,
+            on_delta,
+            |_: String| async {},
+        )
+        .await
+    }
+
+    async fn complete_messages_stream_limited_inner<F, Fut, R, RFut>(
+        &self,
+        messages: Vec<ChatMessage>,
+        model: Option<&str>,
+        tools: Option<&[ToolSpec]>,
+        max_tokens: Option<u32>,
+        mut on_delta: F,
+        mut on_reasoning: R,
+    ) -> Result<CompletionResult>
+    where
+        F: FnMut(String) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+        R: FnMut(String) -> RFut,
+        RFut: std::future::Future<Output = ()>,
     {
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1071,14 +1124,25 @@ impl LlmClient {
             // Hard deadline — reqwest timeout alone can miss stuck body streams.
             let result = {
                 let on_delta_ref = &mut on_delta;
+                let on_reasoning_ref = &mut on_reasoning;
                 let emitted_ref = &emitted;
                 let mut delta_cb = |piece: String| {
                     emitted_ref.store(true, Ordering::Relaxed);
                     on_delta_ref(piece)
                 };
+                let mut reasoning_cb = |piece: String| {
+                    emitted_ref.store(true, Ordering::Relaxed);
+                    on_reasoning_ref(piece)
+                };
                 tokio::time::timeout(
                     std::time::Duration::from_secs(deadline_secs),
-                    self.drive_chat_stream(&key, &base_url, body.clone(), &mut delta_cb),
+                    self.drive_chat_stream(
+                        &key,
+                        &base_url,
+                        body.clone(),
+                        &mut delta_cb,
+                        &mut reasoning_cb,
+                    ),
                 )
                 .await
             };
@@ -1171,16 +1235,19 @@ impl LlmClient {
         })
     }
 
-    async fn drive_chat_stream<F, Fut>(
+    async fn drive_chat_stream<F, Fut, R, RFut>(
         &self,
         key: &str,
         base_url: &str,
         body: Value,
         on_delta: &mut F,
+        on_reasoning: &mut R,
     ) -> Result<(String, Vec<ToolCall>, u32, Option<String>)>
     where
         F: FnMut(String) -> Fut,
         Fut: std::future::Future<Output = ()>,
+        R: FnMut(String) -> RFut,
+        RFut: std::future::Future<Output = ()>,
     {
         let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
         let resp = self
@@ -1257,6 +1324,7 @@ impl LlmClient {
                     if !piece.is_empty() {
                         got_first_token = true;
                         reasoning.push_str(piece);
+                        on_reasoning(piece.to_string()).await;
                     }
                 }
                 if let Some(arr) = delta["tool_calls"].as_array() {

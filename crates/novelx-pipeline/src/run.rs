@@ -5,6 +5,7 @@ use novelx_draft_patch::{
 };
 use novelx_harness::{
     check_draft_with, collect_signals, evaluate_activation, has_blocking_violation,
+    ContentRuleViolation,
     ContentRulesConfig, has_timeline_p0,
     consistency_human_option_labels, merge_verify_audit, normalize_consistency_issues,
     on_consistency_result, on_pacing_result, with_issue_ids, should_publish,
@@ -24,8 +25,9 @@ use crate::context::{build_chapter_context, ContextProfile};
 use crate::lore::{lore_assert_from_summary, lore_query};
 use crate::memory::{apply_summary_json, load_memory, save_memory, OpenThread};
 use crate::project::{
-    load_project_state, read_chapter_draft, read_chapter_outline, save_project_state,
-    write_chapter_draft, write_chapter_outline, ProjectState,
+    chapter_memory_artifact_matches_draft, load_project_state, read_chapter_draft,
+    read_chapter_outline, save_project_state, write_chapter_draft, write_chapter_memory_artifact,
+    write_chapter_outline, ProjectState,
 };
 use crate::schemas::{
     draft_body_chars, normalize_draft_best_effort, validate_draft, MIN_DRAFT_BODY_CHARS,
@@ -153,6 +155,8 @@ pub enum PipelineEvent {
     DraftFlushed { chars: usize },
     AwaitingHuman { prompt: String, options: Vec<String> },
     AutoFixStarted { reason: String },
+    /// Batch continue banner / chapter outcome (tool-card progress).
+    BatchProgress { message: String },
     RunCompleted { run_id: String, message: String },
     Error { message: String },
 }
@@ -1016,63 +1020,102 @@ pub async fn execute_pipeline_with_steps(
                 }
             }
             Some(HandlerKind::Foreshadow) => {
-                let report =
-                    run_foreshadow_tracker(&llm, skill_body, &project_dir, chapter, &draft, &outline)
-                        .await?;
-                let n = apply_foreshadow_report(&project_dir, chapter, &report)?;
-                let dir = project_dir.join("chapters").join(format!("{chapter:03}"));
-                std::fs::create_dir_all(&dir)?;
-                std::fs::write(dir.join("foreshadow.json"), &report)?;
-                report_parts.push(format!("## 伏笔追踪（第{chapter}章）\n\n{report}"));
-                format!("伏笔追踪完成（更新 {n} 条线索）")
+                // Chapter-local only until publish — hard rules / length / accept run later.
+                if has_blocking || await_human {
+                    "一致性/门控未通过，已跳过伏笔追踪".into()
+                } else {
+                    let report = run_foreshadow_tracker(
+                        &llm,
+                        skill_body,
+                        &project_dir,
+                        chapter,
+                        &draft,
+                        &outline,
+                    )
+                    .await?;
+                    write_chapter_memory_artifact(
+                        &project_dir,
+                        chapter,
+                        "foreshadow.json",
+                        &report,
+                        &draft,
+                    )?;
+                    report_parts.push(format!("## 伏笔追踪（第{chapter}章）\n\n{report}"));
+                    "伏笔追踪完成（待发布后入库）".into()
+                }
             }
             Some(HandlerKind::Summarizer) => {
-                let summary = run_summarizer(&llm, skill_body, &draft).await?;
-                let dir = project_dir.join("chapters").join(format!("{chapter:03}"));
-                std::fs::create_dir_all(&dir)?;
-                std::fs::write(dir.join("summary.json"), &summary)?;
-                ran_summarizer = true;
-                let facts = apply_summary_json(&project_dir, chapter, &summary).unwrap_or(0);
-                let (asserted, conflicts) =
-                    lore_assert_from_summary(&project_dir, chapter, &summary).unwrap_or((0, vec![]));
-                if !conflicts.is_empty() {
-                    report_parts.push(format!(
-                        "## Lore 冲突（未覆盖）\n{}",
-                        conflicts.join("\n")
-                    ));
+                // Write chapter summary.json only; hot digests / lore assert wait for publish.
+                if has_blocking || await_human {
+                    "一致性/门控未通过，已跳过摘要".into()
+                } else {
+                    let summary = run_summarizer(&llm, skill_body, &draft).await?;
+                    write_chapter_memory_artifact(
+                        &project_dir,
+                        chapter,
+                        "summary.json",
+                        &summary,
+                        &draft,
+                    )?;
+                    ran_summarizer = true;
+                    report_parts.push(format!("## 章节摘要（第{chapter}章 · 待发布后入库）"));
+                    "摘要已生成（待发布后入库）".into()
                 }
-                format!("摘要已入库（digest facts={facts}，assert={asserted}）")
             }
             Some(HandlerKind::PlotAccept) => {
-                let summary_path = project_dir
-                    .join("chapters")
-                    .join(format!("{chapter:03}"))
-                    .join("summary.json");
-                let summary = std::fs::read_to_string(&summary_path).unwrap_or_default();
-                let verdict =
-                    run_plot_acceptor(&llm, skill_body, &project_dir, chapter, &draft, &summary)
-                        .await?;
-                let dir = project_dir.join("chapters").join(format!("{chapter:03}"));
-                std::fs::create_dir_all(&dir)?;
-                std::fs::write(dir.join("plot_accept.json"), &verdict)?;
-                pending_plot_accept = Some(verdict.clone());
-                let v = serde_json::from_str::<serde_json::Value>(&verdict).unwrap_or_default();
-                if v.get("skipped").and_then(|x| x.as_bool()).unwrap_or(false) {
-                    let r = v
-                        .get("rationale")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("已跳过");
-                    if r.contains("缺少收束") {
-                        report_parts.push(format!("## 剧情验收（阻塞）\n{r}"));
-                    }
-                    format!("剧情验收：{r}")
-                } else if crate::plots::accept_verdict_is_pass(&verdict) {
-                    "剧情验收通过（待本章发布后 completed）".into()
-                } else if let Some(r) = v.get("rationale").and_then(|x| x.as_str()) {
-                    report_parts.push(format!("## 剧情验收（未通过）\n{r}"));
-                    format!("剧情验收未通过：{r}")
+                if has_blocking || await_human {
+                    "一致性/门控未通过，已跳过剧情验收".into()
                 } else {
-                    "剧情验收：未通过".into()
+                    let summary_path = project_dir
+                        .join("chapters")
+                        .join(format!("{chapter:03}"))
+                        .join("summary.json");
+                    let summary = std::fs::read_to_string(&summary_path).unwrap_or_default();
+                    let verdict = run_plot_acceptor(
+                        &llm,
+                        skill_body,
+                        &project_dir,
+                        chapter,
+                        &draft,
+                        &summary,
+                    )
+                    .await?;
+                    let dir = project_dir.join("chapters").join(format!("{chapter:03}"));
+                    std::fs::create_dir_all(&dir)?;
+                    std::fs::write(dir.join("plot_accept.json"), &verdict)?;
+                    pending_plot_accept = Some(verdict.clone());
+                    let v = serde_json::from_str::<serde_json::Value>(&verdict).unwrap_or_default();
+                    if v.get("skipped").and_then(|x| x.as_bool()).unwrap_or(false) {
+                        let r = v
+                            .get("rationale")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("已跳过");
+                        if r.contains("缺少收束") {
+                            has_blocking = true;
+                            run.needs_user_choice = true;
+                            run.plot_accept_passed = Some(false);
+                            run.plot_accept_rationale = Some(r.to_string());
+                            report_parts.push(format!("## 剧情验收（阻塞发布）\n{r}"));
+                        }
+                        format!("剧情验收：{r}")
+                    } else if crate::plots::accept_verdict_is_pass(&verdict) {
+                        run.plot_accept_passed = Some(true);
+                        "剧情验收通过（待本章发布后 completed）".into()
+                    } else if let Some(r) = v.get("rationale").and_then(|x| x.as_str()) {
+                        // Fail blocks publish — do not advance with unmet exit conditions.
+                        has_blocking = true;
+                        run.needs_user_choice = true;
+                        run.plot_accept_passed = Some(false);
+                        run.plot_accept_rationale = Some(r.to_string());
+                        report_parts.push(format!("## 剧情验收（未通过·阻断发布）\n{r}"));
+                        format!("剧情验收未通过（未发布）：{r}")
+                    } else {
+                        has_blocking = true;
+                        run.needs_user_choice = true;
+                        run.plot_accept_passed = Some(false);
+                        report_parts.push("## 剧情验收（未通过·阻断发布）".into());
+                        "剧情验收：未通过（未发布）".into()
+                    }
                 }
             }
             None => {
@@ -1105,11 +1148,30 @@ pub async fn execute_pipeline_with_steps(
     }
 
     // Always scan enabled hard rules (audit + write). Only `blocking: true` blocks publish.
-    let violations = if !draft.is_empty() {
+    let mut violations = if !draft.is_empty() {
         check_draft_with(&content_rules, &draft, &naming.forbidden_names)
     } else {
         Vec::new()
     };
+    // Light deterministic body-state checks (side flip + ability host locus).
+    if !draft.is_empty() {
+        for msg in crate::body_state::check_body_state_side_conflicts(&project_dir, chapter, &draft)
+        {
+            violations.push(ContentRuleViolation {
+                rule: "body_state_side".into(),
+                message: msg,
+                blocking: true,
+            });
+        }
+        for msg in crate::body_state::check_body_state_locus_conflicts(&project_dir, chapter, &draft)
+        {
+            violations.push(ContentRuleViolation {
+                rule: "body_state_locus".into(),
+                message: msg,
+                blocking: true,
+            });
+        }
+    }
     if !violations.is_empty() {
         let blocking_n = violations.iter().filter(|v| v.blocking).count();
         let warn_n = violations.len() - blocking_n;
@@ -1129,11 +1191,10 @@ pub async fn execute_pipeline_with_steps(
             detail = %listed,
             "content rule violations"
         );
-        if blocking_n > 0 {
+                if blocking_n > 0 {
             report_parts.push(format!(
                 "## 硬规则（{blocking_n} 条阻断{}，本章未发布）\n{listed}\n\n\
-                 如何处理：选择「修正本章」，或说明要改的地方\
-                 （去掉正文「第N章」、理顺倒计时/时段回跳、替换禁名等）。",
+                 如何处理：选择「修正本章」，按上方违规逐条改句。",
                 if warn_n > 0 {
                     format!("、{warn_n} 条警告")
                 } else {
@@ -1142,7 +1203,7 @@ pub async fn execute_pipeline_with_steps(
             ));
             let warn = format!(
                 "完成，但有 {blocking_n} 条硬规则阻断（本章未发布）\n{listed}\n\n\
-                 如何处理：选择「修正本章」，或说明要改的地方。"
+                 如何处理：选择「修正本章」，按上方违规逐条改句。"
             );
             if run.message.is_empty() {
                 run.message = warn;
@@ -1261,8 +1322,13 @@ pub async fn execute_pipeline_with_steps(
         run.published = fin.published;
         run.plots_completed = fin.plots_completed;
         run.plot_setting_blocker = fin.plot_setting_blocker;
-        run.plot_accept_passed = fin.plot_accept_passed;
-        run.plot_accept_rationale = fin.plot_accept_rationale;
+        // Keep handler-set accept fail when publish was blocked (finalize returns early).
+        if fin.plot_accept_passed.is_some() {
+            run.plot_accept_passed = fin.plot_accept_passed;
+        }
+        if fin.plot_accept_rationale.is_some() {
+            run.plot_accept_rationale = fin.plot_accept_rationale;
+        }
         // Track consecutive SoftShort for longform length discipline.
         if fin.published {
             if length_ok {
@@ -1688,11 +1754,15 @@ const WRITER_HARD_CONSTRAINTS: &str = "\
 回溯用故事内时间/事件（「上次会面时」「那次事故之后」）。\n\
 2. 明确时间锚：若写钟点/倒计时/还剩时长，全章只维护一条当前读数且单调（倒计时只减不增）；\
 具体读数宜 ≤4 次；禁止假回跳；回忆初始值须写「最初/原先」。\n\
-3. 时段词：上午/傍晚/深夜等须随叙事前进；若回到更早时段，必须交代跨日（翌日/天亮/过了一夜），禁止无过渡回跳。\n\
+3. 时段词：凌晨/清晨/上午/傍晚/夜里/夜晚/深夜等会被当成叙事时刻扫描；全章只沿一条时段线前进；\
+回到更早时段必须交代跨日（翌日/天亮/过了一夜）。\
+**禁止把时段词当修辞**：当前是凌晨时勿写「……的夜晚/夜里」；氛围改用「黑暗/夜色/未亮的天」。\n\
 4. 伤势侧别/部位：若 CanonContext 有【身体与能力状态板】或近章事实写明左/右、肩/臂/手/腿等，\
 本章必须沿用；禁止无交代左右对调或肩臂挪移。\n\
 5. 能力寄宿/附着/载体：状态板与近章事实中的所在肢体/器物/印记点必须沿用；\
-更换须写可见转移过程，禁止默默换位。";
+更换须写可见转移过程，禁止默默换位。\n\
+6. 作者旁白/管线泄露（绝对禁止）：正文禁止「章纲里/章纲写/按大纲/设定上」等对读；\
+禁止「不是A，是B的意思」类纠错释义；禁止机制说明书腔。写前对齐章纲，正文只留场面。";
 
 /// Strip accidental body「第N章」right after generation (title line kept).
 fn scrub_writer_draft(draft: String, content_rules: &ContentRulesConfig) -> String {
@@ -1702,7 +1772,9 @@ fn scrub_writer_draft(draft: String, content_rules: &ContentRulesConfig) -> Stri
 const LOCAL_REVISER_SKILL: &str = "你是小说局部修订编辑。只按用户指令改指定段落；\
 输出替换正文或要求的 JSON，不要写作说明，不要扩写全章。\
 涉及倒计时/钟点时：只保留一条单调当前读数，禁止回跳；回忆初始值须标明「最初/原先」，勿伪装成当前值。\
-涉及伤势/能力位置时：保持左/右与部位、寄宿/载体与改前及 CanonContext 状态板一致，禁止默默挪位。";
+涉及时段词时：勿把「夜晚/夜里」当修辞与「凌晨」混用；冲突时段须理顺或补跨日。\
+涉及伤势/能力位置时：保持左/右与部位、寄宿/载体与改前及 CanonContext 状态板一致，禁止默默挪位。\
+禁止写入章纲对读、作者纠错释义、机制讲义。";
 
 async fn revise_by_local_patches(
     llm: &LlmClient,
@@ -2228,18 +2300,20 @@ async fn run_consistency_auditor(
     let user = format!(
         "对照 CanonContext 审计下列正文。\n\
          优先级（强制）：\n\
-         - P0（阻断）：设定库/禁名硬冲突；**已出现**的章号元叙述；能力破设定；**明确时间互斥/倒计时回跳**；\
-         **章内时段无过渡回跳**（如深夜后又写上午且无翌日/天亮）；\
+         - P0（阻断）：设定库/禁名硬冲突；**已出现**的章号元叙述；\
+         **作者旁白/章纲对读/纠错解说**（「章纲里…」「不是A是B的意思」、机制说明书腔，type=META）；\
+         能力破设定；**明确时间互斥/倒计时回跳**；\
+         **章内时段无过渡回跳**（含把时段词当修辞：当前凌晨却写「……的夜晚」，或深夜后又写上午且无翌日/天亮）；\
          **受伤部位**矛盾；**能力所在位置/载体**矛盾；开篇**无视/未承接/断档/另起**钩子；\
          章纲关键事件**完全缺失**（type=OUTLINE）。有任一真正 P0 → passed=false。\n\
          - P1（不阻断）：动机/铺垫不足、可补交代、剧情卡尚未收束、钩子略跳但已接上、次要状态含糊、\
          时间压缩感但无回跳、能力描写略糊但建议写清。仅有 P1/P2 → passed=true。\n\
          - P2：风格/笔误。\n\
          禁止：把「无违规/未检出/无实质断裂/可补交代/不算硬冲突/略有压缩感/建议强化」写成 P0；\
-         未检出章号问题时不要输出 META issue。\n\
+         未检出章号/旁白问题时不要输出 META issue。\n\
          章号元叙述硬禁：叙述/独白/对话中不得用「第N章」「第八章」指称情节；标题行除外。\n\
-         时间线核对：列出本章全部「还剩/剩余/钟点」当前读数是否单调；再核对上午/傍晚/深夜等时段是否随叙事前进。\n\
-         只输出 JSON：{{\"passed\":bool,\"issues\":[{{\"type\":\"TIMELINE|INJURY|ABILITY_LOC|LORE|CHARACTER|POV|CONTINUITY|OUTLINE|META|PLOT\",\"priority\":\"P0|P1|P2\",\"message\":\"\",\"location\":\"第N段\",\"quote\":\"\"}}],\"report\":\"可读报告（须说明是否核对了明确时间、伤势部位、能力位置、设定与章号元叙述）\"}}\n\n\
+         时间线核对：列出本章全部「还剩/剩余/钟点」当前读数是否单调；再核对凌晨/夜晚/上午/傍晚/深夜等时段是否随叙事前进（勿把时段词当修辞）。\n\
+         只输出 JSON：{{\"passed\":bool,\"issues\":[{{\"type\":\"TIMELINE|INJURY|ABILITY_LOC|LORE|CHARACTER|POV|CONTINUITY|OUTLINE|META|PLOT\",\"priority\":\"P0|P1|P2\",\"message\":\"\",\"location\":\"第N段\",\"quote\":\"\"}}],\"report\":\"可读报告（须说明是否核对了明确时间、伤势部位、能力位置、设定、章号与作者旁白）\"}}\n\n\
          {naming_block}\n\n{canon}\n\n# 正文\n{excerpt}"
     );
     let agent = "consistency_auditor";
@@ -3028,6 +3102,46 @@ pub async fn finalize_chapter_publish(
     }
 
     out.published = true;
+    // Hot memory only after publish, and only when chapter JSON matches current draft.
+    let draft_now = read_chapter_draft(project_dir, chapter).unwrap_or_default();
+    let ch_dir = project_dir
+        .join("chapters")
+        .join(format!("{chapter:03}"));
+    if chapter_memory_artifact_matches_draft(project_dir, chapter, "foreshadow.json", &draft_now) {
+        if let Ok(report) = std::fs::read_to_string(ch_dir.join("foreshadow.json")) {
+            match apply_foreshadow_report(project_dir, chapter, &report) {
+                Ok(n) => tracing::info!(chapter, n, "foreshadow applied on publish"),
+                Err(e) => tracing::warn!(error = %e, chapter, "foreshadow apply on publish failed"),
+            }
+        }
+    } else if ch_dir.join("foreshadow.json").exists() {
+        tracing::warn!(chapter, "skip stale foreshadow.json (draft fingerprint mismatch)");
+    }
+    if chapter_memory_artifact_matches_draft(project_dir, chapter, "summary.json", &draft_now) {
+        if let Ok(summary) = std::fs::read_to_string(ch_dir.join("summary.json")) {
+            match apply_summary_json(project_dir, chapter, &summary) {
+                Ok(n) => tracing::info!(chapter, n, "summary digest applied on publish"),
+                Err(e) => tracing::warn!(error = %e, chapter, "summary apply on publish failed"),
+            }
+            match lore_assert_from_summary(project_dir, chapter, &summary) {
+                Ok((asserted, conflicts)) => {
+                    if !conflicts.is_empty() {
+                        out.report_parts.push(format!(
+                            "## Lore 冲突（未覆盖）\n{}",
+                            conflicts.join("\n")
+                        ));
+                    }
+                    tracing::info!(chapter, asserted, "lore assert on publish");
+                }
+                Err(e) => tracing::warn!(error = %e, chapter, "lore assert on publish failed"),
+            }
+        }
+    } else if ch_dir.join("summary.json").exists() {
+        tracing::warn!(chapter, "skip stale summary.json (draft fingerprint mismatch)");
+        out.report_parts.push(
+            "## 热记忆\n摘要与当前正文不一致，已跳过入库（请再跑修订以重生成摘要）".into(),
+        );
+    }
     if state.next_chapter <= chapter {
         state.next_chapter = chapter + 1;
         state.published_count = state.published_count.max(chapter);

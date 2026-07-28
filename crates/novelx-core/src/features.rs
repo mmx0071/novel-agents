@@ -37,6 +37,9 @@ impl FeatureFlags {
     pub fn defaults() -> Self {
         let mut m = HashMap::new();
         m.insert("studio.deterministic_intents".into(), true);
+        // Default agentic: narrate after clean write before pausing on chapter_next.
+        m.insert("studio.pause_after_clean_write".into(), false);
+        m.insert("studio.stream_reasoning".into(), true);
         m.insert("studio.clear_history_on_new_chapter".into(), true);
         m.insert("studio.auto_reaudit_after_steer".into(), true);
         m.insert("studio.reject_weak_ui_turns".into(), true);
@@ -62,6 +65,22 @@ impl FeatureFlags {
 
     pub fn deterministic_intents(&self) -> bool {
         self.enabled("studio.deterministic_intents")
+    }
+
+    /// When true, clean publish after write/revise always pauses for human.
+    /// When false (default), allow one LLM narration round then pause.
+    pub fn pause_after_clean_write(&self) -> bool {
+        self.map
+            .get("studio.pause_after_clean_write")
+            .copied()
+            .unwrap_or(false)
+    }
+
+    pub fn stream_reasoning(&self) -> bool {
+        self.map
+            .get("studio.stream_reasoning")
+            .copied()
+            .unwrap_or(true)
     }
 
     pub fn clear_history_on_new_chapter(&self) -> bool {

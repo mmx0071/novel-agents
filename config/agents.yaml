@@ -83,8 +83,8 @@ agents:
       摘要层跨章复盘（audit_volume）；不进章流水线 order，由 Studio 工具调用
     activation:
       - condition: chapters_in_arc_gt
-        threshold: 40
-        reason: 本卷已写 40+ 章，建议 Studio 调用 audit_volume 做卷中复盘
+        threshold: 20
+        reason: 本卷已写 20+ 章，建议 Studio 调用 audit_volume 做卷中复盘（与 mid_audit 门槛对齐）
       - condition: volume_handoff
         reason: 卷交接/待同步阶段，建议跑 audit_volume 再开下卷
 

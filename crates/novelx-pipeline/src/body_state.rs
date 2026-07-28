@@ -251,6 +251,188 @@ fn is_control_side_fact(s: &str) -> bool {
     control && has_side_or_site(s)
 }
 
+const BODY_SITES: &[&str] = &[
+    "肩", "臂", "手", "掌", "腕", "腿", "膝", "踝", "指", "肋",
+];
+
+fn extract_side_site_locks(fact: &str) -> Vec<(char, &'static str)> {
+    let mut out = Vec::new();
+    for site in BODY_SITES {
+        let left = format!("左{site}");
+        let right = format!("右{site}");
+        if fact.contains(&left) {
+            out.push(('左', *site));
+        }
+        if fact.contains(&right) {
+            out.push(('右', *site));
+        }
+    }
+    out
+}
+
+fn has_transfer_or_heal_marker(draft: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "转移到",
+        "挪到",
+        "换到",
+        "改用",
+        "已经愈合",
+        "伤已",
+        "伤势已",
+        "包扎好",
+        "换手",
+        "换到另一",
+        "移到另一",
+    ];
+    MARKERS.iter().any(|m| draft.contains(m))
+}
+
+/// Deterministic light check: if the board locks 左X / 右X and the draft uses the
+/// opposite side for the same site without a transfer/heal marker, block publish.
+pub fn check_body_state_side_conflicts(
+    project_dir: &Path,
+    chapter: u32,
+    draft: &str,
+) -> Vec<String> {
+    if draft.trim().is_empty() {
+        return Vec::new();
+    }
+    if has_transfer_or_heal_marker(draft) {
+        return Vec::new();
+    }
+    let lines = collect_body_state_lines(project_dir, chapter);
+    let mut msgs = Vec::new();
+    let mut seen = HashSet::new();
+    for (_ch, fact) in &lines {
+        if !(is_injury_fact(fact) || is_ability_locus_fact(fact) || is_control_side_fact(fact)) {
+            continue;
+        }
+        for (side, site) in extract_side_site_locks(fact) {
+            let opposite = if side == '左' { '右' } else { '左' };
+            let opp = format!("{opposite}{site}");
+            let key = format!("{side}{site}->{opp}");
+            if !seen.insert(key) {
+                continue;
+            }
+            if draft.contains(&opp) {
+                msgs.push(format!(
+                    "身体状态板锁定「{side}{site}」（依据：{}），正文却出现「{opp}」且未见转移/愈合交代。请对齐侧别或写出可见变更过程。",
+                    truncate_chars(fact, 60)
+                ));
+            }
+        }
+    }
+    msgs
+}
+
+const LOCUS_PREFIXES: &[&str] = &["寄宿在", "寄宿于", "附着于", "附着在", "附着到", "印记在"];
+
+/// Ability / mark cues — required in the same sentence as a draft locus host
+/// so metaphors like「寒意附着在脊背」do not false-positive.
+const ABILITY_LOCUS_CUES: &[&str] = &[
+    "印记", "异能", "权能", "能力", "载体", "符号", "操控权", "控制权", "魔纹", "咒印",
+];
+
+fn sentence_has_ability_cue(seg: &str) -> bool {
+    ABILITY_LOCUS_CUES.iter().any(|k| seg.contains(k))
+}
+
+/// Extract short host fragments after 寄宿/附着 cues (e.g. 「右手腕内侧」).
+fn extract_locus_hosts(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for pref in LOCUS_PREFIXES {
+        let mut rest = text;
+        while let Some(idx) = rest.find(pref) {
+            let after = &rest[idx + pref.len()..];
+            let host: String = after
+                .chars()
+                .take_while(|c| {
+                    !matches!(
+                        *c,
+                        '，' | ',' | '。' | '；' | ';' | '、' | ' ' | '\n' | '（' | '('
+                    )
+                })
+                .take(12)
+                .collect();
+            let host = host.trim().to_string();
+            if host.chars().count() >= 2 {
+                out.push(host);
+            }
+            rest = &rest[idx + pref.len()..];
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn fact_shares_ability_cue_with_sentence(fact: &str, seg: &str) -> bool {
+    ABILITY_LOCUS_CUES
+        .iter()
+        .any(|k| fact.contains(k) && seg.contains(k))
+        || (is_ability_locus_fact(fact) && sentence_has_ability_cue(seg))
+}
+
+/// If the board locks an ability host and the draft attaches the same ability to a
+/// different host without a transfer marker, block publish.
+pub fn check_body_state_locus_conflicts(
+    project_dir: &Path,
+    chapter: u32,
+    draft: &str,
+) -> Vec<String> {
+    if draft.trim().is_empty() || has_transfer_or_heal_marker(draft) {
+        return Vec::new();
+    }
+    let mut msgs = Vec::new();
+    let mut seen = HashSet::new();
+    for (_ch, fact) in collect_body_state_lines(project_dir, chapter) {
+        if !is_ability_locus_fact(&fact) {
+            continue;
+        }
+        let locked = extract_locus_hosts(&fact);
+        if locked.is_empty() {
+            continue;
+        }
+        for seg in draft.split(|c| matches!(c, '。' | '！' | '？' | '\n' | '；' | ';')) {
+            let seg = seg.trim();
+            if seg.is_empty()
+                || !sentence_has_ability_cue(seg)
+                || !fact_shares_ability_cue_with_sentence(&fact, seg)
+            {
+                continue;
+            }
+            let draft_hosts = extract_locus_hosts(seg);
+            for host in &locked {
+                for other in &draft_hosts {
+                    if other == host || other.contains(host) || host.contains(other.as_str()) {
+                        continue;
+                    }
+                    let key = format!("{host}->{other}");
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    msgs.push(format!(
+                        "身体状态板锁定能力载体「{host}」（依据：{}），正文却写到「{other}」且未见转移交代。请对齐载体或写出可见转移过程。",
+                        truncate_chars(&fact, 60)
+                    ));
+                }
+            }
+        }
+    }
+    msgs
+}
+
+/// Side flip + ability-host locus checks.
+pub fn check_body_state_conflicts(
+    project_dir: &Path,
+    chapter: u32,
+    draft: &str,
+) -> Vec<String> {
+    let mut msgs = check_body_state_side_conflicts(project_dir, chapter, draft);
+    msgs.extend(check_body_state_locus_conflicts(project_dir, chapter, draft));
+    msgs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,6 +479,45 @@ mod tests {
         assert!(board.contains("左肩"), "{board}");
         assert!(board.contains("能力位置") || board.contains("右手腕"), "{board}");
         assert!(board.contains("不得默默挪位") || board.contains("可见转移"), "{board}");
+        let flip = check_body_state_side_conflicts(
+            &root,
+            2,
+            "他抬起右肩拉弓，伤口完全不在话下。\n",
+        );
+        assert!(
+            flip.iter().any(|m| m.contains("左肩") && m.contains("右肩")),
+            "expected side flip, got {flip:?}"
+        );
+        let ok = check_body_state_side_conflicts(
+            &root,
+            2,
+            "他护着左肩，右手仍握着剑。\n",
+        );
+        assert!(ok.is_empty(), "no false positive: {ok:?}");
+        let locus = check_body_state_locus_conflicts(
+            &root,
+            2,
+            "异能印记寄宿在左掌心，隐隐发热。\n",
+        );
+        assert!(
+            locus.iter().any(|m| m.contains("右手腕") && m.contains("左掌")),
+            "expected locus host flip, got {locus:?}"
+        );
+        let locus_ok = check_body_state_locus_conflicts(
+            &root,
+            2,
+            "异能印记仍寄宿在右手腕内侧，隐隐发热。\n",
+        );
+        assert!(locus_ok.is_empty(), "no false positive locus: {locus_ok:?}");
+        let metaphor = check_body_state_locus_conflicts(
+            &root,
+            2,
+            "寒意附着在脊背，目光寄宿在她脸上。\n",
+        );
+        assert!(
+            metaphor.is_empty(),
+            "metaphor must not trip locus gate: {metaphor:?}"
+        );
         let _ = std::fs::remove_dir_all(&projects);
     }
 

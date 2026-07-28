@@ -163,6 +163,48 @@ pub fn entity_identity_parts(name: &str) -> BTreeSet<String> {
     out
 }
 
+/// Primary display token: text before the first parenthesis (正式名 in `正式名（别名）`).
+fn entity_primary_name(name: &str) -> String {
+    let norm = name.trim().replace('(', "（").replace(')', "）");
+    norm.split('（')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+/// Place / site unit suffixes — when bare name is only the paren qualifier of another
+/// card (`消防楼梯（八号楼）` vs `八号楼`), treat as location disambiguator, not alias.
+fn looks_like_place_unit_name(name: &str) -> bool {
+    const SUFFIXES: &[&str] = &[
+        "楼", "栋", "园", "苑", "站", "路", "街", "巷", "府", "宅", "室", "房", "洞", "井",
+        "寺", "庙", "观", "门", "桥", "港", "岛", "峰", "山", "湖", "河", "海", "城", "镇",
+        "村", "庄", "堡", "寨", "营", "区", "县", "市", "省", "国", "小区", "广场", "大厦",
+    ];
+    SUFFIXES.iter().any(|s| name.ends_with(s))
+}
+
+/// Bare name matches a multi-part composite (`正式名（别名）` / nickname in paren).
+fn bare_matches_composite(bare: &str, composite: &str, parts: &BTreeSet<String>) -> bool {
+    if !parts.contains(bare) {
+        return false;
+    }
+    let primary = entity_primary_name(composite);
+    if primary.is_empty() {
+        return false;
+    }
+    // `旧钥` vs `旧钥（入门引导）`
+    if primary == bare {
+        return true;
+    }
+    // Nickname in paren: `老严` vs `严国栋（老严）`
+    // Reject place-qualifier: `八号楼` vs `消防楼梯（八号楼）`
+    if looks_like_place_unit_name(bare) && !primary.contains(bare) {
+        return false;
+    }
+    bare.chars().count() <= primary.chars().count()
+}
+
 /// True when two display names refer to the same entity (paren alias swap / alias subset).
 pub fn entity_names_equivalent(a: &str, b: &str) -> bool {
     let a = a.trim();
@@ -186,12 +228,16 @@ pub fn entity_names_equivalent(a: &str, b: &str) -> bool {
     if ta.len() >= 2 && tb.len() >= 2 && ta == tb {
         return true;
     }
-    // Bare alias vs `正式名（别名）`
-    if ta.len() == 1 && tb.len() >= 2 && tb.contains(ta.iter().next().unwrap()) {
-        return true;
+    // Bare alias vs `正式名（别名）`（地点限定括号不合并）
+    if ta.len() == 1 && tb.len() >= 2 {
+        if bare_matches_composite(ta.iter().next().unwrap(), &nb, &tb) {
+            return true;
+        }
     }
-    if tb.len() == 1 && ta.len() >= 2 && ta.contains(tb.iter().next().unwrap()) {
-        return true;
+    if tb.len() == 1 && ta.len() >= 2 {
+        if bare_matches_composite(tb.iter().next().unwrap(), &na, &ta) {
+            return true;
+        }
     }
     false
 }
@@ -237,6 +283,269 @@ pub fn resolve_entity_card_path(
         return (path, Some(card));
     }
     (default, None)
+}
+
+/// Campus / settlement scale — preferred mother location cards.
+pub fn location_name_looks_parent_scale(name: &str) -> bool {
+    const SUFFIXES: &[&str] = &[
+        "小区", "园区", "街区", "社区", "庄园", "营地", "基地", "片区", "商圈", "古镇",
+    ];
+    SUFFIXES.iter().any(|s| name.ends_with(s))
+}
+
+/// Sub-area that should usually fold into a mother card (楼栋/景点/房间…).
+pub fn location_name_looks_dependent(name: &str) -> bool {
+    if location_name_looks_parent_scale(name) {
+        return false;
+    }
+    looks_like_place_unit_name(name)
+        || name.contains("树阵")
+        || name.contains("楼梯")
+        || name.contains("走廊")
+        || name.contains("顶层")
+        || name.contains("房间")
+        || name.contains("观测室")
+        || name.contains("广场")
+        || name.contains("地下")
+        || name.contains("门口")
+}
+
+/// Find an existing mother location that `requested` depends on.
+/// Call after [`resolve_entity_card_path`] misses. `hint` may be brief/summary text.
+pub fn detect_location_parent(
+    folder: &Path,
+    requested: &str,
+    hint: &str,
+) -> Option<MarkdownCard> {
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return None;
+    }
+    let cards = load_markdown_cards(folder, "locations");
+    if cards.is_empty() {
+        return None;
+    }
+
+    // 1) Paren qualifier: 消防楼梯（翠苑小区） / 九号楼（翠苑）
+    let primary = entity_primary_name(requested);
+    let parts = entity_identity_parts(requested);
+    for c in &cards {
+        if entity_names_equivalent(&c.name, requested) {
+            continue;
+        }
+        for p in &parts {
+            if p == &primary {
+                continue;
+            }
+            let keys = c.match_keys();
+            if entity_names_equivalent(p, &c.name)
+                || keys.iter().any(|k| entity_names_equivalent(k, p))
+            {
+                return Some(c.clone());
+            }
+        }
+    }
+
+    // 2) Requested name contains an existing card name (翠苑小区东门 / 翠苑小区·八号楼)
+    let mut contains: Vec<&MarkdownCard> = cards
+        .iter()
+        .filter(|c| {
+            !c.name.is_empty()
+                && requested != c.name
+                && !entity_names_equivalent(&c.name, requested)
+                && requested.contains(&c.name)
+        })
+        .collect();
+    contains.sort_by_key(|c| std::cmp::Reverse(c.name.chars().count()));
+    if let Some(c) = contains.first() {
+        return Some((*c).clone());
+    }
+
+    // 3) Hint/brief mentions a parent-scale card
+    let hint = hint.trim();
+    if !hint.is_empty() {
+        let mut mentioned: Vec<&MarkdownCard> = cards
+            .iter()
+            .filter(|c| {
+                !entity_names_equivalent(&c.name, requested)
+                    && hint.contains(&c.name)
+                    && (location_name_looks_parent_scale(&c.name)
+                        || location_name_looks_dependent(requested))
+            })
+            .collect();
+        mentioned.sort_by_key(|c| std::cmp::Reverse(c.name.chars().count()));
+        if let Some(c) = mentioned.first() {
+            return Some((*c).clone());
+        }
+    }
+
+    // 4) Dependent-looking name + exactly one parent-scale card in the project
+    if location_name_looks_dependent(requested) {
+        let parents: Vec<&MarkdownCard> = cards
+            .iter()
+            .filter(|c| location_name_looks_parent_scale(&c.name))
+            .collect();
+        if parents.len() == 1 {
+            let p = parents[0];
+            if !entity_names_equivalent(&p.name, requested) {
+                return Some(p.clone());
+            }
+        }
+    }
+
+    None
+}
+
+/// Resolve location write target: alias hit, else fold into detected mother card.
+/// Returns `(path, existing, write_name, folded_child)` where `folded_child` is Some
+/// when the request name is a dependent sub-area of `write_name`.
+pub fn resolve_location_write_target(
+    folder: &Path,
+    requested_name: &str,
+    hint: &str,
+) -> (PathBuf, Option<MarkdownCard>, String, Option<String>) {
+    let requested = requested_name.trim();
+    let (path, existing) = resolve_entity_card_path(folder, "locations", requested);
+    if let Some(card) = existing {
+        let child = if entity_names_equivalent(&card.name, requested) {
+            None
+        } else {
+            Some(requested.to_string())
+        };
+        return (path, Some(card.clone()), card.name.clone(), child);
+    }
+    if let Some(parent) = detect_location_parent(folder, requested, hint) {
+        let path = folder.join(format!("{}.md", parent.slug));
+        let child = if entity_names_equivalent(&parent.name, requested) {
+            None
+        } else {
+            Some(requested.to_string())
+        };
+        return (path, Some(parent.clone()), parent.name.clone(), child);
+    }
+    (
+        folder.join(format!("{requested}.md")),
+        None,
+        requested.to_string(),
+        None,
+    )
+}
+
+/// Ensure `child_name` is in aliases and has a `### child` block; append `note` if non-empty.
+pub fn fold_location_child_into_card(parent_text: &str, child_name: &str, note: &str) -> String {
+    let child = child_name.trim();
+    if child.is_empty() {
+        return parent_text.to_string();
+    }
+    let (meta, body) = split_simple_frontmatter(parent_text);
+    let mut aliases: Vec<String> = meta
+        .get("aliases")
+        .map(|s| {
+            s.split(|c| c == ',' || c == ';' || c == '|')
+                .map(|a| a.trim().trim_matches(|c| c == '[' || c == ']').to_string())
+                .filter(|a| !a.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if !aliases
+        .iter()
+        .any(|a| entity_names_equivalent(a, child) || a == child)
+    {
+        aliases.push(child.to_string());
+    }
+
+    let note = note.trim();
+    let mut new_body = body.trim_end().to_string();
+    let heading = format!("### {child}");
+    if !new_body.lines().any(|l| l.trim() == heading) {
+        let block = if note.is_empty() {
+            format!("\n{heading}\n")
+        } else {
+            format!("\n{heading}\n\n{note}\n")
+        };
+        if let Some(pos) = find_h2_section_end(&new_body, &["Overview", "概述"]) {
+            new_body.insert_str(pos, &block);
+        } else {
+            new_body.push_str(&format!("\n\n## Overview\n{block}"));
+        }
+    } else if !note.is_empty() {
+        new_body.push_str(&format!("\n### 更新（{child}）\n{note}\n"));
+    }
+
+    rebuild_card_with_aliases(&meta, &new_body, &aliases)
+}
+
+/// Byte offset at the start of the next H2 after a named section (or EOF).
+fn find_h2_section_end(body: &str, titles: &[&str]) -> Option<usize> {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let t = lines[i].trim();
+        if let Some(rest) = t.strip_prefix("## ") {
+            let title = rest.trim();
+            let hit = titles.iter().any(|want| {
+                title == *want
+                    || title.starts_with(&format!("{want}（"))
+                    || title.starts_with(&format!("{want} ·"))
+                    || title.starts_with(&format!("{want}·"))
+            });
+            if hit {
+                i += 1;
+                while i < lines.len() {
+                    let l = lines[i].trim();
+                    if l.starts_with("## ") {
+                        return Some(line_byte_offset(body, i));
+                    }
+                    i += 1;
+                }
+                return Some(body.len());
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn line_byte_offset(text: &str, line_idx: usize) -> usize {
+    let mut offset = 0usize;
+    for (i, line) in text.lines().enumerate() {
+        if i == line_idx {
+            return offset;
+        }
+        offset += line.len();
+        if text[offset..].starts_with("\r\n") {
+            offset += 2;
+        } else if text[offset..].starts_with('\n') {
+            offset += 1;
+        }
+    }
+    text.len()
+}
+
+fn rebuild_card_with_aliases(
+    meta: &HashMap<String, String>,
+    body: &str,
+    aliases: &[String],
+) -> String {
+    let name = meta
+        .get("name")
+        .cloned()
+        .unwrap_or_else(|| "未命名".into());
+    let mut fm_lines = vec![format!("name: {name}")];
+    for (k, v) in meta {
+        if k == "name" || k == "aliases" {
+            continue;
+        }
+        fm_lines.push(format!("{k}: {v}"));
+    }
+    if !aliases.is_empty() {
+        fm_lines.push(format!("aliases: {}", aliases.join(", ")));
+    }
+    format!(
+        "---\n{}\n---\n\n{}\n",
+        fm_lines.join("\n"),
+        body.trim()
+    )
 }
 
 /// Load `*.md` cards from a directory.
@@ -486,6 +795,61 @@ mod tests {
         assert!(entity_names_equivalent("严国栋（老严）", "老严（严国栋）"));
         assert!(entity_names_equivalent("老严", "严国栋（老严）"));
         assert!(!entity_names_equivalent("周荣", "严国栋（老严）"));
+        assert!(entity_names_equivalent("旧钥", "旧钥（入门引导）"));
+        assert!(entity_names_equivalent("匿名短信", "匿名短信（新）"));
+        assert!(entity_names_equivalent("银杏树阵", "银杏树阵（第五棵银杏）"));
+        // Hierarchical place names without paren notes are distinct.
+        assert!(!entity_names_equivalent("八号楼", "八号楼顶层观测室"));
+        // Paren as location qualifier, not alias.
+        assert!(!entity_names_equivalent("八号楼", "消防楼梯（八号楼）"));
+        assert!(!entity_names_equivalent("翠苑小区", "银杏树阵（翠苑小区）"));
+    }
+
+    #[test]
+    fn resolve_entity_card_path_reuses_item_alias() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-resolve-item");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("旧钥.md"),
+            "---\nname: 旧钥\naliases: [入门引导]\n---\n\n# 旧钥\n\nbody\n",
+        )
+        .unwrap();
+        let (path, card) = resolve_entity_card_path(&dir, "items", "旧钥（入门引导）");
+        assert!(card.is_some());
+        assert_eq!(path.file_name().and_then(|s| s.to_str()), Some("旧钥.md"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn location_dependent_folds_into_parent_card() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-loc-parent");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("样例小区.md"),
+            "---\nname: 样例小区\nkind: location\nstatus: active\n---\n\n# 样例小区\n\n## Overview\n\n社区。\n\n## Factions\n\n无。\n\n## Production\n\n无。\n",
+        )
+        .unwrap();
+        assert!(location_name_looks_parent_scale("样例小区"));
+        assert!(location_name_looks_dependent("八号楼"));
+        let parent = detect_location_parent(&dir, "八号楼", "位于样例小区内").unwrap();
+        assert_eq!(parent.name, "样例小区");
+        let (path, card, write_name, child) =
+            resolve_location_write_target(&dir, "八号楼", "样例小区内楼栋");
+        assert_eq!(write_name, "样例小区");
+        assert_eq!(child.as_deref(), Some("八号楼"));
+        assert!(card.is_some());
+        assert_eq!(path.file_name().and_then(|s| s.to_str()), Some("样例小区.md"));
+        let folded = fold_location_child_into_card(
+            &std::fs::read_to_string(&path).unwrap(),
+            "八号楼",
+            "顶层有观测痕迹",
+        );
+        assert!(folded.contains("aliases:") && folded.contains("八号楼"), "{folded}");
+        assert!(folded.contains("### 八号楼"), "{folded}");
+        assert!(folded.contains("顶层有观测痕迹"), "{folded}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

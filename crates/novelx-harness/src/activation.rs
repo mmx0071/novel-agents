@@ -188,15 +188,16 @@ pub fn resolve_pipeline_agents_with_tier(
         let economy = matches!(tier, QualityTier::Economy);
         // economy: foreshadow only on even chapters when no open threads.
         // balanced: never drop foreshadow when open threads remain; otherwise even cadence.
+        // Keep tracker for the opening stretch so early plants aren't missed.
         let drop_foreshadow = if economy {
-            sig.published_count >= 3
+            sig.published_count >= 10
                 && sig.open_foreshadows == 0
                 && sig.chapter > 0
                 && sig.chapter % 2 != 0
                 && !pinned.contains("foreshadow_tracker")
         } else {
             // balanced
-            sig.published_count >= 3
+            sig.published_count >= 10
                 && sig.open_foreshadows == 0
                 && sig.chapter > 0
                 && sig.chapter % 2 != 0
@@ -570,25 +571,35 @@ mod tests {
             agent: "foreshadow_tracker".into(),
             reason: "ch3+".into(),
         }];
-        let sig = ActivationSignals {
+        // Opening stretch: keep tracker even on odd chapters with no open threads.
+        let early = ActivationSignals {
             published_count: 5,
             chapter: 5,
+            open_foreshadows: 0,
+            ..Default::default()
+        };
+        let got_early = resolve_pipeline_agents_filtered(&[], &pipe, &suggestions, Some(&early));
+        assert!(got_early.iter().any(|a| a == "foreshadow_tracker"));
+        // After opening stretch: drop on odd when no open threads.
+        let sig = ActivationSignals {
+            published_count: 10,
+            chapter: 11,
             open_foreshadows: 0,
             ..Default::default()
         };
         let got = resolve_pipeline_agents_filtered(&[], &pipe, &suggestions, Some(&sig));
         assert!(!got.iter().any(|a| a == "foreshadow_tracker"));
         let sig2 = ActivationSignals {
-            published_count: 5,
-            chapter: 6,
+            published_count: 10,
+            chapter: 12,
             open_foreshadows: 0,
             ..Default::default()
         };
         let got2 = resolve_pipeline_agents_filtered(&[], &pipe, &suggestions, Some(&sig2));
         assert!(got2.iter().any(|a| a == "foreshadow_tracker"));
         let sig3 = ActivationSignals {
-            published_count: 5,
-            chapter: 5,
+            published_count: 10,
+            chapter: 11,
             open_foreshadows: 2,
             ..Default::default()
         };

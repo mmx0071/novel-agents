@@ -38,6 +38,7 @@ revise_default:
   - writer
   - pacing_reviewer
   - consistency_auditor
+  - foreshadow_tracker
   - summarizer
   - plot_acceptor
 

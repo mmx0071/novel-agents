@@ -244,8 +244,8 @@ gates:
         aliases: [暂不处理, 取消, 稍后]
 
   # After chapter write/revise: server filters by publish result.
-  # published → cn_continue only; content-rule blocked → cn_revise only;
-  # published + plot_accept fail → both (继续推进 / 修正收束).
+  # published → cn_continue only; content-rule / length / plot_accept fail → cn_revise only
+  # (accept fail blocks publish). Legacy published+accept-fail may still show both.
   # IDs must NOT collide with audit / volume_sync bare ids.
   chapter_next:
     options:
@@ -264,7 +264,7 @@ gates:
         args:
           project: "{{project}}"
           chapter: "{{chapter}}"
-          instructions: "消除正文硬规则违规：除标题行外禁止出现「第N章」元叙述，并替换禁名；只改违规句，勿整章重写。"
+          instructions: "按审批卡列出的硬规则违规逐条改句；只改违规句，勿整章重写。"
         aliases: [修正本章, 修正, 修改本章, 修订]
       - id: cn_batch
         label: 连写到卡点

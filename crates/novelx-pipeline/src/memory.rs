@@ -1540,17 +1540,18 @@ pub fn longform_health_snapshot(project_dir: &Path) -> Value {
         .count();
     let open_cold = cold.len();
     // Index is authoritative after rebuild (hot + archived + open cold, deduped).
+    // Studio / Web debt panel needs the full list (prompt context still uses dangling_show).
     let dangling_total = idx.dangling.len();
     let mut oldest = idx.dangling.clone();
     oldest.sort_by(foreshadow_age_priority);
     let oldest_lines: Vec<Value> = oldest
         .iter()
-        .take(8)
         .map(|t| {
             serde_json::json!({
                 "id": t.id,
-                "text": truncate_chars(&t.text, 80),
+                "text": truncate_chars(&t.text, 120),
                 "planted_chapter": t.planted_chapter,
+                "status": if t.status.is_empty() { "open" } else { &t.status },
             })
         })
         .collect();
@@ -1963,6 +1964,35 @@ mod tests {
             lines.iter().any(|s| s.contains("甲")),
             "context select should surface timeline: {lines:?}"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn longform_health_returns_all_dangling_foreshadows() {
+        let dir = std::env::temp_dir().join(format!(
+            "novelx-lf-health-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("lore")).unwrap();
+        let mut mem = ProjectMemory::default();
+        for i in 1..=12 {
+            mem.open_threads.push(OpenThread {
+                id: format!("t{i}"),
+                text: format!("伏笔线索{i}"),
+                status: "open".into(),
+                planted_chapter: i,
+                resolved_chapter: 0,
+            });
+        }
+        save_memory(&dir, &mem).unwrap();
+        let _ = crate::foreshadow::rebuild_foreshadow_index(&dir);
+        let snap = longform_health_snapshot(&dir);
+        let fs = &snap["foreshadow"];
+        assert_eq!(fs["dangling_total"], 12);
+        let oldest = fs["oldest"].as_array().expect("oldest array");
+        assert_eq!(oldest.len(), 12, "studio debt list must not truncate: {oldest:?}");
+        assert_eq!(oldest[0]["planted_chapter"], 1);
         let _ = fs::remove_dir_all(&dir);
     }
 

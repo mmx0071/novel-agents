@@ -40,10 +40,20 @@ impl Default for ExtractMode {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct IntentSpec {
     pub id: String,
     pub tool: String,
+    /// When false, matcher skips — text falls through to the LLM tool loop (more agentic).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Extra tools to run after the primary tool (same args.project); outputs appended.
+    #[serde(default)]
+    pub also_tools: Vec<String>,
     #[serde(default)]
     pub priority: i32,
     #[serde(default)]
@@ -77,6 +87,7 @@ pub struct IntentMatch {
     pub tool: String,
     pub args: Value,
     pub clear_history: ClearHistory,
+    pub also_tools: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +129,9 @@ impl IntentRouter {
         }
         let t_lower = t.to_lowercase();
         for spec in self.intents.iter() {
+            if !spec.enabled {
+                continue;
+            }
             if spec.require_project && project.filter(|p| !p.is_empty() && *p != "_").is_none() {
                 continue;
             }
@@ -224,6 +238,7 @@ fn build_match(spec: &IntentSpec, t: &str, project: Option<&str>) -> Option<Inte
         tool: spec.tool.clone(),
         args,
         clear_history: spec.clear_history,
+        also_tools: spec.also_tools.clone(),
     })
 }
 
@@ -350,27 +365,18 @@ mod tests {
         assert_eq!(w.args["chapter"], 10);
         assert_eq!(w.clear_history, ClearHistory::OnStart);
 
-        let a = r.match_text("检阅第九章", Some("demo")).unwrap();
-        assert_eq!(a.tool, "audit_chapter");
-        assert_eq!(a.args["chapter"], 9);
-
-        let q = r.match_text("审阅1-8章", Some("demo")).unwrap();
-        assert_eq!(q.tool, "audit_chapters");
-        assert_eq!(q.args["from"], 1);
-        assert_eq!(q.args["to"], 8);
+        // Soft intents disabled → fall through to LLM (more agentic).
+        assert!(r.match_text("检阅第九章", Some("demo")).is_none());
+        assert!(r.match_text("审阅1-8章", Some("demo")).is_none());
+        assert!(r.match_text("审这一卷", Some("demo")).is_none());
+        assert!(r.match_text("对照剧情卡 现在到哪了", Some("demo")).is_none());
+        assert!(r
+            .match_text("修正第五章章纲：加强章末钩子", Some("demo"))
+            .is_none());
 
         let rev = r.match_text("修正第五章", Some("demo")).unwrap();
         assert_eq!(rev.tool, "revise_chapter");
         assert_eq!(rev.args["chapter"], 5);
-
-        let outline = r.match_text("修正第五章章纲：加强章末钩子", Some("demo")).unwrap();
-        assert_eq!(outline.tool, "revise_outline");
-        assert_eq!(outline.args["chapter"], 5);
-        assert!(outline.args["instructions"].as_str().unwrap().contains("章纲"));
-
-        let outline2 = r.match_text("改第2章章纲，补地点名单", Some("demo")).unwrap();
-        assert_eq!(outline2.tool, "revise_outline");
-        assert_eq!(outline2.args["chapter"], 2);
 
         assert!(r.match_text("今天天气不错", Some("demo")).is_none());
         assert!(r.match_text("写第10章", None).is_none());
@@ -386,31 +392,12 @@ mod tests {
             .match_text("先写卷纲和剧情卡，再写第25章", Some("demo"))
             .is_none());
 
-        let vol = r.match_text("审这一卷", Some("demo")).unwrap();
-        assert_eq!(vol.tool, "audit_volume");
-        let vol2 = r.match_text("卷末复盘", Some("demo")).unwrap();
-        assert_eq!(vol2.tool, "audit_volume");
-
+        // Stuck audit queue resume stays deterministic (ops).
         let cont = r.match_text("继续审阅", Some("demo")).unwrap();
         assert_eq!(cont.id, "audit_queue_continue");
         assert_eq!(cont.tool, "audit_chapters");
         assert_eq!(cont.args["action"], "continue");
 
-        // Status questions must list plots — never continue_writing.
-        let plots = r
-            .match_text("对照剧情卡 现在到哪了", Some("demo"))
-            .unwrap();
-        assert_eq!(plots.id, "plot_status");
-        assert_eq!(plots.tool, "list_plots");
-        let plots2 = r.match_text("目前的剧情推进到哪了", Some("demo")).unwrap();
-        assert_eq!(plots2.id, "plot_status");
-        let plots3 = r.match_text("剧情进行到哪了", Some("demo")).unwrap();
-        assert_eq!(plots3.id, "plot_status");
-        assert_eq!(plots3.tool, "list_plots");
-        let plots4 = r.match_text("第三卷进行到哪了", Some("demo")).unwrap();
-        assert_eq!(plots4.id, "plot_status");
-        assert_eq!(plots4.tool, "list_plots");
-        assert_eq!(plots4.args["volume"], 3);
         assert_eq!(parse_volume_number("第三卷进度"), Some(3));
         assert_eq!(parse_volume_number("第3卷到哪了"), Some(3));
     }

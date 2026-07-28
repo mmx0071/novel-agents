@@ -11,6 +11,7 @@ mod studio_next_gates;
 mod tasks;
 mod thread_store;
 mod ui_sync;
+mod world_state;
 
 use audit_decisions::{
     audit_fail_prompt, build_fallback_audit_decisions, decisions_to_ui_options,
@@ -49,8 +50,12 @@ use novelx_protocol::{
     ThreadSummary, TodoItem, TodoStatus, TurnItem, TurnId, UserInput, UserInputOption,
 };
 use novelx_skills::{
-    build_available_skills, build_skill_injections, collect_explicit_skill_mentions,
-    default_skill_roots, load_project_skills, load_skills, SkillMetadata,
+    build_skill_injections, collect_explicit_skill_mentions, default_skill_roots,
+    load_project_skills, load_skills, render_available_skills, SkillMetadata,
+};
+use world_state::{
+    build_system_prompt, catalog_skills_for_session, studio_skill_catalog_budget,
+    SystemPromptParts,
 };
 use novelx_tools::{
     all_tools, clear_audit_queue, dispatch, load_audit_queue, tool_output_for_ui, tool_specs,
@@ -66,7 +71,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 
-const MAX_TOOL_ROUNDS: usize = 8;
+const MAX_TOOL_ROUNDS: usize = 12;
 
 struct ThreadRuntime {
     sub_tx: mpsc::Sender<Submission>,
@@ -185,6 +190,10 @@ pub(crate) struct PendingChapterNext {
     /// Concrete revise instructions for hard-rule / plot-exit gaps (overrides gate YAML default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revise_instructions: Option<String>,
+    /// Exact gate prompt first shown to the user. Reoffer / situational cards must reuse
+    /// this so hard-rule detail is not replaced by a laundry-list fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_prompt: Option<String>,
 }
 
 /// Skip-ahead write blocked → offer writing `next_chapter`.
@@ -1546,14 +1555,7 @@ impl NovelxCore {
                 } {
                     let options = self
                         .chapter_next_options(pending.published, pending.plot_accept_open);
-                    let prompt = if pending.published {
-                        chapter_next_published_prompt(
-                            pending.chapter,
-                            pending.plot_accept_open,
-                        )
-                    } else {
-                        chapter_next_hard_rule_prompt(pending.chapter, &summary)
-                    };
+                    let prompt = pending_chapter_next_prompt(&pending);
                     if let Some(t) = self.threads.write().await.get_mut(&thread_id) {
                         t.ui_turns = attach_ui_approval(
                             std::mem::take(&mut t.ui_turns),
@@ -4309,23 +4311,47 @@ impl NovelxCore {
                 let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("start");
                 if action == "continue" {
                     format!(
-                        "正在续跑《{}》的审阅队列…",
+                        "好的，继续《{}》的审阅队列。",
                         bound_project.as_deref().unwrap_or("?")
                     )
                 } else {
                     format!(
-                        "已建立逐章审阅队列，正在对《{}》执行…",
+                        "好的，开始对《{}》逐章审阅。",
                         bound_project.as_deref().unwrap_or("?")
                     )
                 }
+            } else if tool_name == "continue_writing" {
+                let ch = args.get("chapter").and_then(|v| v.as_u64());
+                if let Some(n) = ch {
+                    format!(
+                        "好的，开始写《{}》第{n}章。",
+                        bound_project.as_deref().unwrap_or("?")
+                    )
+                } else {
+                    format!(
+                        "好的，继续写《{}》下一章。",
+                        bound_project.as_deref().unwrap_or("?")
+                    )
+                }
+            } else if tool_name == "continue_writing_batch" {
+                format!(
+                    "好的，开始连写《{}》，遇到硬门控会停下来。",
+                    bound_project.as_deref().unwrap_or("?")
+                )
+            } else if tool_name == "revise_chapter" {
+                let ch = args.get("chapter").and_then(|v| v.as_u64()).unwrap_or(0);
+                format!(
+                    "好的，开始修订《{}》第{ch}章。",
+                    bound_project.as_deref().unwrap_or("?")
+                )
             } else if tool_name == "list_plots" {
                 format!(
-                    "正在核对《{}》的剧情进度…",
+                    "先核对一下《{}》的剧情进度。",
                     bound_project.as_deref().unwrap_or("?")
                 )
             } else {
                 format!(
-                    "已识别指令，正在对《{}》执行 {tool_name}…",
+                    "好的，正在处理《{}》…",
                     bound_project.as_deref().unwrap_or("?")
                 )
             };
@@ -4374,6 +4400,35 @@ impl NovelxCore {
                     &args.to_string()
                 )
                 .await?;
+            // Optional follow-up tools (e.g. plot_status → list_plots + get_project_status).
+            let mut output = output;
+            for extra in &intent.also_tools {
+                if extra.is_empty() || extra == &tool_name {
+                    continue;
+                }
+                let extra_args = json!({
+                    "project": args.get("project").and_then(|v| v.as_str()).unwrap_or("")
+                });
+                match self
+                    .run_one_tool(
+                        &thread_id,
+                        &turn_id,
+                        extra,
+                        &extra_args.to_string(),
+                    )
+                    .await
+                {
+                    Ok((extra_out, _)) => {
+                        if !extra_out.trim().is_empty() {
+                            output.push_str("\n\n——\n");
+                            output.push_str(extra_out.trim());
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(tool = %extra, error = %e, "intent also_tools failed");
+                    }
+                }
+            }
             // list_plots already returns a Chinese progress report — don't bury it under intro spam.
             let mut summary = if tool_name == "list_plots" {
                 output.clone()
@@ -4520,7 +4575,9 @@ impl NovelxCore {
                 self.maybe_offer_setting_blocker(&thread_id, &turn_id, &tool_name, &args, &data)
                     .await?
             };
-            let asked_next = if asked_mutation
+            // Intent path skips the LLM loop — still narrate clean publish before
+            // 「继续创作」, matching studio.pause_after_clean_write=false.
+            let gates_before_next = asked_mutation
                 || asked_impact
                 || asked_order
                 || asked_plot
@@ -4531,8 +4588,32 @@ impl NovelxCore {
                 || asked_handoff
                 || asked_vol_audit
                 || asked_audit
-                || asked_setting
+                || asked_setting;
+            if !gates_before_next
+                && write_result_is_clean_publish(&tool_name, &data)
+                && !self.features.pause_after_clean_write()
             {
+                match self
+                    .narrate_after_clean_write(
+                        &thread_id,
+                        &turn_id,
+                        &agent_item_id,
+                        &tool_name,
+                        &data,
+                        &output,
+                    )
+                    .await
+                {
+                    Ok(narration) if !narration.trim().is_empty() => {
+                        summary = format!("{intro}\n\n{}", narration.trim());
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "intent clean-write narration failed");
+                    }
+                }
+            }
+            let asked_next = if gates_before_next {
                 false
             } else {
                 self.maybe_offer_chapter_next(&thread_id, &turn_id, &tool_name, &args, &data)
@@ -4685,15 +4766,36 @@ impl NovelxCore {
         } // features.deterministic_intents
 
         let injections = build_skill_injections(&skills, &activate);
-        let skills_catalog = build_available_skills(&skills, Some(4000));
-        let studio_body = std::fs::read_to_string(
-            self.roots.config_root.join("skills/studio.md"),
+        let is_root = self
+            .get_session_source(&thread_id)
+            .await
+            .map(|s| s.is_root())
+            .unwrap_or(true);
+        let catalog_budget = studio_skill_catalog_budget(None);
+        let catalog_skills: Vec<SkillMetadata> = catalog_skills_for_session(
+            &skills,
+            &activate,
+            is_root,
         )
-        .unwrap_or_default();
-        let novel_draft_body = std::fs::read_to_string(
-            self.roots.config_root.join("skills/novel-draft.md"),
-        )
-        .unwrap_or_default();
+        .into_iter()
+        .cloned()
+        .collect();
+        let catalog_render = render_available_skills(&catalog_skills, Some(catalog_budget));
+        if let Some(warn) = catalog_render.report.warning_message() {
+            tracing::warn!(%thread_id, %warn, "skill catalog metadata pressure");
+        }
+        let studio_body = if is_root {
+            std::fs::read_to_string(self.roots.config_root.join("skills/studio.md"))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let novel_draft_body = if is_root {
+            std::fs::read_to_string(self.roots.config_root.join("skills/novel-draft.md"))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         let qa_hint_block = bound_project.as_deref().and_then(|p| {
             let dir = self.roots.projects_root.join(p);
             let hints = novelx_pipeline::studio_activation_hints_for_project(
@@ -4709,53 +4811,38 @@ impl NovelxCore {
             })
         });
         let project_bind = if let Some(p) = bound_project.as_deref() {
-            let mut s = format!(
-                "当前会话已绑定项目《{p}》。用户指令默认针对此书。\n\
-                 - 禁止无谓调用 list_projects（除非用户明确要「列出所有项目」）。\n\
-             - 「修正/扩写/重写/加长第N章」→ 立即 revise_chapter(project=\"{p}\", chapter=N, instructions=用户原话或「扩写到5000-6000字」)。\n\
-             - 用户只说「继续」：若下一章尚无正文 → 必须 continue_writing；若下一章已有草稿 → 先问清写下一章/修订/审校（勿只查状态就结束）。\n\
-             - 问剧情卡/主线/写到哪了/对照进度 → list_plots + get_project_status 后中文汇报；禁止 continue_writing。\n\
-             - 不要只列项目或只口头答应就结束；同一轮必须把可执行工具跑完。\n"
-            );
-            if let Some(qa) = qa_hint_block {
-                s.push_str(&qa);
+            let mut s = if is_root {
+                format!(
+                    "当前会话已绑定项目《{p}》。用户指令默认针对此书。\n\
+                     - 禁止无谓调用 list_projects（除非用户明确要「列出所有项目」）。\n\
+                 - 「修正/扩写/重写/加长第N章」→ 立即 revise_chapter(project=\"{p}\", chapter=N, instructions=用户原话或「扩写到5000-6000字」)。\n\
+                 - 用户只说「继续」：若下一章尚无正文 → 必须 continue_writing；若下一章已有草稿 → 先问清写下一章/修订/审校（勿只查状态就结束）。\n\
+                 - 问剧情卡/主线/写到哪了/对照进度 → list_plots + get_project_status 后中文汇报；禁止 continue_writing。\n\
+                 - 不要只列项目或只口头答应就结束；同一轮必须把可执行工具跑完。\n"
+                )
+            } else {
+                format!("当前任务所属项目：《{p}》。\n")
+            };
+            if is_root {
+                if let Some(qa) = qa_hint_block {
+                    s.push_str(&qa);
+                }
             }
             s
-        } else {
+        } else if is_root {
             "尚未绑定项目：若用户已点名书名则直接用该 project；仅当完全不清楚时才 list_projects，然后必须继续执行原请求。\n".into()
+        } else {
+            String::new()
         };
-        let mut system = format!(
-            "你是 NovelX，小说创作编排 Agent。\n\
-             {project_bind}\
-             优先局部修订正文，避免无必要时全文重写。\n\
-             需要操作项目时，必须通过 API function calling 调用工具，\
-             不要输出 XML、<function_calls>、<invoke> 或伪代码。\n\
-             工具参数使用：project（项目名）、chapter（章节号整数）、instructions（修订说明）。\n\
-             字数太少/扩写/重写/修正章节必须调用 revise_chapter，禁止用 audit_chapter 代替写章。\n\
-             整卷复盘（审这一卷/卷末复盘）必须调用 audit_volume（摘要层），不要默认 audit_chapters 扫整卷。\n\
-             审校多章（如1-8章）或「按建议深审」必须调用 audit_chapters（可用 chapters 列表），禁止同轮多次 audit_chapter。\n\
-             单章审校用 audit_chapter。通过（含仅有 P1/P2）→ 勿称未通过、勿伪造审批卡；用户要改则 revise_chapter。\
-             未通过 → 立即 offer_decisions（按 issue_id 给出修某条/修全部阻断/接受等），不要只给「按审校局部修订」。\
-             禁止在正文里自拟编号审批卡；决策卡只经 offer_decisions / 服务端 open_gate。\n\n{skills_catalog}"
-        );
-        if !studio_body.trim().is_empty() {
-            system.push_str("\n\n# Skill: studio\n\n");
-            system.push_str(&studio_body);
-        }
-        // Field contract for setup collecting — not an LLM extractor agent.
-        if !novel_draft_body.trim().is_empty() {
-            system.push_str("\n\n# Skill: novel-draft\n\n");
-            system.push_str(&novel_draft_body);
-        }
-        for inj in &injections {
-            if inj.name == "studio" || inj.name == "novel-draft" {
-                continue; // already injected as default
-            }
-            system.push_str(&format!(
-                "\n\n# Skill: {}\n\n{}",
-                inj.name, inj.body
-            ));
-        }
+        let (system, _catalog_report) = build_system_prompt(SystemPromptParts {
+            is_root,
+            project_bind,
+            skills_catalog: catalog_render.body,
+            catalog_report: catalog_render.report,
+            studio_body: &studio_body,
+            novel_draft_body: &novel_draft_body,
+            injections: &injections,
+        });
 
         let specs = tool_specs(&self.tools);
         let mut agent_item_id = new_id("item");
@@ -4783,6 +4870,12 @@ impl NovelxCore {
         let mut spam_tool_streak: usize = 0;
         // After audit fail: wait one Studio round for `offer_decisions` before fallback gate.
         let mut awaiting_studio_audit_offer = false;
+        // After clean write/revise: request one narration round (no more write tools).
+        let mut write_followup_pending = false;
+        let mut write_followup_done = false;
+        // Defer「继续创作」until after the narration round so a mid-summary click
+        // is not cleared by thread_awaiting_human (pending_input race).
+        let mut deferred_chapter_next: Option<(String, Value, Value)> = None;
 
         for _round in 0..MAX_TOOL_ROUNDS {
             // Set when continue_writing audit-fails: stub sibling tools, then continue
@@ -4857,14 +4950,18 @@ impl NovelxCore {
             let thread_delta = thread_id.clone();
             let turn_delta = turn_id.clone();
             let item_delta = agent_item_id.clone();
+            let reasoning_item_id = new_id("item");
+            let stream_reasoning = self.features.stream_reasoning();
+            let reasoning_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let mut streamed = String::new();
             let result = self
                 .roots
                 .llm
-                .complete_messages_stream(
+                .complete_messages_stream_limited_ex(
                     messages,
                     Some(&studio_model),
                     Some(&specs),
+                    None,
                     |delta| {
                         let core_delta = core_delta.clone();
                         let thread_delta = thread_delta.clone();
@@ -4884,8 +4981,64 @@ impl NovelxCore {
                                 .await;
                         }
                     },
+                    |piece| {
+                        let core_delta = core_delta.clone();
+                        let thread_delta = thread_delta.clone();
+                        let turn_delta = turn_delta.clone();
+                        let reasoning_item_id = reasoning_item_id.clone();
+                        let reasoning_started = reasoning_started.clone();
+                        async move {
+                            if !stream_reasoning || piece.is_empty() {
+                                return;
+                            }
+                            use std::sync::atomic::Ordering;
+                            if !reasoning_started.swap(true, Ordering::Relaxed) {
+                                core_delta
+                                    .emit_to_thread(
+                                        &thread_delta,
+                                        EventMsg::ItemStarted {
+                                            thread_id: thread_delta.clone(),
+                                            turn_id: turn_delta.clone(),
+                                            item: TurnItem::Reasoning {
+                                                id: reasoning_item_id.clone(),
+                                                text: String::new(),
+                                                status: ItemStatus::InProgress,
+                                            },
+                                        },
+                                    )
+                                    .await;
+                            }
+                            core_delta
+                                .emit_to_thread(
+                                    &thread_delta,
+                                    EventMsg::ReasoningContentDelta {
+                                        thread_id: thread_delta.clone(),
+                                        turn_id: turn_delta,
+                                        item_id: reasoning_item_id,
+                                        delta: piece,
+                                    },
+                                )
+                                .await;
+                        }
+                    },
                 )
                 .await?;
+            if reasoning_started.load(std::sync::atomic::Ordering::Relaxed) {
+                let text = result.reasoning_content.clone().unwrap_or_default();
+                self.emit_to_thread(
+                    &thread_id,
+                    EventMsg::ItemCompleted {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                        item: TurnItem::Reasoning {
+                            id: reasoning_item_id,
+                            text,
+                            status: ItemStatus::Completed,
+                        },
+                    },
+                )
+                .await;
+            }
             streamed.push_str(&result.content);
 
             // Codex-like: tool rounds show ToolCall items; keep prose for the agent bubble.
@@ -4934,6 +5087,16 @@ impl NovelxCore {
                         tool_calls: None,
                     ..Default::default()
                 });
+                }
+                if write_followup_done {
+                    if let Some((name, args, data)) = deferred_chapter_next.take() {
+                        let _ = self
+                            .maybe_offer_chapter_next(
+                                &thread_id, &turn_id, &name, &args, &data,
+                            )
+                            .await?;
+                    }
+                    pause_for_human = true;
                 }
                 break;
             }
@@ -5406,7 +5569,9 @@ impl NovelxCore {
                     pause_for_human = true;
                     break;
                 }
-                // Draft-exists clarify / one chapter per turn — do not auto-chain.
+                // Draft-exists clarify / write path — hard gates pause; clean publish
+                // may allow one narration follow-up (studio.pause_after_clean_write=false).
+                // Offer「继续创作」only after narration (or immediately on hard block).
                 if tc.name == "continue_writing" || tc.name == "revise_chapter" {
                     if self
                         .maybe_offer_draft_exists(
@@ -5421,15 +5586,6 @@ impl NovelxCore {
                         pause_for_human = true;
                         break;
                     }
-                    let _ = self
-                        .maybe_offer_chapter_next(
-                            &thread_id,
-                            &turn_id,
-                            &tc.name,
-                            &args_val,
-                            &data,
-                        )
-                        .await?;
                     // Content audit fail: keep the tool loop alive for one Studio
                     // `offer_decisions` round. Pausing here left pending_audit in
                     // awaiting_offer with no RequestUserInput (zombie gate).
@@ -5440,7 +5596,55 @@ impl NovelxCore {
                         end_batch_for_studio_offer = true;
                         break;
                     }
-                    pause_for_human = true;
+                    let published =
+                        data.get("published").and_then(|v| v.as_bool()) == Some(true);
+                    let hard_block = data.get("blocked").and_then(|v| v.as_bool()) == Some(true)
+                        || data.get("content_rule_blocked").and_then(|v| v.as_bool())
+                            == Some(true)
+                        || data.get("needs_user_choice").and_then(|v| v.as_bool()) == Some(true)
+                        || data.get("consistency_passed").and_then(|v| v.as_bool())
+                            == Some(false)
+                        || !published;
+                    if hard_block || write_followup_done {
+                        if write_followup_done {
+                            if let Some((name, args, d)) = deferred_chapter_next.take() {
+                                let _ = self
+                                    .maybe_offer_chapter_next(
+                                        &thread_id, &turn_id, &name, &args, &d,
+                                    )
+                                    .await?;
+                            }
+                        } else {
+                            let _ = self
+                                .maybe_offer_chapter_next(
+                                    &thread_id,
+                                    &turn_id,
+                                    &tc.name,
+                                    &args_val,
+                                    &data,
+                                )
+                                .await?;
+                        }
+                        pause_for_human = true;
+                        break;
+                    }
+                    if self.features.pause_after_clean_write() {
+                        let _ = self
+                            .maybe_offer_chapter_next(
+                                &thread_id,
+                                &turn_id,
+                                &tc.name,
+                                &args_val,
+                                &data,
+                            )
+                            .await?;
+                        pause_for_human = true;
+                        break;
+                    }
+                    // Clean publish: narrate first, then offer chapter_next.
+                    deferred_chapter_next =
+                        Some((tc.name.clone(), args_val.clone(), data.clone()));
+                    write_followup_pending = true;
                     break;
                 }
                 // Audit-only hard-rule block: open「修正本章」(not consistency decision card).
@@ -5462,7 +5666,7 @@ impl NovelxCore {
             }
             // Human gate / early stop: stub remaining tool_call_ids so next turn's history is valid.
             // Also stub when ending a batch for Studio offer_decisions (no pause yet).
-            if pause_for_human || end_batch_for_studio_offer {
+            if pause_for_human || end_batch_for_studio_offer || write_followup_pending {
                 if let Some(t) = self.threads.write().await.get_mut(&thread_id) {
                     for tc in &pending_tool_calls {
                         if answered_ids.iter().any(|id| id == &tc.id) {
@@ -5471,6 +5675,11 @@ impl NovelxCore {
                         let reason = if pause_for_human {
                             format!(
                                 "（未执行：上一工具需用户确认后结束本轮，跳过 {}）",
+                                tc.name
+                            )
+                        } else if write_followup_pending {
+                            format!(
+                                "（未执行：写章已完成，进入结果总结轮，跳过 {}）",
                                 tc.name
                             )
                         } else {
@@ -5493,9 +5702,45 @@ impl NovelxCore {
                 if pause_for_human {
                     break;
                 }
+                if write_followup_pending {
+                    write_followup_pending = false;
+                    write_followup_done = true;
+                    if let Some(t) = self.threads.write().await.get_mut(&thread_id) {
+                        t.messages.push(ChatMessage {
+                            role: "user".into(),
+                            content: "写章/修订已完成。请用两三句中文向用户总结本章结果与下一步建议；\
+禁止再调用 continue_writing / revise_chapter / continue_writing_batch。\
+不要替用户做选择；总结后本轮结束，系统会再弹出下一步选项。"
+                                .into(),
+                            tool_call_id: None,
+                            tool_calls: None,
+                            ..Default::default()
+                        });
+                    }
+                    continue;
+                }
                 // end_batch_for_studio_offer: continue outer loop for Studio offer.
                 continue;
             }
+
+            if write_followup_done {
+                if let Some((name, args, data)) = deferred_chapter_next.take() {
+                    let _ = self
+                        .maybe_offer_chapter_next(
+                            &thread_id, &turn_id, &name, &args, &data,
+                        )
+                        .await?;
+                }
+                pause_for_human = true;
+                break;
+            }
+        }
+
+        // Safety: if the tool-round budget ended mid-followup, still offer the card.
+        if let Some((name, args, data)) = deferred_chapter_next.take() {
+            let _ = self
+                .maybe_offer_chapter_next(&thread_id, &turn_id, &name, &args, &data)
+                .await?;
         }
 
         // Studio skipped offer_decisions → open deterministic per-P0 decision card.
@@ -6109,6 +6354,7 @@ impl NovelxCore {
             tool: "continue_writing".into(),
             args: json!({ "project": project }),
             clear_history: ClearHistory::OnStart,
+            also_tools: Vec::new(),
         })
     }
 
@@ -6403,14 +6649,7 @@ impl NovelxCore {
                 return;
             }
             let options = self.chapter_next_options(c.published, c.plot_accept_open);
-            let prompt = if c.published {
-                chapter_next_published_prompt(c.chapter, c.plot_accept_open)
-            } else {
-                format!(
-                    "第{}章因硬规则未发布。请选择：修正本章；也可点「其他」说明要求。",
-                    c.chapter
-                )
-            };
+            let prompt = pending_chapter_next_prompt(&c);
             (prompt, options)
         } else {
             return;
@@ -8106,14 +8345,7 @@ impl NovelxCore {
             let options = self
                 .gates
                 .chapter_next_options(c.published, c.plot_accept_open);
-            let prompt = if c.published {
-                chapter_next_published_prompt(c.chapter, c.plot_accept_open)
-            } else {
-                format!(
-                    "第{}章因硬规则未发布。请选择：修正本章；也可点「其他」说明要求。",
-                    c.chapter
-                )
-            };
+            let prompt = pending_chapter_next_prompt(c);
             return Some(json!({
                 "kind": "chapter_next",
                 "prompt": prompt,
@@ -8230,6 +8462,105 @@ impl NovelxCore {
             .await
     }
 
+    /// Short Studio narration after a clean intent-path write (no tool loop follow-up).
+    async fn narrate_after_clean_write(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        agent_item_id: &str,
+        tool_name: &str,
+        data: &Value,
+        tool_output: &str,
+    ) -> Result<String> {
+        let chapter = data
+            .get("chapter")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let project = data
+            .get("project")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let verb = if tool_name == "revise_chapter" {
+            "修订"
+        } else {
+            "写作"
+        };
+        let excerpt = {
+            let t = tool_output.trim();
+            if t.chars().count() > 1600 {
+                format!("{}…", t.chars().take(1600).collect::<String>())
+            } else {
+                t.to_string()
+            }
+        };
+        let messages = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: "你是小说创作助手 Studio。用两三句中文向用户总结刚完成的写章/修订结果，\
+并给一句简短的下一步建议。不要调用工具，不要替用户做选择，不要复述整章正文。"
+                    .into(),
+                tool_call_id: None,
+                tool_calls: None,
+                ..Default::default()
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: format!(
+                    "项目《{project}》第{chapter}章已{verb}完成并发布。工具输出摘要：\n{excerpt}"
+                ),
+                tool_call_id: None,
+                tool_calls: None,
+                ..Default::default()
+            },
+        ];
+        let studio_model = self.roots.llm.model_for_agent("studio_agent");
+        let core_delta = self.clone();
+        let thread_delta = thread_id.to_string();
+        let turn_delta = turn_id.to_string();
+        let item_delta = agent_item_id.to_string();
+        // Separate from the intent intro with a blank line.
+        self.emit_to_thread(
+            thread_id,
+            EventMsg::AgentMessageContentDelta {
+                thread_id: thread_id.to_string(),
+                turn_id: turn_id.to_string(),
+                item_id: agent_item_id.to_string(),
+                delta: "\n\n".into(),
+            },
+        )
+        .await;
+        let result = self
+            .roots
+            .llm
+            .complete_messages_stream_limited(
+                messages,
+                Some(&studio_model),
+                None,
+                Some(400),
+                |delta| {
+                    let core_delta = core_delta.clone();
+                    let thread_delta = thread_delta.clone();
+                    let turn_delta = turn_delta.clone();
+                    let item_delta = item_delta.clone();
+                    async move {
+                        core_delta
+                            .emit_to_thread(
+                                &thread_delta,
+                                EventMsg::AgentMessageContentDelta {
+                                    thread_id: thread_delta.clone(),
+                                    turn_id: turn_delta,
+                                    item_id: item_delta,
+                                    delta,
+                                },
+                            )
+                            .await;
+                    }
+                },
+            )
+            .await?;
+        Ok(result.content)
+    }
+
     /// After chapter write/revise/audit: published →「继续创作」; content-rule block →「修正本章」.
     async fn maybe_offer_chapter_next(
         &self,
@@ -8284,15 +8615,18 @@ impl NovelxCore {
         let content_blocked =
             data.get("content_rule_blocked").and_then(|v| v.as_bool()) == Some(true);
         let length_blocked = is_length_publish_blocked(data);
-        let plot_accept_open = published
-            && data.get("plot_accept_passed").and_then(|v| v.as_bool()) == Some(false);
+        let plot_accept_failed =
+            data.get("plot_accept_passed").and_then(|v| v.as_bool()) == Some(false);
+        // Legacy: published but accept still open. New: accept fail blocks publish.
+        let plot_accept_open = published && plot_accept_failed;
+        let plot_accept_blocked = !published && plot_accept_failed;
         // Clean publish → continue next chapter.
-        // Hard-rule / length block → revise this chapter.
+        // Hard-rule / length / plot-accept block → revise this chapter.
         // Other unpublished cases (consistency / P0) use the audit gate instead.
-        if !published && !content_blocked && !length_blocked {
+        if !published && !content_blocked && !length_blocked && !plot_accept_blocked {
             return Ok(false);
         }
-        let options = self.chapter_next_options(published, plot_accept_open);
+        let options = self.chapter_next_options(published, plot_accept_open || plot_accept_blocked);
         if options.is_empty() {
             return Ok(false);
         }
@@ -8305,8 +8639,19 @@ impl NovelxCore {
             chapter_next_published_prompt(chapter, plot_accept_open)
         } else if length_blocked {
             chapter_next_length_prompt(chapter, detail)
+        } else if plot_accept_blocked {
+            format!(
+                "第{chapter}章剧情收束未通过，未发布。请选择：修正本章；也可点「其他」说明要求。"
+            )
         } else {
-            chapter_next_hard_rule_prompt(chapter, detail)
+            chapter_next_hard_rule_prompt_rich(
+                &self.roots.projects_root,
+                &self.roots.config_root,
+                &project,
+                chapter,
+                detail,
+                report,
+            )
         };
         let revise_instructions = if length_blocked {
             Some(length_revise_instructions(&self.roots.config_root, detail))
@@ -8319,7 +8664,7 @@ impl NovelxCore {
                 detail,
                 report,
             ))
-        } else if plot_accept_open {
+        } else if plot_accept_open || plot_accept_blocked {
             let rationale = data
                 .get("plot_accept_rationale")
                 .and_then(|v| v.as_str())
@@ -8335,14 +8680,17 @@ impl NovelxCore {
         } else {
             None
         };
+        // Treat accept-fail-blocked the same as open for revise options / follow-ups.
+        let plot_accept_flag = plot_accept_open || plot_accept_blocked;
         if let Some(t) = self.threads.write().await.get_mut(thread_id) {
             t.pending_chapter_next = Some(PendingChapterNext {
                 project: project.clone(),
                 chapter,
                 published,
-                plot_accept_open,
+                plot_accept_open: plot_accept_flag,
                 suggest_next: None,
                 revise_instructions,
+                gate_prompt: Some(prompt.clone()),
             });
             t.ui_turns = attach_ui_approval(
                 std::mem::take(&mut t.ui_turns),
@@ -9284,10 +9632,13 @@ impl NovelxCore {
         let content_blocked =
             data.get("content_rule_blocked").and_then(|v| v.as_bool()) == Some(true);
         let length_blocked = is_length_publish_blocked(data);
-        let plot_accept_open = published
-            && data.get("plot_accept_passed").and_then(|v| v.as_bool()) == Some(false);
-        let resume_chapter_next =
-            chapter > 0 && (published || content_blocked || length_blocked);
+        let plot_accept_failed =
+            data.get("plot_accept_passed").and_then(|v| v.as_bool()) == Some(false);
+        let plot_accept_open = published && plot_accept_failed;
+        let plot_accept_blocked = !published && plot_accept_failed;
+        let plot_accept_flag = plot_accept_open || plot_accept_blocked;
+        let resume_chapter_next = chapter > 0
+            && (published || content_blocked || length_blocked || plot_accept_blocked);
         let detail_msg = data.get("message").and_then(|v| v.as_str()).unwrap_or("");
         let revise_instructions = if length_blocked {
             Some(length_revise_instructions(&self.roots.config_root, detail_msg))
@@ -9301,7 +9652,7 @@ impl NovelxCore {
                 detail_msg,
                 report,
             ))
-        } else if plot_accept_open {
+        } else if plot_accept_flag {
             let rationale = data
                 .get("plot_accept_rationale")
                 .and_then(|v| v.as_str())
@@ -9331,7 +9682,7 @@ impl NovelxCore {
                 detail,
                 resume_chapter_next,
                 published,
-                plot_accept_open,
+                plot_accept_open: plot_accept_flag,
                 content_blocked,
                 revise_instructions,
                 offer_volume_handoff_after: false,
@@ -9455,13 +9806,34 @@ impl NovelxCore {
         let length_revise = revise_instructions
             .as_deref()
             .is_some_and(|s| s.contains("扩写到") || s.contains("完整一章"));
+        let plot_accept_revise = revise_instructions
+            .as_deref()
+            .is_some_and(|s| s.contains("剧情卡收束") || s.contains("收束条件"));
         let prompt = if published {
             chapter_next_published_prompt(chapter, plot_accept_open)
         } else if length_revise {
             chapter_next_length_prompt(chapter, "正文字数未达发布门槛")
-        } else {
+        } else if plot_accept_revise || plot_accept_open {
             format!(
-                "第{chapter}章因硬规则未发布。请选择：修正本章；也可点「其他」说明要求。"
+                "第{chapter}章剧情收束未通过，未发布。请选择：修正本章；也可点「其他」说明要求。"
+            )
+        } else if let Some(instr) = revise_instructions.as_deref() {
+            chapter_next_hard_rule_prompt_rich(
+                &self.roots.projects_root,
+                &self.roots.config_root,
+                project,
+                chapter,
+                instr,
+                "",
+            )
+        } else {
+            chapter_next_hard_rule_prompt_rich(
+                &self.roots.projects_root,
+                &self.roots.config_root,
+                project,
+                chapter,
+                "",
+                "",
             )
         };
         if let Some(t) = self.threads.write().await.get_mut(thread_id) {
@@ -9472,6 +9844,7 @@ impl NovelxCore {
                 plot_accept_open,
                 suggest_next: None,
                 revise_instructions,
+                gate_prompt: Some(prompt.clone()),
             });
             t.ui_turns = attach_ui_approval(
                 std::mem::take(&mut t.ui_turns),
@@ -10228,6 +10601,149 @@ fn try_autofix_meta_chapter_refs(
     ))
 }
 
+/// True when a content-rule / hard-gate message line is actionable for revise UI.
+fn looks_like_hard_rule_detail(msg: &str) -> bool {
+    let m = msg.trim();
+    if m.is_empty() {
+        return false;
+    }
+    m.starts_with("正文出现")
+        || m.contains("禁名「")
+        || m.contains("元叙述")
+        || m.contains("管线元叙述")
+        || m.contains("章内倒计时")
+        || m.contains("章内时段")
+        || m.contains("时段叙述")
+        || m.contains("倒计时/剩余")
+        || m.contains("[CONTRADICTION]")
+        || m.contains("[NEW_FACT]")
+        || m.contains("[阻断]")
+        || m.contains("伤势侧别")
+        || m.contains("能力位置")
+        || m.contains("身体状态板")
+}
+
+fn strip_numbered_prefix(line: &str) -> &str {
+    let t = line.trim();
+    if let Some((idx, rest)) = t.split_once(". ") {
+        if !idx.is_empty() && idx.chars().all(|c| c.is_ascii_digit()) {
+            return rest.trim();
+        }
+    }
+    if let Some(rest) = t.strip_prefix("· ") {
+        return rest.trim();
+    }
+    t
+}
+
+fn rule_hint_from_id(rule: &str) -> Option<&'static str> {
+    match rule {
+        "timeline_daypart_regression" => Some("daypart"),
+        "timeline_countdown_jump" => Some("countdown"),
+        "pipeline_meta_leak" => Some("pipeline"),
+        "banned_name" => Some("banned"),
+        "meta_chapter_ref" => Some("meta"),
+        "body_state_side" | "body_state_locus" => Some("body"),
+        "contradiction_marker" | "too_many_new_facts" => Some("other"),
+        _ => None,
+    }
+}
+
+fn rule_hint_from_message(msg: &str) -> Option<&'static str> {
+    if msg.contains("时段") || msg.contains("凌晨") || msg.contains("夜晚") {
+        Some("daypart")
+    } else if msg.contains("倒计时") || msg.contains("还剩") {
+        Some("countdown")
+    } else if msg.contains("管线") || msg.contains("章纲") {
+        Some("pipeline")
+    } else if msg.contains("禁名") {
+        Some("banned")
+    } else if msg.contains("身体状态板") || msg.contains("伤势") || msg.contains("能力载体") {
+        Some("body")
+    } else if msg.contains("元叙述") {
+        Some("meta")
+    } else {
+        None
+    }
+}
+
+fn focus_for_rule_hints(hints: &[&str]) -> &'static str {
+    if hints.iter().any(|h| *h == "daypart") {
+        "理顺章内时段词（勿把「夜晚/夜里」当修辞与「凌晨」混用；回跳须补跨日）。"
+    } else if hints.iter().any(|h| *h == "countdown") {
+        "理顺倒计时/剩余时长：当前读数须单调不增；回忆初始值标明「最初/原先」。"
+    } else if hints.iter().any(|h| *h == "body") {
+        "对齐身体状态板：伤势侧别/部位与能力载体不得无交代对调。"
+    } else if hints.iter().any(|h| *h == "pipeline") {
+        "删除章纲/大纲/设定对读与作者纠错释义，只保留场面叙述。"
+    } else if hints.iter().any(|h| *h == "banned") {
+        "替换禁名，改用名词表规范名。"
+    } else if hints.iter().any(|h| *h == "meta") {
+        "除标题行「# 第N章 …」外，去掉正文「第…章」元叙述，改用故事内时间/事件指称。"
+    } else {
+        "按下列违规逐条改句；只改违规句，勿整章重写。"
+    }
+}
+
+/// Collect blocking hard-rule lines: prefer tool detail, then live draft scan by rule id.
+fn collect_hard_rule_bullets(
+    projects_root: &std::path::Path,
+    config_root: &std::path::Path,
+    project: &str,
+    chapter: u32,
+    message: &str,
+    report: &str,
+) -> (Vec<String>, Vec<&'static str>) {
+    let detail = if !message.trim().is_empty() {
+        message
+    } else {
+        report
+    };
+    let mut bullets: Vec<String> = Vec::new();
+    let mut rule_hints: Vec<&str> = Vec::new();
+    // Prefer live draft scan (source of truth); fall back to tool message only if empty.
+    let content_rules = ContentRulesConfig::load_from_config_root(config_root);
+    let naming = NamingRules::load_from_config_root(config_root);
+    let dir = project_dir(projects_root, project);
+    if let Some(draft) = read_chapter_draft(&dir, chapter) {
+        for v in check_draft_with(&content_rules, &draft, &naming.forbidden_names) {
+            if !v.blocking {
+                continue;
+            }
+            let title = content_rules.title_for_rule(&v.rule);
+            bullets.push(format!("· [{title}] {}", v.message));
+            if let Some(h) = rule_hint_from_id(&v.rule) {
+                rule_hints.push(h);
+            }
+        }
+        for msg in novelx_pipeline::check_body_state_conflicts(&dir, chapter, &draft) {
+            bullets.push(format!("· [身体状态] {msg}"));
+            rule_hints.push("body");
+        }
+    }
+    if bullets.is_empty() {
+        for line in detail.lines() {
+            let msg = strip_numbered_prefix(line);
+            let msg = msg
+                .strip_prefix("[阻断] ")
+                .or_else(|| msg.strip_prefix("[警告] "))
+                .unwrap_or(msg);
+            if !looks_like_hard_rule_detail(msg) {
+                continue;
+            }
+            bullets.push(format!("· {msg}"));
+            if let Some(h) = rule_hint_from_message(msg) {
+                rule_hints.push(h);
+            }
+        }
+    }
+    bullets.sort();
+    bullets.dedup();
+    rule_hints.sort();
+    rule_hints.dedup();
+    (bullets, rule_hints)
+}
+
 /// Concrete revise instructions for「修正本章」after a hard-rule block.
 fn hard_rule_revise_instructions(
     projects_root: &std::path::Path,
@@ -10237,58 +10753,16 @@ fn hard_rule_revise_instructions(
     message: &str,
     report: &str,
 ) -> String {
-    let detail = if !message.trim().is_empty() {
-        message
-    } else {
-        report
-    };
-    let mut bullets: Vec<String> = Vec::new();
-    for line in detail.lines() {
-        let t = line.trim();
-        if t.is_empty() {
-            continue;
-        }
-        let msg = if let Some((idx, rest)) = t.split_once(". ") {
-            if !idx.is_empty() && idx.chars().all(|c| c.is_ascii_digit()) {
-                rest.trim()
-            } else {
-                t
-            }
-        } else {
-            t
-        };
-        if msg.starts_with("正文出现")
-            || msg.contains("禁名「")
-            || msg.contains("元叙述")
-            || msg.contains("[CONTRADICTION]")
-            || msg.contains("[NEW_FACT]")
-        {
-            bullets.push(format!("· {msg}"));
-        }
-    }
-    // Prefer live draft scan so instructions stay accurate after prior revise attempts.
-    let content_rules = ContentRulesConfig::load_from_config_root(config_root);
-    if let Some(draft) = read_chapter_draft(&project_dir(projects_root, project), chapter) {
-        for (idx, line) in draft.lines().enumerate() {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with('#') {
-                continue;
-            }
-            for v in check_draft_with(&content_rules, line, &[]) {
-                if v.rule == "meta_chapter_ref" || v.rule == "banned_name" {
-                    let snippet: String = line.trim().chars().take(100).collect();
-                    bullets.push(format!("· 约第{}行原文：「{snippet}」", idx + 1));
-                }
-            }
-        }
-    }
-    bullets.sort();
-    bullets.dedup();
-    let mut out = format!(
-        "硬规则阻断第{chapter}章发布。只改违规句，勿整章重写。\
-         除标题行「# 第N章 …」外，正文禁止出现任何「第…章」字样；\
-         改用故事内时间/事件指称（如「上次会面时」「那次接口被打开时」）。"
+    let (bullets, rule_hints) = collect_hard_rule_bullets(
+        projects_root,
+        config_root,
+        project,
+        chapter,
+        message,
+        report,
     );
+    let focus = focus_for_rule_hints(&rule_hints);
+    let mut out = format!("硬规则阻断第{chapter}章发布。只改违规句，勿整章重写。{focus}");
     if !bullets.is_empty() {
         out.push_str("\n必须处理：\n");
         out.push_str(&bullets.join("\n"));
@@ -10313,6 +10787,18 @@ fn is_length_publish_blocked(data: &Value) -> bool {
         data.get("length_status").and_then(|v| v.as_str()).unwrap_or(""),
         "hard_short" | "soft_short_escalated"
     )
+}
+
+/// Clean write/revise publish: eligible for narration-before-chapter_next.
+fn write_result_is_clean_publish(tool_name: &str, data: &Value) -> bool {
+    if !matches!(tool_name, "continue_writing" | "revise_chapter") {
+        return false;
+    }
+    data.get("published").and_then(|v| v.as_bool()) == Some(true)
+        && data.get("blocked").and_then(|v| v.as_bool()) != Some(true)
+        && data.get("content_rule_blocked").and_then(|v| v.as_bool()) != Some(true)
+        && data.get("needs_user_choice").and_then(|v| v.as_bool()) != Some(true)
+        && data.get("consistency_passed").and_then(|v| v.as_bool()) != Some(false)
 }
 
 fn length_revise_instructions(config_root: &std::path::Path, detail: &str) -> String {
@@ -10352,38 +10838,99 @@ fn chapter_next_length_prompt(chapter: u32, tool_message: &str) -> String {
 fn chapter_next_hard_rule_prompt(chapter: u32, tool_message: &str) -> String {
     let mut lines: Vec<String> = Vec::new();
     for line in tool_message.lines() {
-        let t = line.trim();
-        if t.is_empty() {
-            continue;
-        }
-        let msg = if let Some((idx, rest)) = t.split_once(". ") {
-            if !idx.is_empty() && idx.chars().all(|c| c.is_ascii_digit()) {
-                rest.trim()
-            } else {
-                t
-            }
-        } else {
-            t
-        };
-        let looks = msg.starts_with("正文出现")
-            || msg.contains("禁名「")
-            || msg.contains("元叙述")
-            || msg.contains("[CONTRADICTION]")
-            || msg.contains("[NEW_FACT]");
-        if looks {
+        let msg = strip_numbered_prefix(line);
+        let msg = msg
+            .strip_prefix("[阻断] ")
+            .or_else(|| msg.strip_prefix("[警告] "))
+            .unwrap_or(msg);
+        if looks_like_hard_rule_detail(msg) {
             lines.push(format!("· {msg}"));
         }
     }
+    // Revise-instruction blobs: reuse「必须处理」bullets when tool message lost structure.
     if lines.is_empty() {
-        format!(
-            "第{chapter}章因硬规则未发布（如正文出现「第N章」元叙述或禁名）。请选择：修正本章；也可点「其他」说明要求。"
-        )
+        if let Some(rest) = tool_message.split("必须处理：").nth(1) {
+            for line in rest.lines() {
+                let msg = strip_numbered_prefix(line);
+                if looks_like_hard_rule_detail(msg) || msg.starts_with('·') {
+                    let msg = msg.trim_start_matches('·').trim();
+                    if !msg.is_empty() {
+                        lines.push(format!("· {msg}"));
+                    }
+                }
+            }
+        }
+    }
+    lines.sort();
+    lines.dedup();
+    if lines.is_empty() {
+        // No laundry-list of unrelated rules — keep the reason honest when detail is missing.
+        format!("第{chapter}章因硬规则未发布。请选择：修正本章；也可点「其他」说明要求。")
     } else {
         format!(
             "第{chapter}章因硬规则未发布：\n{}\n\n请选择：修正本章；也可点「其他」说明要求。",
             lines.join("\n")
         )
     }
+}
+
+/// Build hard-rule chapter_next prompt; live-scan draft when tool message has no detail.
+fn chapter_next_hard_rule_prompt_rich(
+    projects_root: &std::path::Path,
+    config_root: &std::path::Path,
+    project: &str,
+    chapter: u32,
+    tool_message: &str,
+    report: &str,
+) -> String {
+    let from_msg = chapter_next_hard_rule_prompt(chapter, tool_message);
+    if !from_msg.contains("因硬规则未发布。请选择") {
+        return from_msg;
+    }
+    let (bullets, _) = collect_hard_rule_bullets(
+        projects_root,
+        config_root,
+        project,
+        chapter,
+        tool_message,
+        report,
+    );
+    if bullets.is_empty() {
+        from_msg
+    } else {
+        format!(
+            "第{chapter}章因硬规则未发布：\n{}\n\n请选择：修正本章；也可点「其他」说明要求。",
+            bullets.join("\n")
+        )
+    }
+}
+
+/// Reuse the stored gate prompt on reoffer / situational cards.
+fn pending_chapter_next_prompt(pending: &PendingChapterNext) -> String {
+    if let Some(p) = pending.gate_prompt.as_deref() {
+        if !p.trim().is_empty() {
+            return p.to_string();
+        }
+    }
+    if pending.published {
+        return chapter_next_published_prompt(pending.chapter, pending.plot_accept_open);
+    }
+    if let Some(instr) = pending.revise_instructions.as_deref() {
+        if instr.contains("扩写到") || instr.contains("完整一章") {
+            return chapter_next_length_prompt(pending.chapter, instr);
+        }
+        if instr.contains("收束") {
+            return format!(
+                "第{}章剧情收束未通过，未发布。请选择：修正本章；也可点「其他」说明要求。",
+                pending.chapter
+            );
+        }
+        return chapter_next_hard_rule_prompt(pending.chapter, instr);
+    }
+    format!(
+        "第{}章因硬规则未发布。请选择：修正本章；也可点「其他」说明要求。",
+        pending.chapter
+    )
 }
 
 fn load_chapter_audit_brief(
@@ -10447,11 +10994,91 @@ mod tests {
     }
 
     #[test]
+    fn clean_publish_requires_published_without_hard_flags() {
+        let ok = json!({
+            "published": true,
+            "blocked": false,
+            "content_rule_blocked": false,
+            "consistency_passed": true
+        });
+        assert!(write_result_is_clean_publish("continue_writing", &ok));
+        assert!(write_result_is_clean_publish("revise_chapter", &ok));
+        assert!(!write_result_is_clean_publish("audit_chapter", &ok));
+        assert!(!write_result_is_clean_publish(
+            "continue_writing",
+            &json!({"published": false})
+        ));
+        assert!(!write_result_is_clean_publish(
+            "continue_writing",
+            &json!({"published": true, "content_rule_blocked": true})
+        ));
+        assert!(!write_result_is_clean_publish(
+            "continue_writing",
+            &json!({"published": true, "consistency_passed": false})
+        ));
+    }
+
+    #[test]
     fn length_prompt_mentions_expand() {
         let p = chapter_next_length_prompt(3, "正文字数 4200，低于硬门控 4500");
         assert!(p.contains("第3章"));
         assert!(p.contains("字数"));
         assert!(p.contains("修正本章"));
+    }
+
+    #[test]
+    fn hard_rule_prompt_surfaces_daypart_regression() {
+        let msg = "完成，但有 1 条硬规则阻断（本章未发布）\n\
+1. 章内时段叙述回跳：约第5行已到「夜晚」，约第9行又写「凌晨」。";
+        let p = chapter_next_hard_rule_prompt(5, msg);
+        assert!(p.contains("时段叙述回跳"), "got: {p}");
+        assert!(p.contains("夜晚"));
+        assert!(!p.contains("如正文「第N章」"));
+        assert!(
+            !p.contains("禁名 / 管线用语"),
+            "must not laundry-list unrelated rules: {p}"
+        );
+    }
+
+    #[test]
+    fn hard_rule_prompt_empty_detail_is_generic_not_laundry() {
+        let p = chapter_next_hard_rule_prompt(3, "完成，但有硬规则阻断");
+        assert!(p.contains("第3章因硬规则未发布"));
+        assert!(!p.contains("时段回跳 / 倒计时回跳"));
+        assert!(!p.contains("禁名"));
+    }
+
+    #[test]
+    fn pending_prompt_reuses_gate_prompt() {
+        let pending = PendingChapterNext {
+            project: "sample-novel".into(),
+            chapter: 4,
+            published: false,
+            plot_accept_open: false,
+            suggest_next: None,
+            revise_instructions: None,
+            gate_prompt: Some(
+                "第4章因硬规则未发布：\n· 章内时段叙述回跳：夜晚→凌晨\n\n请选择：修正本章；也可点「其他」说明要求。"
+                    .into(),
+            ),
+        };
+        let p = pending_chapter_next_prompt(&pending);
+        assert!(p.contains("夜晚→凌晨"), "got: {p}");
+        assert!(!p.contains("禁名"));
+    }
+
+    #[test]
+    fn looks_like_hard_rule_covers_timeline_and_meta() {
+        assert!(looks_like_hard_rule_detail(
+            "正文出现章号元叙述「第8章」（约第3行）"
+        ));
+        assert!(looks_like_hard_rule_detail(
+            "章内时段叙述回跳：约第5行已到「夜晚」，约第9行又写「凌晨」。"
+        ));
+        assert!(looks_like_hard_rule_detail(
+            "章内倒计时/剩余时长回跳：约第2行「还剩/剩余 ≈ 10秒」"
+        ));
+        assert!(!looks_like_hard_rule_detail("如何处理：选择「修正本章」"));
     }
 
     #[test]

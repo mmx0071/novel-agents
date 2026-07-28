@@ -11,7 +11,7 @@ mod md;
 mod migrate;
 mod plot;
 
-pub use arc::{display_arc_outline, validate_arc_outline};
+pub use arc::{display_arc_outline, normalize_arc_outline_input, validate_arc_outline};
 pub use bible::{display_bible, validate_bible};
 pub use chapter_outline::{
     display_chapter_outline, outline_entity_roster, parse_chapter_outline_text,

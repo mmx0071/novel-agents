@@ -18,13 +18,13 @@
 |------|------|
 | Web `PUT /content` / 手工编辑 | **硬拒**：不合 schema 不写入 |
 | 流水线 `writer` | **先保留再修正**：落盘 → 归一 → 必要时修形 → 仍不合则拦发布 |
-| 发布门控 | 正文须通过严格 `validate_draft`（含 ≥800 字等） |
+| 发布门控 | 正文须通过 `validate_draft`（结构）+ `chapter.yaml` 字数硬门（默认 ≥4500 正文）+ 一致性/硬规则 |
 
 ## 各页签格式
 
 | 页签 | 落盘 | 格式要点 |
 |------|------|----------|
-| 正文 | `chapters/NNN/draft.md` | 首行 `# 第N章 …`；正文≥800字；禁止整篇 \`\`\`json |
+| 正文 | `chapters/NNN/draft.md` | 首行 `# 第N章 …`；结构校验见 `validate_draft`；发布字数见 `chapter.yaml`（默认硬门 ≥4500）；禁止整篇 \`\`\`json |
 | 章纲 | `chapters/NNN/outline.json` | JSON 必填见 content-formats；推荐 `items[]`/`locations[]`；Web 由 `display_chapter_outline` 渲染；Agent 用 `revise_outline` 修订（预览确认） |
 | 总纲 | `artifacts/master_outline.md` | H2：`一句话卖点`、`三幕结构`/`分卷`、`主角弧`、`主线冲突` |
 | 剧情卡 | `plots/*.md` | FM：`title, scope=local, plot_type, status, needs_bridge`；H2：概览/剧情走向/冲突与赌注/出场人物/收束条件 |
