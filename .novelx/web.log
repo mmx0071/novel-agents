@@ -1,8 +1,0 @@
-2026-07-29T03:30:58.056756Z  INFO novelx_llm: LLM profile loaded profile=prod model=deepseek-v4-pro
-2026-07-29T03:30:58.056800Z  INFO novelx_llm: LLM client ready env=DEEPSEEK_API_KEY model=deepseek-v4-pro base=https://api.deepseek.com/v1 tasks=7
-2026-07-29T03:30:58.062574Z  INFO novelx_core::intent: studio intents loaded count=13
-2026-07-29T03:30:58.063536Z  INFO novelx_core::gates: studio gates loaded count=16
-2026-07-29T03:30:58.063898Z  INFO novelx_core::features: studio features loaded count=20
-2026-07-29T03:30:58.064235Z  INFO novelx_harness::policies: studio policies loaded
-2026-07-29T03:30:58.064944Z  INFO novelx_app_server: serving web UI from /Users/xiongchongyang/Projects/novel-agents/web/dist
-2026-07-29T03:30:58.065066Z  INFO novelx_app_server: NovelX listening on http://127.0.0.1:8765

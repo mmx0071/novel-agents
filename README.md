@@ -66,6 +66,22 @@ cd web && npm install && npm run dev
 
 生产可先 `cd web && npm run build`，再只启 `novel web`（静态资源由 axum 托管）。
 
+一键重启（编译 CLI + `web` dist，杀旧进程后启动）：
+
+```bash
+# macOS / Linux
+./scripts/restart.sh
+./scripts/restart.sh --quick      # 不编译
+./scripts/restart.sh --daemon     # 后台，日志 .novelx/web.log
+```
+
+```powershell
+# Windows（PowerShell；若被策略拦截：Set-ExecutionPolicy -Scope CurrentUser RemoteSigned）
+.\scripts\restart.ps1
+.\scripts\restart.ps1 -Quick
+.\scripts\restart.ps1 -Daemon
+```
+
 ## LLM 配置
 
 1. 复制 `.env.example` → `.env`，填入 `DEEPSEEK_API_KEY`

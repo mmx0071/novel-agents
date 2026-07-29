@@ -1,8 +1,11 @@
 .env
 .cache/
 
+# Runtime (web pid/log, local server state)
+.novelx/
+
 # Rust
-/target/
+target/
 
 # Web
 web/node_modules/
