@@ -1,6 +1,7 @@
 # Studio deterministic intents (thin matcher in Rust).
 # Higher priority wins. Unmatched / enabled:false → LLM tool loop (more agentic).
-# Keep enabled only for high-confidence write/ops; query/design/audit fall through.
+# Keep enabled for high-confidence write/ops + single-chapter audit (desk CTA「审校第N章」).
+# Softer query/design/volume-audit stay disabled → LLM multi-step.
 version: 1
 
 intents:
@@ -63,10 +64,10 @@ intents:
       - 卷末复盘
       - 写第
 
-  # 「审校第9章 / 检阅第九章」→ audit_chapter
+  # 「审校第9章 / 检阅第九章」→ audit_chapter（写作台 CTA / 偏好「审校最近章」）
   - id: audit_one
     tool: audit_chapter
-    enabled: false
+    enabled: true
     priority: 80
     require_project: true
     extract: chapter
@@ -86,6 +87,8 @@ intents:
       - 卷末复盘
       - 复盘
       - 继续
+      - 到第
+      - 至第
 
   # 「对照剧情卡到哪了 / 剧情进度 / 第N卷进行到哪了」→ list_plots（内嵌精简项目状态），禁止续写
   - id: plot_status

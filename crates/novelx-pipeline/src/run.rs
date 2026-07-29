@@ -106,6 +106,9 @@ pub struct PipelineRun {
     /// Hard content rules (banned names / meta「第N章」) blocked publish.
     #[serde(default)]
     pub content_rule_blocked: bool,
+    /// Structured hard-rule hits for Studio chapter_next prompts (blocking + warnings).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content_rule_violations: Vec<ContentRuleViolation>,
     /// Studio should present fix options (audit fail / gate await / volume end).
     #[serde(default)]
     pub needs_user_choice: bool,
@@ -427,6 +430,7 @@ pub async fn execute_pipeline_with_steps(
         issues: Vec::new(),
         published: false,
         content_rule_blocked: false,
+        content_rule_violations: Vec::new(),
         needs_user_choice: false,
         volume_ended: None,
         volume_ended_name: None,
@@ -1291,6 +1295,7 @@ pub async fn execute_pipeline_with_steps(
 
     let banned_blocking = has_blocking_violation(&violations);
     run.content_rule_blocked = banned_blocking;
+    run.content_rule_violations = violations.clone();
     let publish_ok = allow_publish
         && should_publish(consistency_passed, has_blocking || await_human)
         && !banned_blocking;

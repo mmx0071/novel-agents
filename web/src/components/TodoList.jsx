@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 
 /**
- * Codex-style progressive todo list:
+ * Progressive audit todo list:
  * pending · in_progress · completed — exactly one in_progress while active.
  * Collapsible so long audit queues don't bury the chat.
  */
@@ -41,7 +41,7 @@ export default function TodoList({ todos }) {
         title={collapsed ? '展开待办' : '收起待办'}
       >
         <span className="nx-todo-chevron" aria-hidden="true">{collapsed ? '▸' : '▾'}</span>
-        <span className="nx-todo-title">Todos</span>
+        <span className="nx-todo-title">审阅清单</span>
         <span className="nx-todo-summary">{summary}</span>
       </button>
       {!collapsed && (

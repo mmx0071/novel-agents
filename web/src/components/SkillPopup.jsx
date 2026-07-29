@@ -33,10 +33,10 @@ export default function SkillPopup({
   if (!open) return null
 
   return (
-    <div className="nx-skill-popup" ref={ref} role="listbox" aria-label="Skills">
-      <div className="nx-skill-popup-hint">Skills · 选中后插入 $name</div>
+    <div className="nx-skill-popup" ref={ref} role="listbox" aria-label="能力列表">
+      <div className="nx-skill-popup-hint">能力 · 选中后插入 $name</div>
       {list.length === 0 ? (
-        <div className="nx-skill-empty">无匹配 skill</div>
+        <div className="nx-skill-empty">无匹配能力</div>
       ) : (
         list.map((s) => (
           <button

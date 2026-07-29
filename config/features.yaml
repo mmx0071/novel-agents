@@ -27,8 +27,6 @@ features:
   studio.require_mutation_confirm: true
   # After mutating tools apply: scan dependent artifacts and offer cascade revise gate.
   studio.impact_cascade: true
-  # Optional LLM refine of impact hits (default off; deterministic scan is enough for P0/P1).
-  studio.impact_llm_refine: false
   # After a plot card completes: run setting_auditor巡检；无 BLOCKER 时轻量 sync（不改 volume_phase）。
   # 若同时命中卷末，则跳过轻量 sync，留给 sync_volume 门控。
   studio.plot_setting_pass: true
@@ -50,3 +48,6 @@ features:
   studio.require_volume_audit_handoff: true
   # When true, completed-volume drafts may be gzip-archived off the hot path.
   studio.cold_archive_drafts: true
+  # Append-only decision/execution audit trail at projects/<name>/.novelx/ops_journal.jsonl
+  # (tools, gates, mutations, pipeline/publish). Survives chat history reset.
+  studio.ops_journal: true

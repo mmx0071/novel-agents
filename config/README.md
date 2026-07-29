@@ -8,7 +8,7 @@
 |-------------|------|----------|
 | `content_rules.yaml` | Web「硬规则」或手工编辑 | Rust 只做通用扫描；`enabled=false` 跳过扫描；`blocking=false` 仅警告不挡发布；词表 / 阈值 / 文案在 YAML |
 | `naming_rules.yaml` | Web「禁名」 | 禁名匹配与取名原则注入 prompt |
-| `policies.yaml` | Web API / 手工 | Studio 意图短语、扩写判定等；PUT 后内存热重载 |
+| `policies.yaml` | HTTP API / 手工（Web ConfigPanel 无 Tab） | Studio 意图短语、扩写判定等；PUT 后内存热重载 |
 | `skills/**` | Web「Skills」（仅框架 skill） | Agent 提示正文；PUT 后 `reload_skills` |
 | `llm.yaml` | Web「模型」结构化表单或手工编辑 | Provider / 任务模型 / profile / 重试；PUT 后热重载 |
 | `gates.yaml` / `features.yaml` / `intents.yaml` | 磁盘编辑（本期无表单） | 门控、特性开关、意图路由 |
@@ -22,12 +22,32 @@ API Key 只写入仓库根 `.env`（gitignore），**不进** `llm.yaml`。`GET 
 
 - `GET/PUT /api/config/content_rules` · `PUT /api/config/content_rules/flags`（切换单条 enabled/blocking）
 - `GET/PUT /api/config/naming_rules`
-- `GET/PUT /api/config/policies`
+- `GET/PUT /api/config/policies`（HTTP/手工；Web ConfigPanel 无 Tab）
 - `GET/PUT /api/config/llm`（结构化 JSON；Key 只写不读）
 - `GET /api/skills/list` · `GET/PUT /api/skills/{name}`（PUT 拒绝 `projects/` 下的 project-skill）
 
 路径均限制在 `config/` 下，防止目录穿越。
 
+### CLI / API-only（Web 未接 UI）
+
+下列路由保留给脚本与 HTTP 客户端，**不删实现**；当前 Web 前端不调用：
+
+| 路由 | 说明 |
+|------|------|
+| `GET/PUT /api/config/policies` | 改 `policies.yaml`；Web 配置页无 policies Tab |
+| `GET /api/projects/{name}/ops_journal` | 操作审计查询；主入口为 CLI `novel ops-log` |
+| `POST /api/thread/resume` | HTTP 恢复线程；Web 走 `POST /api/thread/start` |
+| `POST /api/turn/steer` | HTTP mid-turn steer；Web 走 WS + 工具 `steer_run` |
+
 ## 与作品数据的边界
 
 具体小说内容只在 `projects/<name>/`。本目录保持题材中立，不写死某一本书的角色或地名。
+
+## 操作审计 vs 内容审校
+
+| 概念 | 路径 / 开关 | 用途 |
+|------|-------------|------|
+| **ops journal**（决策/执行审计） | `projects/<name>/.novelx/ops_journal.jsonl`；`studio.ops_journal` | 回放工具、门控、mutation、发布等「发生了什么」；append-only，清聊天不删。`audit_report` kind ≠ `publish_result` |
+| **consistency audit**（内容审校） | `chapters/NNN/audit.json`、`audit_queue`；`audit_tier` | 正文一致性检查结果，不是系统操作日志 |
+
+查询：`novel ops-log <project>` 或 `GET /api/projects/{name}/ops_journal`。

@@ -50,6 +50,13 @@ pub fn new_mutation_id() -> String {
     format!("mut_{}", Uuid::new_v4().simple())
 }
 
+fn preview_has_text_diffs(preview: &Value) -> bool {
+    preview
+        .get("diffs")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty())
+}
+
 /// Build a confirm-required tool result (no disk write).
 pub fn preview_mutation(
     kind: &str,
@@ -63,8 +70,15 @@ pub fn preview_mutation(
         obj.insert("apply".into(), Value::Bool(true));
         obj.insert("mutation_id".into(), Value::String(mutation_id.clone()));
     }
+    let output = if preview_has_text_diffs(&preview) {
+        format!(
+            "⏸ 修订预览：{summary}\n\n请对照原文与修订（写作台「修订对照」或聊天 diff 卡），确认后选「应用修改」落盘，或「放弃」。"
+        )
+    } else {
+        format!("⏸ 待确认：{summary}\n\n请查看预览后选「应用修改」落盘，或「放弃」。")
+    };
     ToolResult {
-        output: format!("⏸ 待确认：{summary}\n\n请在审批卡选择「应用修改」或「放弃」。"),
+        output,
         data: json!({
             "needs_confirm": true,
             "mutation_id": mutation_id,
@@ -110,4 +124,38 @@ pub fn with_confirm_skip(mut args: Value) -> Value {
         obj.insert("confirm_skip".into(), Value::Bool(true));
     }
     args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_with_diffs_mentions_desk_diff() {
+        let r = preview_mutation(
+            "revise_local",
+            "第1章局部修订（1 处）",
+            json!({
+                "diffs": [{ "before": "a", "after": "b" }],
+            }),
+            "revise_chapter",
+            json!({ "project": "sample-novel", "chapter": 1 }),
+        );
+        assert!(r.output.contains("修订预览"));
+        assert!(r.output.contains("修订对照") || r.output.contains("diff"));
+        assert!(!r.output.starts_with("⏸ 待确认："));
+    }
+
+    #[test]
+    fn preview_without_diffs_uses_generic_confirm_copy() {
+        let r = preview_mutation(
+            "update_plot",
+            "更新剧情卡",
+            json!({ "fields": { "status": "active" } }),
+            "update_plot",
+            json!({ "project": "sample-novel" }),
+        );
+        assert!(r.output.starts_with("⏸ 待确认："));
+        assert!(!r.output.contains("写作台「修订对照」"));
+    }
 }

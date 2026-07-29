@@ -23,7 +23,7 @@ const TABS = [
   { id: 'llm', label: '模型' },
   { id: 'rules', label: '硬规则' },
   { id: 'naming', label: '禁名' },
-  { id: 'skills', label: 'Skills' },
+  { id: 'skills', label: '能力包' },
 ]
 
 const EMPTY_LLM = {
@@ -35,7 +35,7 @@ const EMPTY_LLM = {
   retry: { max_retries: 3, base_delay_ms: 800, max_delay_ms: 10000 },
 }
 
-export default function ConfigPanel() {
+export default function ConfigPanel({ onClose, title = '引擎室' }) {
   const [tab, setTab] = useState('llm')
   const [yaml, setYaml] = useState('')
   const [catalog, setCatalog] = useState([])
@@ -212,7 +212,7 @@ export default function ConfigPanel() {
       setError(data.error || '保存失败')
       return
     }
-    setStatus('已保存并热重载 Skills')
+    setStatus('已保存并热重载能力包')
   }
 
   async function saveLlm() {
@@ -297,8 +297,19 @@ export default function ConfigPanel() {
   return (
     <section className="panel config-panel">
       <div className="config-head">
-        <h2>配置</h2>
-        <p className="side-hint">编辑模型、硬规则、禁名与 Skills；落盘后热重载，无需重启。</p>
+        <div className="config-head-row">
+          <h2>{title}</h2>
+          {typeof onClose === 'function' ? (
+            <button
+              type="button"
+              className="btn-ghost btn-inline"
+              onClick={onClose}
+            >
+              关闭
+            </button>
+          ) : null}
+        </div>
+        <p className="side-hint">模型、硬规则、禁名与能力包；落盘后热重载。写作台手稿不会被替换。</p>
       </div>
 
       <div className="panel-tabs" role="tablist">
@@ -324,7 +335,7 @@ export default function ConfigPanel() {
         <div className="config-body config-llm">
           <div className="config-llm-grid">
             <label className="config-field">
-              <span className="config-label">Profile</span>
+              <span className="config-label">配置档</span>
               <select
                 value={llm.profile}
                 onChange={(e) => setLlm((p) => ({ ...p, profile: e.target.value }))}
@@ -588,7 +599,7 @@ export default function ConfigPanel() {
               <div className="config-muted">
                 {skillMeta.path}
                 {skillMeta.description ? ` · ${skillMeta.description}` : ''}
-                {!skillEditable ? ' · 只读（项目 Skill）' : ''}
+                {!skillEditable ? ' · 只读（项目能力包）' : ''}
               </div>
             ) : null}
             <textarea
@@ -597,7 +608,7 @@ export default function ConfigPanel() {
               onChange={(e) => setSkillContent(e.target.value)}
               spellCheck={false}
               disabled={!skillEditable}
-              aria-label="Skill 正文"
+              aria-label="能力包正文"
             />
             <div className="config-actions">
               <button type="button" onClick={() => loadSkill(skillName)} disabled={loading || saving}>

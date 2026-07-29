@@ -963,7 +963,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "chrono",
  "futures-util",
  "novelx-core",
  "novelx-harness",
@@ -976,7 +975,6 @@ dependencies = [
  "tokio",
  "tower-http",
  "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -990,6 +988,7 @@ dependencies = [
  "novelx-harness",
  "novelx-llm",
  "novelx-pipeline",
+ "novelx-protocol",
  "serde_json",
  "tokio",
  "tracing",
@@ -1024,19 +1023,16 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "thiserror",
 ]
 
 [[package]]
 name = "novelx-harness"
 version = "0.1.0"
 dependencies = [
- "novelx-draft-patch",
  "regex",
  "serde",
  "serde_json",
  "serde_yaml",
- "thiserror",
  "tracing",
 ]
 
@@ -1063,8 +1059,6 @@ name = "novelx-pipeline"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
- "chrono",
  "flate2",
  "novelx-draft-patch",
  "novelx-harness",
@@ -1075,7 +1069,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "thiserror",
  "tokio",
  "tracing",
  "uuid",
@@ -1118,7 +1111,6 @@ dependencies = [
  "novelx-skills",
  "serde",
  "serde_json",
- "thiserror",
  "tokio",
  "tracing",
  "uuid",

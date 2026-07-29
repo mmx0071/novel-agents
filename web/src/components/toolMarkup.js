@@ -75,8 +75,8 @@ export function isBulkContextTool(name) {
 /** Strip legacy “详见右侧…” suffixes from server/cache lines. */
 function stripReaderHint(s) {
   return String(s || '')
-    .replace(/[·•]\s*详见右侧阅读区/g, '')
-    .replace(/详见右侧阅读区/g, '')
+    .replace(/[·•]\s*详见右侧(?:阅读区|写作台)/g, '')
+    .replace(/详见右侧(?:阅读区|写作台)/g, '')
     .trim()
 }
 

@@ -7,8 +7,8 @@ export default function MutationPreviewCard({ item }) {
   return (
     <div className={`nx-card nx-mutation-preview nx-status-${item.status || 'completed'}`}>
       <div className="nx-card-head">
-        <span className="nx-card-kind">预览</span>
-        <span className="nx-card-title">{item.kind || 'mutation'}</span>
+        <span className="nx-card-kind">变更预览</span>
+        <span className="nx-card-title">{item.kind || '变更'}</span>
       </div>
       {fields ? (
         <pre className="nx-card-output">{JSON.stringify(fields, null, 2)}</pre>

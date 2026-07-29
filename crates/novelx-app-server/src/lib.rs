@@ -2,12 +2,13 @@
 
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::response::{Html, IntoResponse, Json, Response};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::routing::{get, post, put};
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
+use novelx_core::ops_journal::{self, OpsJournalQuery};
 use novelx_core::NovelxCore;
 use novelx_harness::{ContentRulesConfig, NamingRules, StudioPolicies};
 use novelx_llm::{
@@ -31,7 +32,7 @@ use novelx_pipeline::schemas::{
     parse_chapter_outline_text, validate_arc_outline, validate_bible, validate_draft,
     validate_entity_body_edit, validate_master_outline, validate_plot_card_body_edit, EntityKind,
 };
-use novelx_protocol::{EventMsg, Op};
+use novelx_protocol::{EventMsg, Op, OpsJournalKind};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -151,6 +152,10 @@ pub async fn serve(repo_root: PathBuf, addr: SocketAddr) -> Result<()> {
         .route("/api/library/{name}", get(library_one).delete(library_delete))
         .route("/api/projects/{name}/preview", get(preview))
         .route("/api/projects/{name}/content", put(project_content_put))
+        .route(
+            "/api/projects/{name}/ops_journal",
+            get(ops_journal_get),
+        )
         .route(
             "/api/projects/{name}/chapters/{chapter}",
             get(chapter_get).delete(chapter_delete),
@@ -1213,6 +1218,74 @@ async fn library_one(State(state): State<AppState>, Path(name): Path<String>) ->
 
 async fn preview(State(state): State<AppState>, Path(name): Path<String>) -> impl IntoResponse {
     Json(build_preview(&state.repo_root, &name))
+}
+
+#[derive(Debug, Deserialize)]
+struct OpsJournalGetQuery {
+    #[serde(default = "default_ops_journal_limit")]
+    limit: usize,
+    #[serde(default)]
+    chapter: Option<u32>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    after: Option<String>,
+}
+
+fn default_ops_journal_limit() -> usize {
+    200
+}
+
+async fn ops_journal_get(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(q): Query<OpsJournalGetQuery>,
+) -> impl IntoResponse {
+    let dir = state.repo_root.join("projects").join(&name);
+    if !dir.is_dir() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("项目「{name}」不存在"),
+            })),
+        )
+            .into_response();
+    }
+    let kind = match q.kind.as_deref() {
+        None | Some("") => None,
+        Some(s) => match OpsJournalKind::parse(s) {
+            Some(k) => Some(k),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": format!("未知 kind：{s}"),
+                    })),
+                )
+                    .into_response();
+            }
+        },
+    };
+    let limit = q.limit.clamp(1, 2000);
+    let entries = ops_journal::query_entries(
+        &state.repo_root.join("projects"),
+        &name,
+        &OpsJournalQuery {
+            limit,
+            chapter: q.chapter,
+            kind,
+            after: q.after,
+        },
+    );
+    Json(serde_json::json!({
+        "ok": true,
+        "project": name,
+        "count": entries.len(),
+        "entries": entries,
+    }))
+    .into_response()
 }
 
 #[derive(Debug, Deserialize)]

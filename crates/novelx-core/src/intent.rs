@@ -365,8 +365,17 @@ mod tests {
         assert_eq!(w.args["chapter"], 10);
         assert_eq!(w.clear_history, ClearHistory::OnStart);
 
-        // Soft intents disabled → fall through to LLM (more agentic).
-        assert!(r.match_text("检阅第九章", Some("demo")).is_none());
+        // Single-chapter audit is deterministic (desk CTA「审校第N章」).
+        let audit = r.match_text("审校第5章", Some("demo")).unwrap();
+        assert_eq!(audit.id, "audit_one");
+        assert_eq!(audit.tool, "audit_chapter");
+        assert_eq!(audit.args["chapter"], 5);
+        assert_eq!(audit.args["project"], "demo");
+        let audit_cn = r.match_text("检阅第九章", Some("demo")).unwrap();
+        assert_eq!(audit_cn.tool, "audit_chapter");
+        assert_eq!(audit_cn.args["chapter"], 9);
+
+        // Softer / multi-step intents stay disabled → LLM.
         assert!(r.match_text("审阅1-8章", Some("demo")).is_none());
         assert!(r.match_text("审这一卷", Some("demo")).is_none());
         assert!(r.match_text("对照剧情卡 现在到哪了", Some("demo")).is_none());
@@ -380,6 +389,7 @@ mod tests {
 
         assert!(r.match_text("今天天气不错", Some("demo")).is_none());
         assert!(r.match_text("写第10章", None).is_none());
+        assert!(r.match_text("审校第5章", None).is_none());
 
         // Composite handoff / setup tasks must not collapse into continue_writing.
         assert!(r

@@ -7,4 +7,5 @@ alwaysApply: true
 
 - 不得在 `crates/**`、`web/**`、`config/**` 中写死某一本小说的书名、角色、势力、地名或专属梗概。
 - 样例内容只放在 `projects/<name>/`；测试用 `sample-novel` / `主角` 等中性占位。
-- 完整条款见 `.cursor/skills/novelx-dev/SKILL.md`。
+- 行为改动优先 `config/features.yaml` / `gates.yaml` / `intents.yaml` / schemas，勿硬编码中文特判。
+- 完整开发规范见 `.cursor/skills/novelx-dev/SKILL.md`（细节 [reference.md](.cursor/skills/novelx-dev/reference.md)）。

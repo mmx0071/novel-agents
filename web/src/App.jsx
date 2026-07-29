@@ -11,7 +11,23 @@ import {
 import NovelXChat from './components/NovelXChat'
 import MarkdownView from './components/MarkdownView'
 import ConfigPanel from './components/ConfigPanel'
+import VolumeWorkspace from './components/VolumeWorkspace'
+import WritingPrefs from './components/WritingPrefs'
 import { buildVolumePlotGroups, sortPlotsByProgress } from './plotSort'
+import {
+  STAGE_ORDER,
+  buildCreateNovelMessage,
+  deriveStudioStage,
+  resolveStudioCta,
+} from './studioPhase'
+import {
+  CHAPTER_WORD_HARD_MIN,
+  CHAPTER_WORD_MAX,
+  CHAPTER_WORD_MIN,
+  wordProgressLabel,
+  wordProgressTone,
+} from './chapterTargets'
+import { pickActivePlot, summarizePlotForDesk } from './plotSummary'
 
 const API = '/api'
 const initialCache = typeof window !== 'undefined' ? loadStudioCache() : migrateCache(null)
@@ -157,7 +173,7 @@ function formatExpectedEvent(e) {
     + `- **最近检阅**：拟合 ${fit} · ${reason}\n`
     + (suggestion ? `- **建议做法**：${suggestion}\n` : '')
     + (e.notes ? `\n## 备注\n\n${e.notes}\n` : '')
-    + '\n> 只读展示。纳入/跳过请在对话审批卡操作；落地用设定/剧情工具后 resolve。\n'
+    + '\n> 只读展示。纳入或跳过请在右侧创作助手中选择；确认后再由设定/剧情工具落地。\n'
   )
 }
 
@@ -194,8 +210,9 @@ function formatPlotCard(p) {
 }
 
 export default function App() {
-  /** `library` = 书库创作；`config` = 硬规则 / Skills */
+  /** `library` = 书库；`prefs` = 写作偏好；引擎室用 engineOpen 抽屉 */
   const [appMode, setAppMode] = useState('library')
+  const [engineOpen, setEngineOpen] = useState(false)
   const [library, setLibrary] = useState([])
   const [novelRecord, setNovelRecord] = useState(null)
   const [project, setProject] = useState(initialProject)
@@ -214,6 +231,22 @@ export default function App() {
   const [readerEditError, setReaderEditError] = useState('')
   const [chatSetupGateOpen, setChatSetupGateOpen] = useState(false)
   const [foreshadowDebtExpanded, setForeshadowDebtExpanded] = useState(false)
+  const [showNewNovelForm, setShowNewNovelForm] = useState(false)
+  const [newNovelTitle, setNewNovelTitle] = useState('')
+  const [newNovelGenre, setNewNovelGenre] = useState('')
+  const [newNovelBrief, setNewNovelBrief] = useState('')
+  const [newNovelBusy, setNewNovelBusy] = useState(false)
+  const [deskPatches, setDeskPatches] = useState([])
+  const [deskPatchFocus, setDeskPatchFocus] = useState(null)
+  const [deskPatchHidden, setDeskPatchHidden] = useState(false)
+  const [plotRailOpen, setPlotRailOpen] = useState(false)
+  const [auditState, setAuditState] = useState({
+    todos: [],
+    reports: [],
+    latest: null,
+    openApproval: null,
+  })
+  const [chatBusy, setChatBusy] = useState(false)
   const chatSendRef = useRef(null)
   const workspacesRef = useRef(initialCache.projectSessions || {})
   const currentProjectRef = useRef(initialProject)
@@ -298,7 +331,8 @@ export default function App() {
       (data.preview?.arc_outlines?.length || data.preview?.plots?.length)
       && !data.preview?.chapters?.length
     ) {
-      setReaderTab('arcs')
+      // No chapters yet — land on volume workspace, not raw arc strip.
+      setReaderTab('volume')
     } else {
       setReaderTab('draft')
     }
@@ -365,6 +399,143 @@ export default function App() {
   const handleChatPreviewRefresh = useCallback((name, opts) => {
     if (name) refreshPreview(name, opts)
   }, [refreshPreview])
+
+  const handleProjectBound = useCallback(async (name) => {
+    const id = String(name || '').trim()
+    if (!id) return
+    setShowNewNovelForm(false)
+    setNewNovelBusy(false)
+    await refreshLibrary()
+    await selectProject(id, 'master')
+  }, [refreshLibrary, selectProject])
+
+  const deskPatchesRef = useRef([])
+  // Keep audit snapshot for top「下一步」alignment only (no bottom audit dock).
+  const handleAuditStateChange = useCallback((state) => {
+    setAuditState(state || { todos: [], reports: [], latest: null, openApproval: null })
+  }, [])
+
+  const handleDraftPatchesChange = useCallback((patches, opts = {}) => {
+    const list = Array.isArray(patches) ? patches : []
+    const prevSig = deskPatchesRef.current
+      .map((p) => `${p.chapter}:${p.start_para}:${p.before}`)
+      .join('|')
+    const nextSig = list.map((p) => `${p.chapter}:${p.start_para}:${p.before}`).join('|')
+    const arrived = list.length && prevSig !== nextSig
+    deskPatchesRef.current = list
+    setDeskPatches(list)
+    if (opts.focus || arrived) {
+      setDeskPatchHidden(false)
+    }
+    if (opts.focus) {
+      setDeskPatchFocus(opts.focus)
+      const ch = Number(opts.focus.chapter) || 0
+      if (ch > 0) setSelectedChapter(ch)
+      setReaderTab('draft')
+      return
+    }
+    if (!list.length) {
+      setDeskPatchFocus(null)
+      return
+    }
+    // New revise diffs → jump writing desk to draft so before/after is visible.
+    if (arrived) {
+      const latest = list[list.length - 1]
+      const ch = Number(latest?.chapter) || 0
+      if (ch > 0) setSelectedChapter(ch)
+      setReaderTab('draft')
+      setDeskPatchFocus(latest)
+      return
+    }
+    setDeskPatchFocus((prev) => {
+      if (!prev) return list[list.length - 1]
+      const still = list.find((p) => (
+        Number(p.chapter) === Number(prev.chapter)
+        && Number(p.start_para) === Number(prev.start_para)
+        && String(p.before || '') === String(prev.before || '')
+      ))
+      return still || list[list.length - 1]
+    })
+  }, [])
+
+  const sendChatMessage = useCallback((text, opts) => {
+    if (!text || typeof chatSendRef.current !== 'function') return false
+    return chatSendRef.current(text, opts) !== false
+  }, [])
+
+  const handleChatBusyChange = useCallback((busy) => {
+    setChatBusy(Boolean(busy))
+  }, [])
+
+  const submitNewNovel = useCallback(() => {
+    const title = newNovelTitle.trim()
+    if (!title) {
+      window.alert('请填写书名')
+      return
+    }
+    const msg = buildCreateNovelMessage({
+      title,
+      genre: newNovelGenre,
+      brief: newNovelBrief,
+    })
+    if (project) clearToDraft()
+    setNewNovelBusy(true)
+    setAppMode('library')
+    setNewNovelTitle('')
+    setNewNovelGenre('')
+    setNewNovelBrief('')
+    setShowNewNovelForm(false)
+
+    const startPoll = () => {
+      let tries = 0
+      const poll = window.setInterval(async () => {
+        tries += 1
+        const data = await api('/library')
+        const novels = data.novels || []
+        setLibrary(novels)
+        const hit = novels.find((n) => (
+          n.id === title
+          || n.display_title === title
+          || String(n.display_title || '').includes(title)
+        ))
+        if (hit?.id && hit.id !== project) {
+          window.clearInterval(poll)
+          setNewNovelBusy(false)
+          await selectProject(hit.id, 'master')
+          return
+        }
+        if (tries >= 24) {
+          window.clearInterval(poll)
+          setNewNovelBusy(false)
+        }
+      }, 1500)
+    }
+
+    // Chat may rebind sendRef after clearing project — retry briefly.
+    let attempt = 0
+    const trySend = () => {
+      if (sendChatMessage(msg)) {
+        startPoll()
+        return
+      }
+      attempt += 1
+      if (attempt < 12) {
+        window.setTimeout(trySend, 200)
+        return
+      }
+      setNewNovelBusy(false)
+      window.alert('创作助手尚未就绪，请稍后再试或直接在右侧输入')
+    }
+    window.setTimeout(trySend, 120)
+  }, [
+    clearToDraft,
+    newNovelBrief,
+    newNovelGenre,
+    newNovelTitle,
+    project,
+    selectProject,
+    sendChatMessage,
+  ])
 
   useEffect(() => { refreshLibrary() }, [refreshLibrary])
 
@@ -460,7 +631,10 @@ export default function App() {
 
   const storyOutline = preview?.story_outline
   const nextChapter = novelRecord?.next_chapter ?? (preview?.chapters?.length || 0) + 1
-  const publishedSet = new Set((preview?.chapters || []).map((c) => c.number))
+  const publishedCount = Number(
+    novelRecord?.published_count ?? preview?.published_count ?? 0,
+  ) || 0
+  const isChapterPublished = (n) => Number(n) > 0 && Number(n) <= publishedCount
   // bible.md is canonical; world_architect.md is legacy dual-write — show one「世界观」tab.
   // master_outline.md is the only「总纲」surface (story_outline.json is internal acts store).
   // nomenclature overlaps 人物/物品/地点 entity cards — hide from reader.
@@ -490,6 +664,7 @@ export default function App() {
   const volumeGroups = buildVolumePlotGroups(arcOutlines, plots)
   const isArcNav = readerTab === 'arcs' || readerTab === 'plots'
   const isExpectedNav = readerTab === 'expected'
+  const isVolumeWorkspace = readerTab === 'volume'
 
   const activeVolumeGroup = (() => {
     if (!volumeGroups.length) return null
@@ -598,11 +773,64 @@ export default function App() {
     }
   }, [readerTab, readerCardKeysSig, readerCardKey, readerVolume])
 
-  const chapterList = (preview?.chapters || []).map((c) => ({
-    number: c.number,
-    title: c.title,
-    summary: '',
-  }))
+  const chapterList = (preview?.chapters || []).map((c) => {
+    const number = c.number
+    const published = isChapterPublished(number)
+    const hasDraft = !!c.has_draft || (Number(c.body_chars) || 0) > 0
+    let status = 'empty'
+    let statusLabel = '待写'
+    if (published) {
+      status = 'published'
+      statusLabel = '已发布'
+    } else if (hasDraft) {
+      status = 'draft'
+      statusLabel = '草稿'
+    } else if (c.has_outline) {
+      status = 'outline'
+      statusLabel = '有章纲'
+    } else if (number === nextChapter) {
+      status = 'next'
+      statusLabel = '下一章'
+    }
+    return {
+      number,
+      title: c.title,
+      summary: '',
+      hasDraft,
+      hasOutline: !!c.has_outline,
+      bodyChars: Number(c.body_chars) || 0,
+      status,
+      statusLabel,
+    }
+  })
+
+  const selectedChapterStatus = chapterList.find((c) => c.number === selectedChapter)
+
+  const draftBodyChars = (() => {
+    if (readerTab !== 'draft') return 0
+    if (readerEditing) return Array.from(readerEditText || '').length
+    const fromCache = Number(chapterData?.body_chars) || 0
+    if (fromCache > 0) return fromCache
+    const draft = String(chapterData?.draft || '')
+    return draft ? Array.from(draft.replace(/\s+/g, '')).length || draft.length : 0
+  })()
+  const wordTone = wordProgressTone(draftBodyChars)
+  const wordPct = Math.min(100, Math.round((draftBodyChars / CHAPTER_WORD_MIN) * 100))
+  const activePlotSummary = summarizePlotForDesk(pickActivePlot(plots))
+  const visibleDeskPatches = deskPatches.filter((p) => (
+    !selectedChapter || Number(p.chapter) === Number(selectedChapter)
+  ))
+  const activeDeskPatch = (() => {
+    if (!visibleDeskPatches.length) return null
+    if (deskPatchFocus && visibleDeskPatches.some((p) => (
+      Number(p.chapter) === Number(deskPatchFocus.chapter)
+      && Number(p.start_para) === Number(deskPatchFocus.start_para)
+      && String(p.before || '') === String(deskPatchFocus.before || '')
+    ))) {
+      return deskPatchFocus
+    }
+    return visibleDeskPatches[visibleDeskPatches.length - 1]
+  })()
 
   const progressLabel = (() => {
     if (!novelRecord) return ''
@@ -670,6 +898,7 @@ export default function App() {
     chapterList.length
     || artifactTabs.length
     || arcOutlines.length
+    || volumeGroups.length
     || entities.characters?.length
     || entities.items?.length
     || entities.locations?.length
@@ -678,9 +907,11 @@ export default function App() {
     || preview?.artifacts?.master_planner
     || storyOutline?.markdown
     || storyOutline?.acts?.length
+    || project
   )
 
   const readerContent = (() => {
+    if (readerTab === 'volume') return ''
     if (readerTab === 'draft') {
       if (chapterLoading && !chapterData?.draft) return '（加载正文中…）'
       return chapterData?.draft
@@ -763,6 +994,11 @@ export default function App() {
   }, [readerTab, selectedChapter])
 
   const readerTabs = [
+    {
+      id: 'volume',
+      label: '本卷',
+      show: Boolean(volumeGroups.length || project),
+    },
     { id: 'draft', label: '正文', show: Boolean(chapterData) },
     { id: 'outline', label: '章纲', show: Boolean(chapterData) },
     {
@@ -796,15 +1032,62 @@ export default function App() {
     project
     && readerTab
     && readerTab !== 'entity_gaps'
-    && readerTab !== 'expected',
+    && readerTab !== 'expected'
+    && readerTab !== 'volume',
   )
+
+  const currentVolumeGroup = (() => {
+    if (!volumeGroups.length) return null
+    const fromState = volumeHealth?.active_index
+    if (fromState) {
+      const hit = volumeGroups.find((g) => g.volume === fromState)
+      if (hit) return hit
+    }
+    const activePlot = pickActivePlot(plots)
+    if (activePlot) {
+      const vol = Number(activePlot.volume_index || activePlot.arc_index || 0)
+      const hit = volumeGroups.find((g) => g.volume === vol)
+      if (hit) return hit
+    }
+    return volumeGroups[volumeGroups.length - 1]
+  })()
 
   const setupAwaitingConfirm = preview?.setup_phase === 'awaiting_confirm' || chatSetupGateOpen
   const setupOutlineTab = readerTab === 'master'
     || readerTab === 'arcs'
+    || readerTab === 'volume'
     || readerTab === 'art:arc_outline'
     || readerTab === 'art:arc_planner'
   const showSetupConfirmBar = Boolean(project && setupAwaitingConfirm && setupOutlineTab)
+
+  const deskPatchChapter = (() => {
+    const fromFocus = Number(deskPatchFocus?.chapter) || 0
+    if (fromFocus > 0) return fromFocus
+    const last = deskPatches[deskPatches.length - 1]
+    return Number(last?.chapter) || 0
+  })()
+  const deskPatchDockVisible = Boolean(
+    !deskPatchHidden && activeDeskPatch && readerTab === 'draft',
+  )
+  const studioStage = resolveStudioCta(
+    deriveStudioStage(preview, {
+      nextChapter,
+      publishedCount,
+    }),
+    {
+      openApproval: auditState.openApproval,
+      latest: auditState.latest,
+      patchChapter: deskPatchChapter || undefined,
+      reviseAppliedAfterFail: auditState.reviseAppliedAfterFail,
+      reviseChapter: auditState.reviseChapter,
+    },
+  )
+  const showNextCta = Boolean(
+    studioStage.cta
+    && !showSetupConfirmBar
+    // Volume workspace already has a primary write button for the same action.
+    && !(readerTab === 'volume' && studioStage.cta.id === 'write_next'),
+  )
 
   const prevSetupGateRef = useRef(false)
   useEffect(() => {
@@ -815,10 +1098,36 @@ export default function App() {
   }, [project, chatSetupGateOpen])
 
   const sendSetupGate = (actionId) => {
-    if (typeof chatSendRef.current === 'function') {
-      chatSendRef.current(actionId)
-    }
+    if (chatBusy) return
+    sendChatMessage(actionId, { busy: 'ignore' })
   }
+
+  const runStudioCta = () => {
+    const cta = studioStage.cta
+    if (!cta || chatBusy) return
+    if (cta.readerTab) setReaderTab(cta.readerTab === 'plots' ? 'arcs' : cta.readerTab)
+    // Apply: stay on the chapter that has diffs (never jump to phase nextChapter).
+    let chapter = Number(cta.chapter) || 0
+    if (cta.isApply && deskPatchChapter > 0) chapter = deskPatchChapter
+    if (chapter > 0) setSelectedChapter(chapter)
+    // Desk CTAs must not interrupt/restart a running turn on double-click.
+    if (cta.message) sendChatMessage(cta.message, { busy: 'ignore' })
+  }
+
+  // Esc closes engine drawer; lock body scroll while open.
+  useEffect(() => {
+    if (!engineOpen) return undefined
+    const prev = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    const onKey = (e) => {
+      if (e.key === 'Escape') setEngineOpen(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => {
+      document.body.style.overflow = prev
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [engineOpen])
 
   const beginReaderEdit = () => {
     setReaderEditError('')
@@ -964,15 +1273,41 @@ export default function App() {
   return (
     <div className="studio">
       <header className="studio-header">
-        <h1>NovelX</h1>
-        {project && (
-          <div className="header-meta">
-            <span>{novelRecord?.display_title || project}</span>
-            {novelRecord && progressLabel && (
-              <span className="progress-chip">{progressLabel}</span>
-            )}
-          </div>
-        )}
+        <div className="studio-header-left">
+          <h1>NovelX</h1>
+          {project && (
+            <div className="header-meta">
+              <span>{novelRecord?.display_title || project}</span>
+              {novelRecord && progressLabel && (
+                <span className="progress-chip">{progressLabel}</span>
+              )}
+            </div>
+          )}
+        </div>
+        {project && preview ? (
+          <nav className="stage-strip" aria-label="创作阶段">
+            {STAGE_ORDER.map((s, idx) => {
+              const active = studioStage.stageIndex === idx
+              const done = studioStage.stageIndex > idx
+              return (
+                <span
+                  key={s.id}
+                  className={[
+                    'stage-chip',
+                    active ? 'is-active' : '',
+                    done ? 'is-done' : '',
+                  ].filter(Boolean).join(' ')}
+                  title={active ? studioStage.detail : s.label}
+                >
+                  {s.label}
+                </span>
+              )
+            })}
+            {studioStage.detail ? (
+              <span className="stage-detail">{studioStage.detail}</span>
+            ) : null}
+          </nav>
+        ) : null}
       </header>
 
       <div className="studio-grid">
@@ -990,20 +1325,101 @@ export default function App() {
             <button
               type="button"
               role="tab"
-              aria-selected={appMode === 'config'}
-              className={appMode === 'config' ? 'active' : ''}
-              onClick={() => setAppMode('config')}
+              aria-selected={appMode === 'prefs'}
+              className={appMode === 'prefs' ? 'active' : ''}
+              onClick={() => setAppMode('prefs')}
             >
-              配置
+              偏好
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={engineOpen}
+              className={engineOpen ? 'active' : ''}
+              onClick={() => setEngineOpen(true)}
+            >
+              引擎
             </button>
           </div>
+          {appMode === 'prefs' ? (
+            <WritingPrefs
+              project={project}
+              longformHealth={longformHealth}
+              publishedCount={publishedCount}
+              nextChapter={nextChapter}
+              onOpenEngine={() => setEngineOpen(true)}
+              onAuditChapter={(ch) => {
+                setSelectedChapter(ch)
+                setReaderTab('draft')
+                sendChatMessage(`审校第${ch}章`, { busy: 'ignore' })
+              }}
+            />
+          ) : null}
           {appMode === 'library' ? (
             <>
-              <h2 className="side-title">我的</h2>
-              <p className="side-hint">每本小说独立 NovelX 对话，可切换并行创作</p>
+              <div className="side-library-head">
+                <h2 className="side-title">我的</h2>
+                <button
+                  type="button"
+                  className="btn-primary btn-inline btn-new-novel"
+                  onClick={() => setShowNewNovelForm((v) => !v)}
+                  disabled={newNovelBusy}
+                >
+                  {showNewNovelForm ? '收起' : '新建小说'}
+                </button>
+              </div>
+              <p className="side-hint">每本小说独立创作助手会话，可切换并行创作</p>
+              {showNewNovelForm ? (
+                <form
+                  className="new-novel-form"
+                  onSubmit={(e) => {
+                    e.preventDefault()
+                    submitNewNovel()
+                  }}
+                >
+                  <label className="new-novel-field">
+                    <span>书名</span>
+                    <input
+                      type="text"
+                      value={newNovelTitle}
+                      onChange={(e) => setNewNovelTitle(e.target.value)}
+                      placeholder="必填"
+                      autoFocus
+                      disabled={newNovelBusy}
+                    />
+                  </label>
+                  <label className="new-novel-field">
+                    <span>题材</span>
+                    <input
+                      type="text"
+                      value={newNovelGenre}
+                      onChange={(e) => setNewNovelGenre(e.target.value)}
+                      placeholder="可选，如未定"
+                      disabled={newNovelBusy}
+                    />
+                  </label>
+                  <label className="new-novel-field">
+                    <span>灵感</span>
+                    <textarea
+                      value={newNovelBrief}
+                      onChange={(e) => setNewNovelBrief(e.target.value)}
+                      placeholder="一两句卖点或设定方向（可选）"
+                      rows={3}
+                      disabled={newNovelBusy}
+                    />
+                  </label>
+                  <button
+                    type="submit"
+                    className="btn-primary btn-inline"
+                    disabled={newNovelBusy || !newNovelTitle.trim()}
+                  >
+                    {newNovelBusy ? '创建中…' : '开始立项'}
+                  </button>
+                </form>
+              ) : null}
               <ul className="novel-list">
                 {library.length === 0 ? (
-                  <li className="empty-list">暂无小说，在 NovelX 说「我想写一本小说」</li>
+                  <li className="empty-list">暂无小说，点「新建小说」或对创作助手说「我想写一本小说」</li>
                 ) : (
                   library.map((n) => (
                     <li key={n.id} className={project === n.id ? 'selected' : ''} onClick={() => loadNovel(n.id)}>
@@ -1034,7 +1450,7 @@ export default function App() {
               {project && longformHealth && (
                 <div className="side-health" aria-label="超长篇健康">
                   <h2 className="side-title">长篇健康</h2>
-                  <p className="side-hint">伏笔与卷况，不占阅读区</p>
+                  <p className="side-hint">伏笔与卷况，不占写作台</p>
                   <div className="longform-health longform-health--side">
                     <div
                       className={`longform-health-card longform-health-card--foreshadow level-${foreshadowLevel}${
@@ -1157,34 +1573,28 @@ export default function App() {
                 </div>
               )}
             </>
-          ) : (
-            <>
-              <h2 className="side-title">框架配置</h2>
-              <p className="side-hint">硬规则、禁名与 Skills 在右侧编辑；改动写入 config/。</p>
-            </>
-          )}
+          ) : null}
         </section>
 
-        {appMode === 'config' ? (
-          <div className="work-area work-area-config">
-            <ConfigPanel />
-          </div>
-        ) : (
         <div className="work-area">
           <section className="panel reader-panel">
           <div className="reader-head">
-            <h2>阅读</h2>
+            <h2>写作台</h2>
             {chapterList.length > 0 && (
-              <div className="chapter-strip">
+              <div className="chapter-strip" role="tablist" aria-label="章节">
                 {chapterList.map((ch) => (
                   <button
                     key={ch.number}
                     type="button"
+                    role="tab"
+                    aria-selected={selectedChapter === ch.number}
                     className={[
                       'ch-pill',
                       selectedChapter === ch.number ? 'active' : '',
-                      publishedSet.has(ch.number) ? 'published' : '',
-                      ch.number === nextChapter ? 'next' : '',
+                      ch.status === 'published' ? 'published' : '',
+                      ch.status === 'draft' ? 'draft' : '',
+                      ch.status === 'outline' ? 'outline' : '',
+                      ch.status === 'next' || ch.number === nextChapter ? 'next' : '',
                     ].join(' ')}
                     onClick={() => {
                       if (readerEditing) {
@@ -1192,9 +1602,11 @@ export default function App() {
                         cancelReaderEdit()
                       }
                       setSelectedChapter(ch.number)
-                      setReaderTab(publishedSet.has(ch.number) ? 'draft' : 'master')
+                      setReaderTab(ch.hasDraft || ch.status === 'published' ? 'draft' : 'master')
                     }}
-                    title={ch.title || `第${ch.number}章`}
+                    title={`${ch.title || `第${ch.number}章`} · ${ch.statusLabel}${
+                      ch.bodyChars ? ` · ${ch.bodyChars}字` : ''
+                    }`}
                   >
                     {ch.number}
                   </button>
@@ -1213,9 +1625,19 @@ export default function App() {
                     <span className="reader-ch-title">
                       第{selectedChapter}章
                       {chapterData?.title ? ` · ${chapterData.title}` : ''}
+                      {selectedChapterStatus ? (
+                        <span
+                          className={`ch-status-badge ch-status-${selectedChapterStatus.status}`}
+                        >
+                          {selectedChapterStatus.statusLabel}
+                          {selectedChapterStatus.bodyChars
+                            ? ` · ${selectedChapterStatus.bodyChars}字`
+                            : ''}
+                        </span>
+                      ) : null}
                     </span>
                   ) : (
-                    <span className="reader-ch-title reader-ch-title-muted">阅读区</span>
+                    <span className="reader-ch-title reader-ch-title-muted">写作台</span>
                   )}
                   <div className="reader-head-actions">
                     {readerCanEdit && !readerEditing && (
@@ -1223,7 +1645,7 @@ export default function App() {
                         type="button"
                         className="btn-ghost btn-inline reader-edit-btn"
                         onClick={beginReaderEdit}
-                        title="编辑当前阅读内容"
+                        title="编辑当前内容"
                       >
                         编辑
                       </button>
@@ -1260,7 +1682,7 @@ export default function App() {
                     )}
                   </div>
                 </div>
-                <div className="reader-tabs" role="tablist" aria-label="阅读分类">
+                <div className="reader-tabs" role="tablist" aria-label="写作台分类">
                   {readerTabs.map((t) => (
                     <button
                       key={t.id}
@@ -1276,24 +1698,54 @@ export default function App() {
               {readerEditError ? (
                 <div className="reader-edit-error">{readerEditError}</div>
               ) : null}
+              {showNextCta ? (
+                <div className="next-cta-bar" role="region" aria-label="下一步">
+                  <div className="next-cta-copy">
+                    <strong>下一步 · {studioStage.cta.label}</strong>
+                    <span>
+                      {chatBusy
+                        ? '助手进行中，完成后可再点'
+                        : (studioStage.cta.hint || studioStage.detail)}
+                    </span>
+                  </div>
+                  <div className="next-cta-actions">
+                    <button
+                      type="button"
+                      className="btn-primary btn-inline"
+                      onClick={runStudioCta}
+                      disabled={chatBusy}
+                      aria-busy={chatBusy}
+                    >
+                      {chatBusy ? '进行中…' : studioStage.cta.label}
+                    </button>
+                  </div>
+                </div>
+              ) : null}
               {showSetupConfirmBar && (
                 <div className="setup-confirm-bar" role="region" aria-label="定稿确认">
                   <div className="setup-confirm-copy">
                     <strong>总纲与卷纲已就绪</strong>
-                    <span>确认后进入写章；或打回后重新生成大纲。</span>
+                    <span>
+                      {chatBusy
+                        ? '助手进行中，请稍候再确认'
+                        : '确认后进入写章；或打回后重新生成大纲。'}
+                    </span>
                   </div>
                   <div className="setup-confirm-actions">
                     <button
                       type="button"
                       className="btn-primary btn-inline"
                       onClick={() => sendSetupGate('sc_approve')}
+                      disabled={chatBusy}
+                      aria-busy={chatBusy}
                     >
-                      确认定稿
+                      {chatBusy ? '进行中…' : '确认定稿'}
                     </button>
                     <button
                       type="button"
                       className="btn-ghost btn-inline"
                       onClick={() => sendSetupGate('sc_revise')}
+                      disabled={chatBusy}
                     >
                       修改再生成
                     </button>
@@ -1388,18 +1840,177 @@ export default function App() {
                   })}
                 </div>
               )}
+              {readerTab === 'draft' && selectedChapter > 0 ? (
+                <div className="desk-word-bar" aria-label="字数进度">
+                  <div className="desk-word-meta">
+                    <span>
+                      {draftBodyChars}
+                      <span className="desk-word-sep">/</span>
+                      {CHAPTER_WORD_MIN}–{CHAPTER_WORD_MAX} 字
+                    </span>
+                    <span className={`desk-word-tone tone-${wordTone}`}>
+                      {wordProgressLabel(draftBodyChars)}
+                    </span>
+                    <span className="desk-word-hard">硬门 ≥{CHAPTER_WORD_HARD_MIN}</span>
+                  </div>
+                  <div className="desk-word-track" aria-hidden="true">
+                    <div
+                      className={`desk-word-fill tone-${wordTone}`}
+                      style={{ width: `${wordPct}%` }}
+                    />
+                    <span
+                      className="desk-word-mark hard"
+                      style={{ left: `${Math.min(100, (CHAPTER_WORD_HARD_MIN / CHAPTER_WORD_MIN) * 100)}%` }}
+                    />
+                  </div>
+                </div>
+              ) : null}
+              {readerTab === 'draft' && activePlotSummary ? (
+                <div className={`desk-plot-rail${plotRailOpen ? '' : ' is-collapsed'}`}>
+                  <button
+                    type="button"
+                    className="desk-plot-rail-head"
+                    onClick={() => setPlotRailOpen((v) => !v)}
+                    aria-expanded={plotRailOpen}
+                  >
+                    <span className="desk-plot-rail-title">
+                      当前剧情 · {activePlotSummary.title}
+                      <span className="desk-plot-status">{activePlotSummary.statusLabel}</span>
+                    </span>
+                    <span className="desk-plot-rail-chevron">{plotRailOpen ? '▾' : '▸'}</span>
+                  </button>
+                  {plotRailOpen ? (
+                    <div className="desk-plot-rail-body">
+                      <p>{activePlotSummary.body}</p>
+                      <button
+                        type="button"
+                        className="btn-ghost btn-inline"
+                        onClick={() => {
+                          setReaderTab('arcs')
+                          const key = plotCardKey(pickActivePlot(plots))
+                          if (key) setReaderCardKey(key)
+                        }}
+                      >
+                        打开完整剧情卡
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+              {!deskPatchHidden && activeDeskPatch && readerTab === 'draft' ? (
+                <div className="desk-patch-dock" role="region" aria-label="修订对照">
+                  <div className="desk-patch-dock-head">
+                    <strong>
+                      修订对照 · 第{activeDeskPatch.chapter}章 · 第{activeDeskPatch.start_para}
+                      {activeDeskPatch.end_para !== activeDeskPatch.start_para
+                        ? `–${activeDeskPatch.end_para}`
+                        : ''}
+                      段
+                      {visibleDeskPatches.length > 1
+                        ? ` · ${visibleDeskPatches.length} 处`
+                        : ''}
+                    </strong>
+                    <div className="desk-patch-dock-actions">
+                      {visibleDeskPatches.length > 1 ? (
+                        <select
+                          className="desk-patch-select"
+                          value={String(Math.max(0, visibleDeskPatches.findIndex((p) => (
+                            Number(p.chapter) === Number(activeDeskPatch.chapter)
+                            && Number(p.start_para) === Number(activeDeskPatch.start_para)
+                            && String(p.before || '') === String(activeDeskPatch.before || '')
+                          ))))}
+                          onChange={(e) => {
+                            const idx = Number(e.target.value)
+                            if (visibleDeskPatches[idx]) setDeskPatchFocus(visibleDeskPatches[idx])
+                          }}
+                          aria-label="选择修订段"
+                        >
+                          {visibleDeskPatches.map((p, idx) => (
+                            <option key={`${p.chapter}-${p.start_para}-${idx}`} value={String(idx)}>
+                              第{p.start_para}
+                              {p.end_para !== p.start_para ? `–${p.end_para}` : ''}
+                              段
+                            </option>
+                          ))}
+                        </select>
+                      ) : null}
+                      {studioStage.cta?.isApply ? (
+                        <button
+                          type="button"
+                          className="btn-primary btn-inline"
+                          onClick={runStudioCta}
+                          disabled={chatBusy}
+                          title="将预览中的修订写入正文"
+                        >
+                          {chatBusy ? '进行中…' : '应用修改'}
+                        </button>
+                      ) : null}
+                      <button
+                        type="button"
+                        className="btn-ghost btn-inline"
+                        onClick={() => setDeskPatchHidden(true)}
+                      >
+                        收起对照
+                      </button>
+                    </div>
+                  </div>
+                  <div className="desk-patch-diff">
+                    <div className="desk-patch-before">
+                      <div className="desk-patch-label">原文</div>
+                      <pre>{activeDeskPatch.before || '（空）'}</pre>
+                    </div>
+                    <div className="desk-patch-after">
+                      <div className="desk-patch-label">修订后</div>
+                      <pre>{activeDeskPatch.after || '（空）'}</pre>
+                    </div>
+                  </div>
+                </div>
+              ) : null}
               <div
-                className={`reader-body${readerEditing ? ' reader-body-editing' : ''}`}
+                className={`reader-body${readerEditing ? ' reader-body-editing' : ''}${
+                  !deskPatchHidden && activeDeskPatch && readerTab === 'draft' ? ' with-patch' : ''
+                }${isVolumeWorkspace ? ' reader-body-workspace' : ''}`}
                 ref={readerRef}
                 onScroll={onReaderScroll}
               >
-                {readerEditing ? (
+                {isVolumeWorkspace ? (
+                  <VolumeWorkspace
+                    group={currentVolumeGroup}
+                    nextChapter={nextChapter}
+                    publishedCount={publishedCount}
+                    onOpenArc={() => {
+                      setReaderTab('arcs')
+                      if (currentVolumeGroup?.volume) {
+                        setReaderVolume(currentVolumeGroup.volume)
+                        setReaderCardKey(`v${currentVolumeGroup.volume}`)
+                      }
+                    }}
+                    onOpenPlot={(p) => {
+                      setReaderTab('arcs')
+                      const vol = Number(p?.volume_index || p?.arc_index || currentVolumeGroup?.volume)
+                      if (vol) setReaderVolume(vol)
+                      const key = plotCardKey(p)
+                      if (key) setReaderCardKey(key)
+                    }}
+                    writeBusy={chatBusy}
+                    onWriteNext={() => {
+                      if (chatBusy) return
+                      if (!sendChatMessage(`写第${nextChapter}章`, { busy: 'ignore' })) return
+                      setReaderTab('draft')
+                      if (nextChapter > 0) setSelectedChapter(nextChapter)
+                    }}
+                    onOpenChapter={(ch, tab) => {
+                      setSelectedChapter(ch)
+                      setReaderTab(tab || 'draft')
+                    }}
+                  />
+                ) : readerEditing ? (
                   <textarea
                     className="reader-editor"
                     value={readerEditText}
                     onChange={(e) => setReaderEditText(e.target.value)}
                     spellCheck={false}
-                    aria-label="编辑阅读内容"
+                    aria-label="编辑写作台内容"
                   />
                 ) : (
                   <MarkdownView
@@ -1408,6 +2019,25 @@ export default function App() {
                   />
                 )}
               </div>
+              {(readerTab === 'draft' || readerTab === 'outline')
+                && selectedChapter > 0
+                && selectedChapterStatus ? (
+                <div className="reader-publish-foot" aria-label="章节发布状态">
+                  <span>
+                    第{selectedChapter}章 · {selectedChapterStatus.statusLabel}
+                    {selectedChapterStatus.bodyChars
+                      ? ` · ${selectedChapterStatus.bodyChars}字`
+                      : ''}
+                  </span>
+                  <span className="reader-publish-foot-meta">
+                    {selectedChapterStatus.status === 'published'
+                      ? '已计入已写章节'
+                      : selectedChapterStatus.status === 'draft'
+                        ? '草稿未计入已发布'
+                        : `下一章目标：第${nextChapter}章`}
+                  </span>
+                </div>
+              ) : null}
             </>
           )}
         </section>
@@ -1416,11 +2046,29 @@ export default function App() {
           project={project}
           sendRef={chatSendRef}
           onSetupGateChange={setChatSetupGateOpen}
+          onBusyChange={handleChatBusyChange}
           onPreviewRefresh={handleChatPreviewRefresh}
+          onProjectBound={handleProjectBound}
+          onDraftPatchesChange={handleDraftPatchesChange}
+          onAuditStateChange={handleAuditStateChange}
+          compactDraftPatches={deskPatchDockVisible}
         />
         </div>
-        )}
       </div>
+
+      {engineOpen ? (
+        <div className="engine-drawer-root" role="dialog" aria-label="引擎室">
+          <button
+            type="button"
+            className="engine-drawer-backdrop"
+            aria-label="关闭引擎室"
+            onClick={() => setEngineOpen(false)}
+          />
+          <div className="engine-drawer">
+            <ConfigPanel onClose={() => setEngineOpen(false)} title="引擎室" />
+          </div>
+        </div>
+      ) : null}
     </div>
   )
 }

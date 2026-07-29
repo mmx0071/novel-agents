@@ -19,8 +19,6 @@ pub struct PersistedThread {
     #[serde(default)]
     pub pending_volume_sync: Option<crate::PendingVolumeSync>,
     #[serde(default)]
-    pub pending_volume_audit: Option<crate::PendingVolumeAudit>,
-    #[serde(default)]
     pub pending_setup: Option<crate::PendingSetup>,
     #[serde(default)]
     pub pending_volume_handoff: Option<crate::PendingVolumeHandoff>,
@@ -29,17 +27,9 @@ pub struct PersistedThread {
     #[serde(default)]
     pub pending_chapter_order: Option<crate::PendingChapterOrder>,
     #[serde(default)]
-    pub pending_plot_write: Option<crate::PendingPlotWrite>,
-    #[serde(default)]
-    pub pending_expected_event: Option<crate::PendingExpectedEvent>,
-    #[serde(default)]
-    pub pending_setting_blocker: Option<crate::PendingSettingBlocker>,
-    #[serde(default)]
     pub skipped_expected_ids: Vec<String>,
     #[serde(default)]
     pub pending_mutation: Option<crate::PendingMutation>,
-    #[serde(default)]
-    pub pending_mutation_followup: Option<crate::PendingMutationFollowup>,
     #[serde(default)]
     pub pending_studio_next: Option<crate::studio_next::PendingStudioNext>,
     #[serde(default)]
@@ -92,17 +82,12 @@ pub fn from_state(thread_id: &str, state: &ThreadState) -> PersistedThread {
         ui_turns: state.ui_turns.clone(),
         pending_audit: state.pending_audit.clone(),
         pending_volume_sync: state.pending_volume_sync.clone(),
-        pending_volume_audit: state.pending_volume_audit.clone(),
         pending_setup: state.pending_setup.clone(),
         pending_volume_handoff: state.pending_volume_handoff.clone(),
         pending_chapter_next: state.pending_chapter_next.clone(),
         pending_chapter_order: state.pending_chapter_order.clone(),
-        pending_plot_write: state.pending_plot_write.clone(),
-        pending_expected_event: state.pending_expected_event.clone(),
-        pending_setting_blocker: state.pending_setting_blocker.clone(),
         skipped_expected_ids: state.skipped_expected_ids.clone(),
         pending_mutation: state.pending_mutation.clone(),
-        pending_mutation_followup: state.pending_mutation_followup.clone(),
         pending_studio_next: state.pending_studio_next.clone(),
         awaiting_studio_next: state.awaiting_studio_next.clone(),
         outline_rewrite_active: state.outline_rewrite_active,
@@ -128,20 +113,14 @@ pub fn into_state(p: PersistedThread) -> (String, ThreadState) {
             ui_turns: p.ui_turns,
             pending_audit: p.pending_audit,
             pending_volume_sync: p.pending_volume_sync,
-            // Deprecated situational gates no longer render cards — drop on load.
-            pending_volume_audit: None,
             pending_setup: p.pending_setup,
             pending_volume_handoff: p.pending_volume_handoff,
             pending_chapter_next: p
                 .pending_chapter_next
                 .filter(|c| c.suggest_next.is_none()),
             pending_chapter_order: p.pending_chapter_order,
-            pending_plot_write: None,
-            pending_expected_event: None,
-            pending_setting_blocker: None,
             skipped_expected_ids: p.skipped_expected_ids,
             pending_mutation: p.pending_mutation,
-            pending_mutation_followup: None,
             pending_studio_next: p.pending_studio_next,
             awaiting_studio_next: p.awaiting_studio_next,
             outline_rewrite_active: p.outline_rewrite_active,

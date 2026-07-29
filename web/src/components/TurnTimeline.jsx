@@ -13,6 +13,8 @@ export default function TurnTimeline({
   project,
   liveTurnId,
   onReaderJump,
+  onOpenPatchInDesk,
+  compactDraftPatches = false,
   onPickOption,
   otherText,
   setOtherText,
@@ -23,8 +25,8 @@ export default function TurnTimeline({
   if (!turns?.length) {
     return (
       <div className="empty tiny nx-empty-hint">
-        <div>向 NovelX 下指令，Turn 内会按 Codex 样式展示 Skill / Tool / 正文。</div>
-        <div className="nx-muted">试试：审阅第1–5章 · 或输入 $ 选择 skill</div>
+        <div>向 NovelX 下指令，这里会展示写作进度、工具步骤与正文摘要。</div>
+        <div className="nx-muted">试试：审阅第1–5章 · 或输入 $ 选择能力</div>
       </div>
     )
   }
@@ -62,6 +64,8 @@ export default function TurnTimeline({
                 itemIndex={itemIdx}
                 project={project}
                 onReaderJump={onReaderJump}
+                onOpenPatchInDesk={onOpenPatchInDesk}
+                compactDraftPatches={compactDraftPatches}
                 turnActive={isLiveTurn && (turn.status === 'running' || loading)}
                 suppressCaret={hasToolOrSkill}
                 isStreamTip={isLiveTurn && isAgentStreamTip(turn.items, itemIdx)}
@@ -78,7 +82,8 @@ export default function TurnTimeline({
               <ApprovalOptions
                 prompt={turn.approval.prompt}
                 options={turn.approval.options}
-                disabled={loading}
+                // Gate cards must stay clickable even if a late tick left loading=true.
+                disabled={loading && !turn.approval?.options?.length}
                 onPick={onPickOption}
                 otherText={otherText}
                 setOtherText={setOtherText}
@@ -101,7 +106,7 @@ const TurnSep = memo(function TurnSep({ index, running, aborted }) {
     <div className="nx-turn-sep">
       <span className="nx-turn-sep-line" />
       <span className="nx-turn-sep-label">
-        回合 {index + 1}
+        本轮 {index + 1}
         {running ? ' · 进行中' : aborted ? ' · 已中断' : ''}
       </span>
       <span className="nx-turn-sep-line" />
@@ -178,6 +183,8 @@ const TurnItemView = memo(function TurnItemView({
   itemIndex,
   project,
   onReaderJump,
+  onOpenPatchInDesk,
+  compactDraftPatches = false,
   turnActive,
   suppressCaret,
   isStreamTip,
@@ -242,7 +249,14 @@ const TurnItemView = memo(function TurnItemView({
     case 'tool_call':
       return <ToolCallCard item={item} project={project} onReaderJump={onReaderJump} />
     case 'draft_patch':
-      return <DraftPatchCard item={item} />
+      return (
+        <DraftPatchCard
+          item={item}
+          onOpenInDesk={onOpenPatchInDesk}
+          // Compact only while writing-desk dock already shows the same diffs.
+          compact={!!compactDraftPatches}
+        />
+      )
     case 'mutation_preview':
       return <MutationPreviewCard item={item} />
     case 'pipeline_step':

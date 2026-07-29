@@ -496,6 +496,111 @@ pub fn new_id(prefix: &str) -> String {
     format!("{}_{}", prefix, Uuid::new_v4().simple())
 }
 
+/// Decision / execution audit trail kinds (append-only ops journal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpsJournalKind {
+    TurnStarted,
+    TurnComplete,
+    TurnAborted,
+    UserInput,
+    IntentMatched,
+    GateOpened,
+    GateResponded,
+    ToolStarted,
+    ToolCompleted,
+    MutationPreview,
+    MutationConfirm,
+    MutationDiscard,
+    MutationApplied,
+    ImpactOffered,
+    ImpactResolved,
+    PipelineStep,
+    PublishResult,
+    /// Consistency / setting audit report item (not the same as publish).
+    AuditReport,
+    HardBlock,
+    HistoryReset,
+}
+
+impl OpsJournalKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TurnStarted => "turn_started",
+            Self::TurnComplete => "turn_complete",
+            Self::TurnAborted => "turn_aborted",
+            Self::UserInput => "user_input",
+            Self::IntentMatched => "intent_matched",
+            Self::GateOpened => "gate_opened",
+            Self::GateResponded => "gate_responded",
+            Self::ToolStarted => "tool_started",
+            Self::ToolCompleted => "tool_completed",
+            Self::MutationPreview => "mutation_preview",
+            Self::MutationConfirm => "mutation_confirm",
+            Self::MutationDiscard => "mutation_discard",
+            Self::MutationApplied => "mutation_applied",
+            Self::ImpactOffered => "impact_offered",
+            Self::ImpactResolved => "impact_resolved",
+            Self::PipelineStep => "pipeline_step",
+            Self::PublishResult => "publish_result",
+            Self::AuditReport => "audit_report",
+            Self::HardBlock => "hard_block",
+            Self::HistoryReset => "history_reset",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "turn_started" => Some(Self::TurnStarted),
+            "turn_complete" => Some(Self::TurnComplete),
+            "turn_aborted" => Some(Self::TurnAborted),
+            "user_input" => Some(Self::UserInput),
+            "intent_matched" => Some(Self::IntentMatched),
+            "gate_opened" => Some(Self::GateOpened),
+            "gate_responded" => Some(Self::GateResponded),
+            "tool_started" => Some(Self::ToolStarted),
+            "tool_completed" => Some(Self::ToolCompleted),
+            "mutation_preview" => Some(Self::MutationPreview),
+            "mutation_confirm" => Some(Self::MutationConfirm),
+            "mutation_discard" => Some(Self::MutationDiscard),
+            "mutation_applied" => Some(Self::MutationApplied),
+            "impact_offered" => Some(Self::ImpactOffered),
+            "impact_resolved" => Some(Self::ImpactResolved),
+            "pipeline_step" => Some(Self::PipelineStep),
+            "publish_result" => Some(Self::PublishResult),
+            "audit_report" => Some(Self::AuditReport),
+            "hard_block" => Some(Self::HardBlock),
+            "history_reset" => Some(Self::HistoryReset),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for OpsJournalKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// One append-only ops journal line under `projects/<name>/.novelx/ops_journal.jsonl`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpsJournalEntry {
+    pub ts: String,
+    pub project: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chapter: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    pub kind: OpsJournalKind,
+    pub summary: String,
+    #[serde(default)]
+    pub data: serde_json::Value,
+}
+
 impl EventMsg {
     pub fn session_configured(
         thread_id: impl Into<ThreadId>,
@@ -549,5 +654,25 @@ mod tests {
             AgentPath::root().child("writer").as_str(),
             "/root/writer"
         );
+    }
+
+    #[test]
+    fn ops_journal_kind_roundtrip() {
+        let entry = OpsJournalEntry {
+            ts: "2026-07-28T00:00:00Z".into(),
+            project: "sample-novel".into(),
+            thread_id: Some("thr_1".into()),
+            turn_id: Some("turn_1".into()),
+            chapter: Some(1),
+            correlation_id: Some("mut_1".into()),
+            kind: OpsJournalKind::MutationApplied,
+            summary: "applied".into(),
+            data: serde_json::json!({}),
+        };
+        let s = serde_json::to_string(&entry).unwrap();
+        assert!(s.contains("mutation_applied"));
+        let back: OpsJournalEntry = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.kind, OpsJournalKind::MutationApplied);
+        assert_eq!(OpsJournalKind::parse("gate_opened"), Some(OpsJournalKind::GateOpened));
     }
 }

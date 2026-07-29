@@ -101,11 +101,31 @@ async fn dispatch_one(
             }
         }
         Op::RespondUserInput {
+            turn_id: gate_turn_id,
             option_id,
             free_text,
             ..
         } => {
+            let opt = option_id.clone();
+            let free = free_text.clone();
             let text = free_text.unwrap_or(option_id);
+            // Correlate with gate_opened via Op.turn_id; response_turn_id is the new turn.
+            core.journal_ops(
+                None,
+                Some(thread_id),
+                Some(gate_turn_id.as_str()),
+                None,
+                Some(opt.as_str()),
+                novelx_protocol::OpsJournalKind::GateResponded,
+                format!("gate responded: {opt}"),
+                serde_json::json!({
+                    "option_id": opt,
+                    "free_text": free,
+                    "gate_turn_id": gate_turn_id,
+                    "response_turn_id": sub_id,
+                }),
+            )
+            .await;
             user_input_or_turn(
                 core,
                 thread_id,

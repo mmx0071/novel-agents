@@ -22,7 +22,7 @@ export default function ApprovalOptions({
         />
       ) : null}
       <div className="chat-option-list" role="group" aria-label="请选择下一步">
-        <div className="chat-option-hint">请选择下一步（按钮发送选项 id；也可输入序号）</div>
+        <div className="chat-option-hint">请选择下一步（也可输入序号）</div>
         {opts.map((opt, i) => (
           <button
             key={opt.id || i}
@@ -42,7 +42,7 @@ export default function ApprovalOptions({
           onClick={() => setShowOther(true)}
         >
           <span className="choice-num">{opts.length + 1}.</span>
-          其他
+          补充要求
         </button>
         {showOther && (
           <div className="chat-other-row">

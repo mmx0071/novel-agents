@@ -70,6 +70,21 @@ enum Commands {
         /// Project directory name under projects/
         name: String,
     },
+    /// Print decision/execution ops journal (append-only audit trail)
+    OpsLog {
+        /// Project directory name under projects/
+        name: String,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Filter by kind (e.g. mutation_applied, gate_responded)
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        chapter: Option<u32>,
+        /// Emit JSON instead of one-line summaries
+        #[arg(long)]
+        json: bool,
+    },
     /// Start NovelX web server
     Web {
         #[arg(long, default_value = "127.0.0.1:8765")]
@@ -194,6 +209,44 @@ async fn main() -> Result<()> {
             }
             for (p, err) in &report.plot_failed {
                 println!("  plot fail {p}: {err}");
+            }
+        }
+        Commands::OpsLog {
+            name,
+            limit,
+            kind,
+            chapter,
+            json,
+        } => {
+            let dir = projects.join(&name);
+            if !dir.is_dir() {
+                anyhow::bail!("项目不存在：{}", dir.display());
+            }
+            let kind = match kind.as_deref() {
+                None | Some("") => None,
+                Some(s) => Some(
+                    novelx_protocol::OpsJournalKind::parse(s)
+                        .ok_or_else(|| anyhow::anyhow!("未知 kind：{s}"))?,
+                ),
+            };
+            let entries = novelx_core::ops_journal::query_entries(
+                &projects,
+                &name,
+                &novelx_core::ops_journal::OpsJournalQuery {
+                    limit: limit.clamp(1, 2000),
+                    chapter,
+                    kind,
+                    after: None,
+                },
+            );
+            if json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else if entries.is_empty() {
+                println!("(empty) projects/{name}/.novelx/ops_journal.jsonl");
+            } else {
+                for e in &entries {
+                    println!("{}", novelx_core::ops_journal::format_entry_line(e));
+                }
             }
         }
         Commands::Web { bind } => {

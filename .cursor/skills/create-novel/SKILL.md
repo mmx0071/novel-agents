@@ -10,7 +10,7 @@ description: >-
 
 本 Skill 指导 Agent 使用 `novel-agents`（Rust）进行超长篇协同创作。
 
-改代码 / 改框架时另见 [novelx-dev](../novelx-dev/SKILL.md)：**产品代码须题材与作品中立，禁止把特定样例小说写进 crates/web/config。**
+改代码 / 改框架时另见 [novelx-dev](../novelx-dev/SKILL.md)（[reference](../novelx-dev/reference.md)）：题材中立、Prompt/Schema/门控分层、features 优先、Studio 安全闸、超长篇与落盘/Web 双层。禁止把特定样例小说写进 `crates`/`web`/`config`。
 
 ## 何时加载
 
@@ -104,6 +104,7 @@ Release 二进制：`cargo build -p novelx-cli --release` → `./target/release/
 | foreshadow_tracker / literary_editor | 伏笔/风格（润色：activation 建议 + Studio `activate_agents`，非每章必跑） |
 | entity_designer / plot_designer / setting_auditor | Studio 介入；剧情收束后自动巡检（±轻量同步），不进章流水线 order |
 | volume_auditor | Studio `audit_volume`；不进章流水线 |
+| expectation_reviewer | 预期事件检阅（硬条件满足时）；不进章流水线 order |
 
 ## 流水线顺序
 

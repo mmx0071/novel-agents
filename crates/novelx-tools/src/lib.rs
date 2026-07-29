@@ -706,8 +706,12 @@ impl ToolHandler for ReviseChapter {
             return Ok(reject_apply_without_id());
         }
 
-        // Local path: plan diffs without writing, then confirm-apply cached patches.
-        if prefer_local && mutation_confirm_enabled(&ctx.config_root) && !wants_apply(&args) {
+        // Local path: plan diffs → show before/after (Cursor-style) → apply on confirm.
+        // Even gate-sourced revise keeps this step when there are real patches to review.
+        if prefer_local
+            && mutation_confirm_enabled(&ctx.config_root)
+            && !wants_apply(&args)
+        {
             let planned = novelx_pipeline::plan_local_revision_preview(
                 &ctx.projects_root,
                 &ctx.config_root,
@@ -736,8 +740,7 @@ impl ToolHandler for ReviseChapter {
                     return Ok(preview_mutation(
                         "revise_local",
                         &format!(
-                            "第{chapter}章局部修订（{patch_count} 处补丁）：{}",
-                            instructions.chars().take(80).collect::<String>()
+                            "第{chapter}章局部修订（{patch_count} 处）：请对照原文与修订后再应用"
                         ),
                         json!({
                             "kind": "revise_local",
@@ -757,10 +760,10 @@ impl ToolHandler for ReviseChapter {
                     ));
                 }
                 Ok(_) => {
-                    // No local patches planned — fall through to confirm full revise intent.
+                    // No local patches — fall through (full revise / intent confirm).
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "local revise preview failed; fall back to intent confirm");
+                    tracing::warn!(error = %e, "local revise preview failed; fall back to full revise");
                 }
             }
         }
@@ -4245,7 +4248,7 @@ impl ToolHandler for SteerRun {
         } else {
             "按最近一致性审计意见局部修订".to_string()
         };
-        // Reuse revise_chapter so local patches go through diff confirm + cached apply.
+        // Reuse revise_chapter so local patches go through diff preview + apply.
         // Pass structured issues so collect_revision_targets can locate quotes/spans.
         let revise_args = json!({
             "project": project,

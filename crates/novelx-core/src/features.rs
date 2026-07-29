@@ -48,7 +48,6 @@ impl FeatureFlags {
         m.insert("studio.enforce_chapter_order".into(), true);
         m.insert("studio.require_mutation_confirm".into(), true);
         m.insert("studio.impact_cascade".into(), true);
-        m.insert("studio.impact_llm_refine".into(), false);
         m.insert("studio.impact_scan_all_drafts".into(), false);
         // Default false: use longform.yaml impact_scan_mode (indexed) instead of full-book scan.
         m.insert("studio.impact_scan_all_on_setting".into(), false);
@@ -56,6 +55,8 @@ impl FeatureFlags {
         m.insert("studio.require_volume_audit_mid".into(), true);
         m.insert("studio.require_volume_audit_handoff".into(), true);
         m.insert("studio.cold_archive_drafts".into(), true);
+        // Append-only decision/execution audit trail under .novelx/ops_journal.jsonl.
+        m.insert("studio.ops_journal".into(), true);
         Self { map: Arc::new(m) }
     }
 
@@ -124,14 +125,32 @@ impl FeatureFlags {
             .unwrap_or(true)
     }
 
-    pub fn impact_llm_refine(&self) -> bool {
-        self.enabled("studio.impact_llm_refine")
-    }
-
     pub fn enforce_chapter_order(&self) -> bool {
         self.map
             .get("studio.enforce_chapter_order")
             .copied()
             .unwrap_or(true)
+    }
+
+    /// Persist decision/execution ops journal (tools, gates, mutations, publish).
+    pub fn ops_journal(&self) -> bool {
+        self.map
+            .get("studio.ops_journal")
+            .copied()
+            .unwrap_or(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ops_journal_defaults_on() {
+        assert!(FeatureFlags::defaults().ops_journal());
+        let off = FeatureFlags {
+            map: Arc::new(HashMap::from([("studio.ops_journal".into(), false)])),
+        };
+        assert!(!off.ops_journal());
     }
 }

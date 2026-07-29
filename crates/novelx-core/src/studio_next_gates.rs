@@ -11,13 +11,8 @@ use novelx_protocol::{new_id, EventMsg, ItemStatus, TurnItem, UserInputOption};
 use serde_json::{json, Value};
 
 impl NovelxCore {
-    /// Drop legacy situational pendings that no longer render open_gate cards.
+    /// Drop situational pendings that no longer render open_gate cards.
     pub(crate) fn clear_deprecated_situational_pendings(t: &mut crate::ThreadState) {
-        t.pending_mutation_followup = None;
-        t.pending_setting_blocker = None;
-        t.pending_plot_write = None;
-        t.pending_expected_event = None;
-        t.pending_volume_audit = None;
         if t.pending_chapter_next
             .as_ref()
             .is_some_and(|c| c.suggest_next.is_some())
