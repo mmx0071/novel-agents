@@ -5,6 +5,7 @@ mod expected_tools;
 mod multi_agent;
 mod mutation;
 mod mutation_gate;
+mod mutation_policy;
 mod tool_ui;
 
 pub use audit_queue::{
@@ -12,9 +13,11 @@ pub use audit_queue::{
     AuditQueueStatus,
 };
 pub use mutation::{
-    apply_without_mutation_id, confirm_skipped, maybe_preview, mutation_confirm_enabled,
-    preview_mutation, reject_apply_without_id, wants_apply, with_confirm_skip,
+    apply_without_mutation_id, confirm_skipped, is_routine_self_confirm, maybe_preview,
+    mutation_confirm_enabled, preview_mutation, reject_apply_without_id, wants_apply,
+    will_write_without_preview, with_confirm_skip,
 };
+pub use mutation_policy::{cached_policy, MutationPolicy};
 pub use tool_ui::{agent_label_zh, tool_output_for_ui};
 
 use anyhow::Result;
@@ -23,7 +26,7 @@ use novelx_llm::LlmClient;
 use novelx_harness::NamingRules;
 use novelx_pipeline::project::{
     init_project, load_project_state, project_dir, read_chapter_outline, save_project_state,
-    write_chapter_outline,
+    write_chapter_outline_budget,
 };
 use novelx_pipeline::{
     active_volume_for_chapter, bound_for_volume, build_chapter_context, build_setting_audit_pack,
@@ -37,16 +40,17 @@ use novelx_pipeline::{
     impact_source_outline, list_plots_summary, list_projects, load_memory, load_meta_json,
     load_volume_bounds, lock_brief, lore_query, mark_volume_sync_skipped,
     materialize_plot_card_markdown, maybe_advance_setup_after_outlines, maybe_cold_archive_volume,
-    normalize_plot_card_best_effort, parse_chapter_outline_text, plot_design_blocked_reason,
+    normalize_plot_card_best_effort, outline_budget_repair_hint,
+    parse_chapter_outline_text_budget, plot_design_blocked_reason,
     read_arc_outline_excerpt, read_arc_outline_text, read_chapter_draft,
     read_chapter_draft_resolved,
     rebuild_plot_index, resolve_setup_next_step, resolve_setup_phase, confirm_volume_memory,
     resolve_volume_phase, run_continue_batch, run_setting_audit, run_volume_audit,
-    run_volume_drift_check_with, run_volume_sync, set_volume_phase, steer_revision_options,
-    update_plot_card, BatchContinueOpts, DriftCheckOpts, validate_arc_outline, validate_bible,
-    validate_entity_card, validate_master_outline, volume_chapter_span, ContextProfile,
-    EntityKind, PhaseEnforceFlags, PlotWriteGate, PlotWriteMode, RevisionOptions, RunMode,
-    SettingAuditPackOpts, SetupPhase, VolumePhase,
+    run_volume_drift_check_with, run_volume_sync, set_volume_phase, split_chapter_draft,
+    steer_revision_options, update_plot_card, BatchContinueOpts, DriftCheckOpts,
+    validate_arc_outline, validate_bible, validate_entity_card, validate_master_outline,
+    volume_chapter_span, ContextProfile, EntityKind, PhaseEnforceFlags, PlotWriteGate,
+    PlotWriteMode, RevisionOptions, RunMode, SettingAuditPackOpts, SetupPhase, VolumePhase,
 };
 use novelx_protocol::{AgentPath, ThreadId};
 use novelx_skills::{build_skill_injections, load_skills, SkillScope};
@@ -145,9 +149,11 @@ pub struct ContinueWriting;
 pub struct ContinueWritingBatch;
 pub struct ReplanVolume;
 pub struct ReviseChapter;
+pub struct SplitChapter;
 pub struct AuditChapter;
 pub struct AuditChapters;
 pub struct AuditVolume;
+pub struct ResearchMaterials;
 pub struct ApplyDraftPatch;
 pub struct InitNovel;
 pub struct QueryLore;
@@ -379,7 +385,7 @@ impl ToolHandler for ContinueWriting {
         ) {
             return Ok(prev);
         }
-        let run = run_pipeline_streaming(
+        let mut run = run_pipeline_streaming(
             ctx,
             &project,
             chapter,
@@ -387,6 +393,23 @@ impl ToolHandler for ContinueWriting {
             RevisionOptions::default(),
         )
         .await?;
+        // HardLong auto-split defers publish — re-audit part A in the same tool call.
+        if run.auto_split && !run.published {
+            let to = run.auto_split_to.unwrap_or(chapter.saturating_add(1));
+            if let Some(p) = &ctx.progress {
+                let _ = p.send(format!("⚙ 已自动拆出第{to}章，复审第{chapter}章…"));
+            }
+            run = run_pipeline_streaming(
+                ctx,
+                &project,
+                chapter,
+                RunMode::AuditOnly,
+                RevisionOptions::default(),
+            )
+            .await?;
+            run.auto_split = true;
+            run.auto_split_to = Some(to);
+        }
         let mut output = if ctx.progress.is_some() {
             if !run.message.is_empty() {
                 format!("\n——\n{}", run.message)
@@ -412,7 +435,9 @@ impl ToolHandler for ContinueWritingBatch {
         "continue_writing_batch"
     }
     fn description(&self) -> &'static str {
-        "无人值守连写多章，直到硬门控（一致性 FAIL / 卷审 / 卷末 / 字数阻断 / 剧情门）或达到 max_chapters。\
+        "无人值守连写多章，直到硬门控（一致性 FAIL / 卷审 / 卷末 / 字数阻断 / 草稿形状）或达到成功发布上限。\
+         字数不足可自动扩写；严重超长（HardLong）会自动拆成两章一次。\
+         剧情验收未收束不阻断发布。未显式指定 until_chapter 时回落项目 target_chapters。\
          适合超长篇推进；不会跳过需人工确认的门。默认上限见 config/longform.yaml。"
     }
     fn parameters(&self) -> Value {
@@ -420,8 +445,8 @@ impl ToolHandler for ContinueWritingBatch {
             "type":"object",
             "properties":{
                 "project":{"type":"string"},
-                "max_chapters":{"type":"integer","description":"最多连写章数（默认 longform.batch_max_chapters，上限 100）"},
-                "until_chapter":{"type":"integer","description":"写到该章号（含）后停止"},
+                "max_chapters":{"type":"integer","description":"本批最多成功发布章数（默认 longform.batch_max_chapters，上限 100；按发布计数，非尝试次数）"},
+                "until_chapter":{"type":"integer","description":"写到该章号（含）后停止；未设时回落 state.target_chapters"},
                 "confirm_skip_volume_audit":{"type":"boolean","description":"跳过卷中审软门控"},
                 "confirm_skip_expected":{"type":"boolean","description":"跳过预处理预期检阅门控"},
                 "auto_length_revise":{"type":"boolean","description":"字数不足时自动全文扩写一次（默认 true）"}
@@ -434,10 +459,15 @@ impl ToolHandler for ContinueWritingBatch {
         if project.is_empty() {
             anyhow::bail!("project 必填");
         }
+        let lf = novelx_harness::LongformConfig::load_from_config_root(&ctx.config_root);
+        // Resolve default here so preview / apply_args never show「连写最多 0 章」.
         let max_chapters = args
             .get("max_chapters")
             .and_then(|v| v.as_u64())
-            .map(|n| n as u32);
+            .map(|n| n as u32)
+            .unwrap_or(lf.batch_max_chapters)
+            .max(1)
+            .min(100);
         let until_chapter = args
             .get("until_chapter")
             .and_then(|v| v.as_u64())
@@ -454,22 +484,28 @@ impl ToolHandler for ContinueWritingBatch {
             .get("auto_length_revise")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
+        let until_note = until_chapter
+            .map(|u| format!("，直到第{u}章"))
+            .unwrap_or_else(|| {
+                // Mirror batch.rs: unset until falls back to target_chapters when > 0.
+                let dir = project_dir(&ctx.projects_root, &project);
+                novelx_pipeline::load_project_state(&dir)
+                    .ok()
+                    .map(|s| s.target_chapters)
+                    .filter(|&t| t > 0)
+                    .map(|t| format!("，直到第{t}章（项目 target_chapters）"))
+                    .unwrap_or_default()
+            });
         if let Some(prev) = mutation::maybe_preview(
             &ctx.config_root,
             &args,
             "continue_writing_batch",
-            &format!(
-                "将连写最多 {} 章（至硬门控为止）{}",
-                max_chapters.unwrap_or(0),
-                until_chapter
-                    .map(|u| format!("，直到第{u}章"))
-                    .unwrap_or_default()
-            ),
+            &format!("将连写最多 {max_chapters} 章（至硬门控为止）{until_note}"),
             json!({
                 "kind": "continue_writing_batch",
                 "max_chapters": max_chapters,
                 "until_chapter": until_chapter,
-                "markdown": "确认后开始批写；遇一致性/卷审/卷末/预期检阅/字数阻断即停；字数不足可自动扩写一次。",
+                "markdown": "确认后开始批写；遇一致性/卷审/卷末/预期检阅/字数阻断即停；字数不足可自动扩写。",
             }),
             "continue_writing_batch",
             json!({
@@ -487,7 +523,7 @@ impl ToolHandler for ContinueWritingBatch {
             ctx,
             BatchContinueOpts {
                 project,
-                max_chapters,
+                max_chapters: Some(max_chapters),
                 until_chapter,
                 confirm_skip_volume_audit: skip_vol,
                 confirm_skip_expected: skip_expected,
@@ -814,7 +850,23 @@ impl ToolHandler for ReviseChapter {
             return Ok(prev);
         }
 
-        let run = run_pipeline_streaming(ctx, &project, chapter, RunMode::Revise, rev).await?;
+        let mut run = run_pipeline_streaming(ctx, &project, chapter, RunMode::Revise, rev).await?;
+        if run.auto_split && !run.published {
+            let to = run.auto_split_to.unwrap_or(chapter.saturating_add(1));
+            if let Some(p) = &ctx.progress {
+                let _ = p.send(format!("⚙ 已自动拆出第{to}章，复审第{chapter}章…"));
+            }
+            run = run_pipeline_streaming(
+                ctx,
+                &project,
+                chapter,
+                RunMode::AuditOnly,
+                RevisionOptions::default(),
+            )
+            .await?;
+            run.auto_split = true;
+            run.auto_split_to = Some(to);
+        }
         let output = if ctx.progress.is_some() {
             if !run.message.is_empty() {
                 format!("\n——\n{}", run.message)
@@ -829,6 +881,117 @@ impl ToolHandler for ReviseChapter {
             obj.insert("impact_source".into(), impact_source_draft(chapter));
         }
         Ok(ToolResult { output, data })
+    }
+}
+
+#[async_trait]
+impl ToolHandler for SplitChapter {
+    fn name(&self) -> &'static str {
+        "split_chapter"
+    }
+    fn description(&self) -> &'static str {
+        "将严重超长的未发布草稿按段落边界拆成连续两章（N 与 N+1），不保留同章号上/下。\
+         适用于字数 HardLong 阻断；拆后请审校/发布前半，再处理后半。勿拆已发布章。"
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "project":{"type":"string"},
+                "chapter":{"type":"integer","description":"要拆的章号（通常为 tip 未发布草稿）"},
+                "cut_ratio":{"type":"number","description":"切开位置约 0.35–0.65，默认 0.5"},
+                "title_b":{"type":"string","description":"后半章标题后缀（可选）"},
+                "force":{"type":"boolean","description":"覆盖已有第N+1章短稿或强制拆已发布章（慎用）"},
+                "apply":{"type":"boolean","description":"true=确认落盘；默认预览"},
+                "mutation_id":{"type":"string"}
+            },
+            "required":["project","chapter"]
+        })
+    }
+    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
+        let project = args["project"].as_str().unwrap_or("").to_string();
+        let chapter = args["chapter"].as_u64().unwrap_or(0) as u32;
+        if project.is_empty() || chapter == 0 {
+            anyhow::bail!("project 与 chapter 必填");
+        }
+        let cut_ratio = args
+            .get("cut_ratio")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.5) as f32;
+        let title_b = args
+            .get("title_b")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+        let dir = project_dir(&ctx.projects_root, &project);
+        let draft = read_chapter_draft(&dir, chapter).unwrap_or_default();
+        let body_n = novelx_pipeline::draft_body_chars(&draft);
+        if apply_without_mutation_id(&ctx.config_root, &args) {
+            return Ok(reject_apply_without_id());
+        }
+        let mut apply_args = args.clone();
+        if let Some(obj) = apply_args.as_object_mut() {
+            obj.insert("project".into(), json!(project));
+            obj.insert("chapter".into(), json!(chapter));
+            obj.insert("cut_ratio".into(), json!(cut_ratio));
+            if let Some(t) = &title_b {
+                obj.insert("title_b".into(), json!(t));
+            }
+            obj.insert("force".into(), json!(force));
+        }
+        if let Some(prev) = mutation::maybe_preview(
+            &ctx.config_root,
+            &args,
+            "split_chapter",
+            &format!(
+                "将第{chapter}章（约 {body_n} 字）拆成第{chapter}章 + 第{}章",
+                chapter + 1
+            ),
+            json!({
+                "kind": "split_chapter",
+                "project": project,
+                "chapter": chapter,
+                "next_chapter": chapter + 1,
+                "body_chars": body_n,
+                "cut_ratio": cut_ratio,
+                "markdown": format!(
+                    "确认后按段落边界切开：前半保留为第{chapter}章，后半写入第{}章；并清除两章审校/摘要缓存。",
+                    chapter + 1
+                ),
+            }),
+            "split_chapter",
+            apply_args,
+        ) {
+            return Ok(prev);
+        }
+        let result = split_chapter_draft(
+            &dir,
+            chapter,
+            cut_ratio,
+            title_b.as_deref(),
+            force,
+        )?;
+        Ok(ToolResult {
+            output: format!(
+                "已拆章：第{}章「{}」（{}字）+ 第{}章「{}」（{}字）。请先审校/发布前半，再处理后续。",
+                result.chapter_a,
+                result.title_a,
+                result.chars_a,
+                result.chapter_b,
+                result.title_b,
+                result.chars_b
+            ),
+            data: json!({
+                "split": true,
+                "chapter_a": result.chapter_a,
+                "chapter_b": result.chapter_b,
+                "chars_a": result.chars_a,
+                "chars_b": result.chars_b,
+                "title_a": result.title_a,
+                "title_b": result.title_b,
+                "project": project,
+            }),
+        })
     }
 }
 
@@ -915,8 +1078,11 @@ impl ToolHandler for ReviseOutline {
                      用户修订要求：{instructions}\n\n\
                      只输出一个 JSON 对象（可包在 ```json 代码块中），不要 Markdown 散文或解释。\n\
                      必填字段：title, pov, time_location, goal, conflict, emotion_curve,\n\
-                     key_events(数组≥2), characters(数组), items(数组), locations(数组),\n\
+                     plot_includes(数组), plot_defers(数组),\n\
+                     key_events(数组 2–4 条), characters(数组), items(数组), locations(数组),\n\
                      scene_tags(数组), cliffhanger, lore_queries(数组)。\n\
+                     篇幅预算：includes 估 5000–6000 字；key_events 只展开 includes 且≤4；\n\
+                     有进行中剧情卡时勿把整卡走向塞进本章，defers 至少 1 条。\n\
                      JSON 硬约束：字符串内禁止未转义的英文双引号；对话/强调用「」或『』；不要尾逗号。\n\
                      在现有章纲上按指令修改；未点名的情节尽量保留。必须服从 CanonContext。\n\
                      人物/组织命名遵守取名硬约束。\n\n\
@@ -935,16 +1101,19 @@ impl ToolHandler for ReviseOutline {
                     .await?
                     .trim()
                     .to_string();
-                // One repair pass if invalid.
-                if parse_chapter_outline_text(&out).is_err() {
-                    let err = parse_chapter_outline_text(&out)
-                        .err()
-                        .map(|e| e.to_string())
-                        .unwrap_or_default();
+                // Repair: schema/budget invalid, or soft gaps (empty includes / defers).
+                let has_plot =
+                    novelx_pipeline::active_plot_exit_context(&dir).is_some();
+                let needs_repair = match parse_chapter_outline_text_budget(&out) {
+                    Err(e) => Some(e.to_string()),
+                    Ok(o) => outline_budget_repair_hint(&o, has_plot),
+                };
+                if let Some(err) = needs_repair {
                     let repair = format!(
-                        "第{chapter}章章纲 JSON 无法解析，请输出修正后的完整 JSON 对象（可包在 ```json 中），不要解释。\n\
+                        "第{chapter}章章纲 JSON 不合规或篇幅切片不完整，请输出修正后的完整 JSON 对象（可包在 ```json 中），不要解释。\n\
                          错误：{err}\n\
                          要求：落实用户修订「{instructions}」；保留未点名情节；\
+                         plot_includes 至少 1 条；key_events 2–4 条；有进行中剧情卡时 plot_defers 至少 1 条；\
                          字符串内勿用未转义英文双引号；字段齐全。\n\n# 待修正原文\n{out}"
                     );
                     out = ctx
@@ -962,7 +1131,7 @@ impl ToolHandler for ReviseOutline {
             }
         };
 
-        let parsed = match parse_chapter_outline_text(&generated) {
+        let parsed = match parse_chapter_outline_text_budget(&generated) {
             Ok(o) => o,
             Err(e) => {
                 return Ok(ToolResult {
@@ -1013,7 +1182,7 @@ impl ToolHandler for ReviseOutline {
             return Ok(prev);
         }
 
-        write_chapter_outline(&dir, chapter, &pretty)?;
+        write_chapter_outline_budget(&dir, chapter, &pretty)?;
         Ok(ToolResult {
             output: format!("已更新第{chapter}章章纲（outline.json）"),
             data: json!({
@@ -1071,7 +1240,7 @@ impl ToolHandler for AuditChapter {
         let mut rev = RevisionOptions::default();
         rev.verify_previous = verify_previous;
         rev.full_rescan = full_rescan;
-        let run = run_pipeline_streaming(
+        let mut run = run_pipeline_streaming(
             ctx,
             &project,
             chapter,
@@ -1079,6 +1248,22 @@ impl ToolHandler for AuditChapter {
             rev,
         )
         .await?;
+        if run.auto_split && !run.published {
+            let to = run.auto_split_to.unwrap_or(chapter.saturating_add(1));
+            if let Some(p) = &ctx.progress {
+                let _ = p.send(format!("⚙ 已自动拆出第{to}章，复审第{chapter}章…"));
+            }
+            run = run_pipeline_streaming(
+                ctx,
+                &project,
+                chapter,
+                RunMode::AuditOnly,
+                RevisionOptions::default(),
+            )
+            .await?;
+            run.auto_split = true;
+            run.auto_split_to = Some(to);
+        }
         // When progress is live, the report already streamed via LlmDelta / step lines.
         // Do NOT paste run.message again — that duplicated the whole audit in the tool card.
         // Keep coda aligned with the real gate: consistency fail ≠ hard-rule block.
@@ -1358,6 +1543,158 @@ impl ToolHandler for AuditVolume {
             }),
         })
     }
+}
+
+#[async_trait]
+impl ToolHandler for ResearchMaterials {
+    fn name(&self) -> &'static str {
+        "research_materials"
+    }
+    fn description(&self) -> &'static str {
+        "剧情枯竭/需灵感时按需检索参考素材卡（非 Canon）。默认不调用；\
+         仅当 get_project_status / 激活建议出现 material_researcher，或用户明确要灵感时使用。\
+         产出 hooks 供 design_plot / 章纲注入，不改 Bible/正文。"
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "project":{"type":"string"},
+                "chapter":{"type":"integer","description":"当前章号，用于冷却；默认 next_chapter"},
+                "reason":{"type":"string","description":"conflict_thin|motif_repeat|world_texture_thin|plot_drought|other"},
+                "force":{"type":"boolean","description":"忽略冷却强制补充"}
+            },
+            "required":["project"]
+        })
+    }
+    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
+        let project = args["project"].as_str().unwrap_or("");
+        if project.is_empty() {
+            anyhow::bail!("project 必填");
+        }
+        let dir = project_dir(&ctx.projects_root, project);
+        let state = load_project_state(&dir)?;
+        let chapter = args["chapter"]
+            .as_u64()
+            .map(|n| n as u32)
+            .unwrap_or_else(|| state.next_chapter.max(1));
+        let reason = args["reason"].as_str().unwrap_or("plot_drought").trim();
+        let force = args["force"].as_bool().unwrap_or(false);
+
+        let mat_cfg = novelx_pipeline::load_material_runtime_config(&ctx.config_root);
+        if !mat_cfg.enabled {
+            return Ok(ToolResult {
+                output: "素材研究已在 decision_council.yaml 中关闭。".into(),
+                data: json!({
+                    "blocked": true,
+                    "reason": "material_disabled",
+                    "project": project,
+                }),
+            });
+        }
+        let cooldown = mat_cfg.cooldown_chapters;
+        let max_cards = mat_cfg.max_cards_per_call;
+        if !force && !novelx_pipeline::material_cooldown_allows(&dir, chapter, cooldown) {
+            return Ok(ToolResult {
+                output: format!(
+                    "素材冷却中（距上次不足 {cooldown} 章）。需要可传 force=true。"
+                ),
+                data: json!({
+                    "blocked": true,
+                    "reason": "material_cooldown",
+                    "project": project,
+                    "chapter": chapter,
+                    "cooldown_chapters": cooldown,
+                }),
+            });
+        }
+
+        let brief = novelx_pipeline::read_project_brief(&dir);
+        let (_src, bible_full) = novelx_pipeline::read_world_doc(&dir);
+        let bible = bible_full.chars().take(1600).collect::<String>();
+        let gaps = novelx_pipeline::active_plot_exit_context(&dir)
+            .map(|(entry, exit, _)| format!("活跃剧情「{}」收束：{exit}", entry.title))
+            .unwrap_or_else(|| "（无活跃剧情卡缺口描述）".into());
+        let skill = load_agent_skill(ctx, "material-researcher");
+        let prompt = novelx_pipeline::material_research_prompt(
+            &brief, &bible, &gaps, reason, max_cards,
+        );
+        let raw = ctx
+            .llm
+            .complete(
+                &skill,
+                &prompt,
+                Some(&ctx.llm.model_for_agent("material_researcher")),
+            )
+            .await?;
+        let parsed = extract_json_value_loose(&raw).unwrap_or_else(|| json!({}));
+        let cards = novelx_pipeline::parse_material_cards_json(&parsed, max_cards as usize);
+        if cards.is_empty() {
+            return Ok(ToolResult {
+                output: format!("素材 Agent 未产出可用卡片。原始输出节选：\n{}", &raw.chars().take(400).collect::<String>()),
+                data: json!({
+                    "blocked": true,
+                    "reason": "empty_materials",
+                    "project": project,
+                    "raw_excerpt": raw.chars().take(400).collect::<String>(),
+                }),
+            });
+        }
+        let ids = novelx_pipeline::save_material_cards(
+            &ctx.projects_root,
+            project,
+            chapter,
+            &cards,
+        )?;
+        let _ = novelx_pipeline::clear_drought_flag(&dir);
+        let _ = novelx_pipeline::clear_inspiration_flag(&dir);
+        let hooks: Vec<String> = cards
+            .iter()
+            .flat_map(|c| c.hooks.iter().cloned())
+            .take(8)
+            .collect();
+        Ok(ToolResult {
+            output: format!(
+                "已写入 {} 张参考素材卡（非 Canon）：{}。可在 design_plot / 章纲中使用 hooks。",
+                ids.len(),
+                ids.join(", ")
+            ),
+            data: json!({
+                "project": project,
+                "chapter": chapter,
+                "card_ids": ids,
+                "hooks": hooks,
+                "provenance": "model_grounded",
+                "do_not_canonize": true,
+            }),
+        })
+    }
+}
+
+fn extract_json_value_loose(raw: &str) -> Option<Value> {
+    let t = raw.trim();
+    if let Ok(v) = serde_json::from_str::<Value>(t) {
+        return Some(v);
+    }
+    if let Some(start) = t.find('{') {
+        if let Some(end) = t.rfind('}') {
+            if end > start {
+                if let Ok(v) = serde_json::from_str::<Value>(&t[start..=end]) {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    if let Some(start) = t.find('[') {
+        if let Some(end) = t.rfind(']') {
+            if end > start {
+                if let Ok(v) = serde_json::from_str::<Value>(&t[start..=end]) {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Audit current chapter; on pass, auto-advance until fail or queue done.
@@ -2327,6 +2664,10 @@ impl ToolHandler for ListPlots {
                     .pointer("/foreshadow/dangling_total")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
+                let pressure = health
+                    .pointer("/foreshadow/dangling_pressure")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 output.push_str(&format!(
                     "\n\n——\n项目状态：下一章={} 已发布={} setup={} volume={}",
                     state.next_chapter,
@@ -2335,7 +2676,7 @@ impl ToolHandler for ListPlots {
                     vol.as_str(),
                 ));
                 if dangling > 0 {
-                    output.push_str(&format!(" 伏笔未收={dangling}"));
+                    output.push_str(&format!(" 伏笔未收={dangling}（近债={pressure}）"));
                 }
             }
         }
@@ -3290,9 +3631,16 @@ async fn generate_plot_card(
     } else {
         format!("【当前卷纲】\n{arc_excerpt}")
     };
+    let dir = project_dir(&ctx.projects_root, project);
+    let mat_hooks = novelx_pipeline::format_material_hooks_for_context(&dir, 900);
+    let mat_block = if mat_hooks.is_empty() {
+        String::new()
+    } else {
+        format!("\n{mat_hooks}\n")
+    };
     let prompt = format!(
         "为《{project}》写剧情卡「{title}》。要点：{brief}\n\
-         {arc_block}\n\
+         {arc_block}{mat_block}\
          【层级】卷纲统揽整卷；本卡只写卷内**一段**情节（scope 必须是 local）。\
          从卷纲冲突阶梯中切出本段节点，禁止把整卷阶梯/终止条件抄进一张卡。\
          收束条件须是本段落点（通常严于/早于卷纲终止条件），并写 next_plot 指向下一段。\
@@ -3959,10 +4307,15 @@ impl ToolHandler for GetProjectStatus {
         let health = longform_health_snapshot(&dir);
         if let Some(fs) = health.get("foreshadow") {
             let total = fs.get("dangling_total").and_then(|v| v.as_u64()).unwrap_or(0);
+            let pressure = fs
+                .get("dangling_pressure")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let far = fs.get("dangling_far").and_then(|v| v.as_u64()).unwrap_or(0);
             let cold = fs.get("open_cold").and_then(|v| v.as_u64()).unwrap_or(0);
             if total > 0 {
                 output.push_str(&format!(
-                    "\n伏笔债务：未收 {total} 条（冷归档 {cold}）"
+                    "\n伏笔债务：总量 {total}（近债/压力 {pressure}，远期 {far}，冷归档 {cold}）"
                 ));
             }
         }
@@ -4658,6 +5011,125 @@ impl ToolHandler for DeleteEntity {
     }
 }
 
+pub struct ListVersionNodes;
+pub struct RestoreVersionNode;
+
+#[async_trait]
+impl ToolHandler for ListVersionNodes {
+    fn name(&self) -> &'static str {
+        "list_version_nodes"
+    }
+    fn description(&self) -> &'static str {
+        "列出作品 shadow git 版本节点（最近优先），供回退选择"
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "project":{"type":"string"},
+                "limit":{"type":"integer","description":"默认 30，最大 200"}
+            },
+            "required":["project"]
+        })
+    }
+    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
+        let project = args["project"].as_str().unwrap_or("");
+        if project.is_empty() {
+            anyhow::bail!("project 必填");
+        }
+        let limit = args["limit"].as_u64().unwrap_or(30).clamp(1, 200) as usize;
+        let dir = project_dir(&ctx.projects_root, project);
+        if novelx_pipeline::version_git_available() {
+            let _ = novelx_pipeline::ensure_version_repo(&dir);
+        }
+        let nodes = novelx_pipeline::list_version_nodes(&dir, limit)?;
+        let lines: Vec<String> = nodes
+            .iter()
+            .map(|n| {
+                format!(
+                    "{}  {}  {}{}",
+                    &n.sha[..n.sha.len().min(10)],
+                    n.label,
+                    n.summary.chars().take(60).collect::<String>(),
+                    n.chapter.map(|c| format!("  ch{c}")).unwrap_or_default()
+                )
+            })
+            .collect();
+        Ok(ToolResult {
+            output: if lines.is_empty() {
+                "尚无版本节点（首次改盘后会自动打点）".into()
+            } else {
+                lines.join("\n")
+            },
+            data: json!({
+                "project": project,
+                "count": nodes.len(),
+                "nodes": nodes,
+            }),
+        })
+    }
+}
+
+#[async_trait]
+impl ToolHandler for RestoreVersionNode {
+    fn name(&self) -> &'static str {
+        "restore_version_node"
+    }
+    fn description(&self) -> &'static str {
+        "将作品工作树回退到指定版本节点 sha（高位操作，须人审确认；会先打 pre-restore 安全点）"
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "project":{"type":"string"},
+                "sha":{"type":"string","description":"版本节点 commit sha（可短 hash）"},
+                "apply":{"type":"boolean"},
+                "mutation_id":{"type":"string"}
+            },
+            "required":["project","sha"]
+        })
+    }
+    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
+        let project = args["project"].as_str().unwrap_or("");
+        let sha = args["sha"].as_str().unwrap_or("").trim();
+        if project.is_empty() || sha.is_empty() {
+            anyhow::bail!("project 与 sha 必填");
+        }
+        if !novelx_pipeline::version_git_available() {
+            return Ok(ToolResult {
+                output: "本机未安装 git，无法回退版本节点".into(),
+                data: json!({"blocked": true, "reason": "git_missing", "project": project}),
+            });
+        }
+        if let Some(prev) = mutation::maybe_preview(
+            &ctx.config_root,
+            &args,
+            "restore_version_node",
+            &format!("将回退作品到版本节点 {sha}"),
+            json!({ "sha": sha, "project": project }),
+            "restore_version_node",
+            args.clone(),
+        ) {
+            return Ok(prev);
+        }
+        let dir = project_dir(&ctx.projects_root, project);
+        let node = novelx_pipeline::restore_version_node(&dir, sha)?;
+        Ok(ToolResult {
+            output: format!(
+                "已回退到 {}（{}）",
+                &node.sha[..node.sha.len().min(12)],
+                node.label
+            ),
+            data: json!({
+                "project": project,
+                "restored": true,
+                "node": node,
+            }),
+        })
+    }
+}
+
 pub fn all_tools() -> Vec<Arc<dyn ToolHandler>> {
     vec![
         Arc::new(ListProjects),
@@ -4665,10 +5137,12 @@ pub fn all_tools() -> Vec<Arc<dyn ToolHandler>> {
         Arc::new(ContinueWritingBatch),
         Arc::new(ReplanVolume),
         Arc::new(ReviseChapter),
+        Arc::new(SplitChapter),
         Arc::new(ReviseOutline),
         Arc::new(AuditChapter),
         Arc::new(AuditChapters),
         Arc::new(AuditVolume),
+        Arc::new(ResearchMaterials),
         Arc::new(ApplyDraftPatch),
         Arc::new(InitNovel),
         Arc::new(CreateNovel),
@@ -4691,6 +5165,8 @@ pub fn all_tools() -> Vec<Arc<dyn ToolHandler>> {
         Arc::new(DesignArcOutline),
         Arc::new(SyncVolume),
         Arc::new(ConfirmVolumeMemory),
+        Arc::new(ListVersionNodes),
+        Arc::new(RestoreVersionNode),
         Arc::new(SteerRun),
         Arc::new(OfferDecisions),
         Arc::new(ActivateAgents),
@@ -4839,6 +5315,16 @@ fn spawn_pipeline_progress_forwarder(
                             }
                         }
                         LlmProgressKind::GeneratingHint => continue,
+                        LlmProgressKind::StreamRestart => {
+                            // Mid-stream full restart: server cleared the draft buffer;
+                            // reset UI accumulators or 「正文生成中」keeps climbing across retries.
+                            prose_chars.insert(agent.clone(), 0);
+                            last_emit_chars.remove(&agent);
+                            last_prose_emit.remove(&agent);
+                            last_draft_chars = 0;
+                            draft_backed = false;
+                            "  ⚠ 流中断，整段重试（进度已清零）…\n".into()
+                        }
                         LlmProgressKind::ModelDone { chars } => {
                             if chars == 0 {
                                 "  模型返回空（将按缺省处理）\n".into()
@@ -4987,6 +5473,8 @@ enum LlmProgressKind {
     CallStarted,
     WaitingFirst { secs: u32 },
     GeneratingHint,
+    /// Mid-stream transport failure → full restart (clear UI char accumulators).
+    StreamRestart,
     ModelDone { chars: usize },
     /// Mirrored model tokens — throttled char ticks (skipped when draft flush is active).
     Prose,
@@ -5002,6 +5490,10 @@ fn classify_llm_progress_delta(delta: &str) -> LlmProgressKind {
     }
     if let Some(secs) = parse_wait_first_secs(t) {
         return LlmProgressKind::WaitingFirst { secs };
+    }
+    // Emitted by novelx-llm before on_restart clears the draft buffer.
+    if t.contains("模型流中断") || t.contains("整段重试") {
+        return LlmProgressKind::StreamRestart;
     }
     if t.contains("生成中…") || t.contains("已生成约") {
         return LlmProgressKind::GeneratingHint;
@@ -5027,6 +5519,31 @@ fn classify_llm_progress_delta(delta: &str) -> LlmProgressKind {
     // often begins a parenthetical (e.g. 「（BLOOD-001）」) and would leak bare「（」
     // lines into the tool card. Harness status lines are already matched above.
     LlmProgressKind::Prose
+}
+
+#[cfg(test)]
+mod llm_progress_classify_tests {
+    use super::{classify_llm_progress_delta, LlmProgressKind};
+
+    #[test]
+    fn stream_restart_marker_resets_progress_kind() {
+        assert!(matches!(
+            classify_llm_progress_delta("⚠ 模型流中断，整段重试（1/3）…"),
+            LlmProgressKind::StreamRestart
+        ));
+        assert!(matches!(
+            classify_llm_progress_delta("整段重试中"),
+            LlmProgressKind::StreamRestart
+        ));
+    }
+
+    #[test]
+    fn prose_not_confused_with_restart() {
+        assert!(matches!(
+            classify_llm_progress_delta("陈衍推开门，听到重试机关的咔哒声。"),
+            LlmProgressKind::Prose
+        ));
+    }
 }
 
 #[cfg(test)]

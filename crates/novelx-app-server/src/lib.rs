@@ -157,6 +157,14 @@ pub async fn serve(repo_root: PathBuf, addr: SocketAddr) -> Result<()> {
             get(ops_journal_get),
         )
         .route(
+            "/api/projects/{name}/version_nodes",
+            get(version_nodes_get),
+        )
+        .route(
+            "/api/projects/{name}/version_nodes/{sha}/restore",
+            post(version_nodes_restore),
+        )
+        .route(
             "/api/projects/{name}/chapters/{chapter}",
             get(chapter_get).delete(chapter_delete),
         )
@@ -1289,6 +1297,90 @@ async fn ops_journal_get(
 }
 
 #[derive(Debug, Deserialize)]
+struct VersionNodesGetQuery {
+    #[serde(default = "default_version_nodes_limit")]
+    limit: usize,
+}
+
+fn default_version_nodes_limit() -> usize {
+    40
+}
+
+async fn version_nodes_get(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(q): Query<VersionNodesGetQuery>,
+) -> impl IntoResponse {
+    let dir = state.repo_root.join("projects").join(&name);
+    if !dir.is_dir() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("项目「{name}」不存在"),
+            })),
+        )
+            .into_response();
+    }
+    let limit = q.limit.clamp(1, 500);
+    match state.core.list_project_version_nodes(&name, limit) {
+        Ok(nodes) => Json(serde_json::json!({
+            "ok": true,
+            "project": name,
+            "count": nodes.len(),
+            "nodes": nodes,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": e.to_string(),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn version_nodes_restore(
+    State(state): State<AppState>,
+    Path((name, sha)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let dir = state.repo_root.join("projects").join(&name);
+    if !dir.is_dir() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("项目「{name}」不存在"),
+            })),
+        )
+            .into_response();
+    }
+    match state
+        .core
+        .restore_project_version_node(&name, &sha, None, None)
+        .await
+    {
+        Ok(node) => Json(serde_json::json!({
+            "ok": true,
+            "project": name,
+            "restored": true,
+            "node": node,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": e.to_string(),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct ContentPutReq {
     tab: String,
     content: String,
@@ -1677,6 +1769,7 @@ fn event_matches_thread(ev: &EventMsg, thread_id: &str) -> bool {
         | EventMsg::ReasoningContentDelta { thread_id: tid, .. }
         | EventMsg::ToolCallOutputDelta { thread_id: tid, .. }
         | EventMsg::RequestUserInput { thread_id: tid, .. }
+        | EventMsg::SessionPhaseChanged { thread_id: tid, .. }
         | EventMsg::TodoUpdated { thread_id: tid, .. }
         | EventMsg::ChatHistoryReset { thread_id: tid, .. } => tid == thread_id,
         EventMsg::AgentStatusChanged { status } => {

@@ -251,10 +251,13 @@ fn default_overnight() -> Vec<String> {
     .collect()
 }
 fn default_daypart_recall() -> Vec<String> {
-    ["最初", "原先", "开始时", "曾经", "那时", "想起", "回忆", "梦里", "梦中"]
-        .into_iter()
-        .map(String::from)
-        .collect()
+    [
+        "最初", "原先", "开始时", "曾经", "那时", "想起", "回忆", "梦里", "梦中",
+        "昨天", "昨日", "前天", "大前天", "那天", "前一天",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 fn default_schedule_patterns() -> Vec<String> {
     [
@@ -917,6 +920,30 @@ fn is_schedule_range(cfg: &ContentRulesConfig, line: &str) -> bool {
         .any(|p| !p.is_empty() && line.contains(p))
 }
 
+/// «不是清晨该有的…» / «不像下午那样…» — daypart word used as comparison, not clock.
+fn is_rhetorical_daypart(line: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "不是清晨",
+        "不是凌晨",
+        "不是黎明",
+        "不是早晨",
+        "不是上午",
+        "不是中午",
+        "不是午后",
+        "不是下午",
+        "不是傍晚",
+        "不是黄昏",
+        "不是夜里",
+        "不是夜晚",
+        "不是深夜",
+        "该有的",
+        "该有之",
+        "不像",
+        "不似",
+    ];
+    MARKERS.iter().any(|m| line.contains(m))
+}
+
 fn check_daypart_regression(
     cfg: &ContentRulesConfig,
     draft: &str,
@@ -934,6 +961,10 @@ fn check_daypart_regression(
             continue;
         }
         if is_schedule_range(cfg, &narrative) || is_schedule_range(cfg, line) {
+            continue;
+        }
+        // Rhetorical / counterfactual daypart («不是清晨该有的温度») — not a clock move.
+        if is_rhetorical_daypart(&narrative) {
             continue;
         }
         let Some((word, rank)) = daypart_rank_cfg(cfg, &narrative) else {
@@ -1071,6 +1102,20 @@ mod tests {
         assert!(
             v.iter().any(|x| x.rule == "timeline_daypart_regression"),
             "expected daypart regression, got {v:?}"
+        );
+    }
+
+    #[test]
+    fn yesterday_afternoon_recall_not_daypart_advance() {
+        let draft = "\
+# 第1章\n\n\
+天还没亮。\n\n\
+短信里是昨天下午居委会发的通知。\n\n\
+铁杆的温度不是清晨该有的温度。\n";
+        let v = check_draft(draft, &[]);
+        assert!(
+            !v.iter().any(|x| x.rule == "timeline_daypart_regression"),
+            "recall/rhetorical daypart must not block: {v:?}"
         );
     }
 

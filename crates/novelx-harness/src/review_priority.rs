@@ -244,7 +244,11 @@ fn is_hook_continuity_blocker(msg: &str) -> bool {
 fn has_soft_nonblocker_markers(msg: &str) -> bool {
     [
         "不算硬冲突",
+        "不算硬",
         "不构成硬",
+        "不构成硬性",
+        "不构成硬性回跳",
+        "故不构成",
         "不构成强制",
         "可接受",
         "微小波动",
@@ -274,16 +278,40 @@ fn has_soft_nonblocker_markers(msg: &str) -> bool {
     .any(|s| msg.contains(s))
 }
 
+/// Explicit soft denials that must demote even when the message still contains「回跳」.
+fn has_explicit_soft_denial(msg: &str) -> bool {
+    [
+        "不构成硬",
+        "不构成硬性",
+        "不构成硬性回跳",
+        "故不构成",
+        "不算硬",
+        "不算硬冲突",
+    ]
+    .iter()
+    .any(|s| msg.contains(s))
+}
+
 /// Soft narrative gaps must not block publish as P0.
 fn should_demote_to_p1(issue: &Value) -> bool {
     let ty = issue_type(issue);
     let msg = issue_message(issue);
+    // Soft denial of hard conflict always wins (including「不构成硬性回跳」).
+    if has_explicit_soft_denial(&msg) {
+        return true;
+    }
     // Explicit soft verdict wins even if type is TIMELINE/ABILITY_LOC and model said P0.
+    // Do not let hedging suffixes (请确认/隐患) demote factual TIMELINE/INJURY conflicts —
+    // those belong in ABILITY_LOC-specific arms below.
     if has_soft_nonblocker_markers(&msg) && !msg.contains("回跳到") && !msg.contains("倒计时回跳")
     {
-        // "没有回跳…不算硬冲突" → demote; "从14:52回跳到14:58" → keep hard.
+        // "没有回跳…不算硬冲突" → demote; "从14:52回跳到14:58" → keep hard
+        // unless an explicit soft denial already returned above.
         if !(msg.contains("回跳") && !msg.contains("没有回跳") && !msg.contains("无回跳")) {
-            return true;
+            let hard_type = matches!(ty.as_str(), "TIMELINE" | "INJURY");
+            if !(hard_type && has_hard_conflict_markers(&msg)) {
+                return true;
+            }
         }
     }
     match ty.as_str() {
@@ -297,7 +325,8 @@ fn should_demote_to_p1(issue: &Value) -> bool {
                 || msg.contains("偏少")
                 || msg.contains("压缩")
                 || msg.contains("读感")
-                || msg.contains("跳动次数"))
+                || msg.contains("跳动次数")
+                || msg.contains("仅提示"))
                 && !msg.contains("回跳到")
                 && !msg.contains("互斥")
         }
@@ -308,6 +337,10 @@ fn should_demote_to_p1(issue: &Value) -> bool {
                 || msg.contains("可能让读者")
                 || msg.contains("视觉错觉")
                 || msg.contains("防止设定质疑")
+                || msg.contains("请确认")
+                || msg.contains("隐患")
+                || msg.contains("未明示")
+                || msg.contains("未产生矛盾")
                 || (!has_hard_conflict_markers(&msg)
                     && (msg.contains("误以为") || msg.contains("易误导")))
         }
@@ -856,6 +889,46 @@ mod tests {
         })]);
         assert!(!has_p0, "{issues:?}");
         assert_eq!(issues[0]["priority"], "P1");
+    }
+
+    #[test]
+    fn demotes_soft_daypart_denial_containing_regression_word() {
+        // 「不构成硬性回跳」still contains「回跳」— must not keep P0 / force_full.
+        let msg = "上章末句出现时段词「晨光」，本章开篇未明确交代时段。全章未见明确时段词回跳，\
+故不构成硬性回跳。仅提示：若后续需明确当前时刻，应沿时间线前进。";
+        let (has_p0, issues) = normalize_consistency_issues(vec![json!({
+            "type": "TIMELINE",
+            "priority": "P0",
+            "message": msg,
+        })]);
+        assert!(!has_p0, "{issues:?}");
+        assert_eq!(issues[0]["priority"], "P1");
+        assert!(!has_timeline_p0(&issues));
+    }
+
+    #[test]
+    fn demotes_ability_loc_please_confirm_without_hard_conflict() {
+        let (has_p0, issues) = normalize_consistency_issues(vec![json!({
+            "type": "ABILITY_LOC",
+            "priority": "P0",
+            "message": "正文未交代双手侧别对应的螺旋纹分布是否仅限左手，若右手无纹则无问题；\
+当前表述未产生矛盾，因属新增人物能力寄宿侧别影响后续核对，故标P0请确认。",
+        })]);
+        assert!(!has_p0, "{issues:?}");
+        assert_eq!(issues[0]["priority"], "P1");
+    }
+
+    #[test]
+    fn hard_timeline_with_please_confirm_suffix_stays_p0() {
+        // 「请确认」must not globally demote a factual TIMELINE conflict.
+        let (has_p0, issues) = normalize_consistency_issues(vec![json!({
+            "type": "TIMELINE",
+            "priority": "P0",
+            "message": "倒计时从14:52回跳到14:58，前后互斥，请确认。",
+        })]);
+        assert!(has_p0, "{issues:?}");
+        assert_eq!(issues[0]["priority"], "P0");
+        assert!(has_timeline_p0(&issues));
     }
 
     #[test]

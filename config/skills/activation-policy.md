@@ -57,14 +57,16 @@ chapter_planner → lore_librarian → writer
 | Agent | 何时考虑激活 |
 |-------|-------------|
 | world_architect | 尚无 Bible |
-| nomenclature_curator | 尚无名词表 / 有 Bible / 章纲有新实体 |
+| nomenclature_curator | 尚无名词表 / 章纲或正文有新实体提示（勿因仅有 Bible 每章必跑） |
 | dialogue_specialist | 对话密集 |
 | scene_specialist | 场景/动作高潮 |
-| foreshadow_tracker | 未收束伏笔 |
+| foreshadow_tracker | 未收束伏笔；或已发布 >10 章（lean：无未收时奇数章跳过） |
 | literary_editor | **非 MVP**。规则建议（近章审校失败率偏高）或 Studio `activate_agents`；用户点名润色时持久激活，勿每章必跑 |
 | master_planner / arc_planner | 尚无总纲/卷纲 |
 | expectation_reviewer | **不进章流水线**。由 Studio `review_expected_events` 在硬条件满足时调用；用户决策纳入/跳过 |
 | volume_auditor | **不进章流水线**。Studio `audit_volume` 摘要层复盘 + 建议深审章；深审再走 `audit_chapters` |
+| decision_council | **不进章流水线**。仅审校决策冲突加审时 spawn；见 `decision_council.yaml` |
+| material_researcher | **不进章流水线**。仅剧情枯竭 / 需灵感时 `research_materials`；产出参考卡非 Canon |
 
 共享短文：`prose-pitfalls`（正文硬雷区）、`content-formats`（落盘格式）、`volume-lifecycle`（卷相位/衔接章）由运行时按 Agent 白名单前缀注入；勿在各 SKILL 内复制长文。
 
@@ -74,6 +76,9 @@ chapter_planner → lore_librarian → writer
 
 **仅当一致性审校未通过**（或基础设施失败重试、队列/卷审等系统已 `open_gate`）时，才出现审校决策卡。  
 内容审校失败时优先 **按 issue 决策**（Studio `offer_decisions`，或系统按 P0 兜底）。  
+当 `studio.decision_council` 开启时：内容审校 FAIL 先走评审团自动修订（不自动 accept P0）；死锁 / 基础设施失败 / 超重试才人审。  
+章通过后 `studio.seal_on_chapter_pass` 会切割 Studio 对话，下一章只吃落盘 CanonContext。  
 **审校已通过**（即使报告有 P1/P2）**不弹**审校门控；用户要改走 `revise_chapter`。
 
-静态门控模板见 `config/gates.yaml`；动态审校选项由 pending_audit.decision_options 生成。`steer_run` 支持 `issue_ids`。
+静态门控模板见 `config/gates.yaml`；动态审校选项由 pending_audit.decision_options 生成。`steer_run` 支持 `issue_ids`。  
+评审团与素材策略见 `config/decision_council.yaml`。

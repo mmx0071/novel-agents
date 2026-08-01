@@ -1,13 +1,149 @@
 //! Foreshadow index: durable dangling list for CanonContext + tracker read-back.
 //! Longform: age-boosted display (oldest first) + cold archive never hard-drops.
+//! Debt tiers: batch brake uses pressure (overdue near/mid), not total / far-horizon.
 
 use crate::cards::truncate_chars;
 use crate::memory::{
     load_foreshadow_archive, load_memory, select_dangling_age_boosted, OpenThread, ProjectMemory,
 };
 use anyhow::{Context, Result};
+use novelx_harness::ForeshadowDebtConfig;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+
+/// Batch-relevant debt class for one open foreshadow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForeshadowDebtClass {
+    /// Within grace after plant — inventory only.
+    Fresh,
+    /// Overdue near-term pressure — counts for batch brake.
+    Near,
+    /// Older pressure band — counts when `batch_count_mid`.
+    Mid,
+    /// Long-horizon / low urgency — never counts for batch brake.
+    Far,
+}
+
+impl ForeshadowDebtClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Near => "near",
+            Self::Mid => "mid",
+            Self::Far => "far",
+        }
+    }
+
+    pub fn counts_for_batch(self, cfg: &ForeshadowDebtConfig) -> bool {
+        match self {
+            Self::Near => true,
+            Self::Mid => cfg.batch_count_mid,
+            Self::Fresh | Self::Far => false,
+        }
+    }
+}
+
+/// Normalize tracker `horizon` / `urgency` into near|mid|far (empty if unknown).
+pub fn normalize_foreshadow_horizon(horizon: &str, urgency: &str) -> String {
+    let h = horizon.trim().to_ascii_lowercase();
+    if matches!(h.as_str(), "near" | "mid" | "far") {
+        return h;
+    }
+    match urgency.trim().to_ascii_lowercase().as_str() {
+        "high" => "near".into(),
+        "mid" | "medium" => "mid".into(),
+        "low" => "far".into(),
+        _ => String::new(),
+    }
+}
+
+/// Classify one open thread relative to the chapter about to be written.
+pub fn classify_foreshadow_debt(
+    planted_chapter: u32,
+    horizon: &str,
+    urgency: &str,
+    current_chapter: u32,
+    cfg: &ForeshadowDebtConfig,
+) -> ForeshadowDebtClass {
+    let explicit = normalize_foreshadow_horizon(horizon, urgency);
+    if explicit == "far" {
+        return ForeshadowDebtClass::Far;
+    }
+    let age = if planted_chapter == 0 || current_chapter <= planted_chapter {
+        0
+    } else {
+        current_chapter.saturating_sub(planted_chapter)
+    };
+    let grace = cfg.grace_chapters;
+    let far_after = cfg.far_after_chapters.max(grace.saturating_add(1));
+
+    if explicit == "near" {
+        return if age <= grace {
+            ForeshadowDebtClass::Fresh
+        } else {
+            ForeshadowDebtClass::Near
+        };
+    }
+    if explicit == "mid" {
+        return if age <= grace {
+            ForeshadowDebtClass::Fresh
+        } else if age > far_after {
+            ForeshadowDebtClass::Far
+        } else {
+            ForeshadowDebtClass::Mid
+        };
+    }
+
+    // Auto (untagged): grace → fresh; (grace, far_after] → near pressure; older → far.
+    if age <= grace {
+        ForeshadowDebtClass::Fresh
+    } else if age > far_after {
+        ForeshadowDebtClass::Far
+    } else {
+        ForeshadowDebtClass::Near
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ForeshadowDebtBreakdown {
+    pub total: u32,
+    pub fresh: u32,
+    pub near: u32,
+    pub mid: u32,
+    pub far: u32,
+    /// Threads that count toward `batch_max_dangling_foreshadow`.
+    pub pressure: u32,
+}
+
+pub fn foreshadow_debt_breakdown(
+    dangling: &[OpenThread],
+    current_chapter: u32,
+    cfg: &ForeshadowDebtConfig,
+) -> ForeshadowDebtBreakdown {
+    let mut out = ForeshadowDebtBreakdown {
+        total: dangling.len() as u32,
+        ..Default::default()
+    };
+    for t in dangling {
+        let class = classify_foreshadow_debt(
+            t.planted_chapter,
+            &t.horizon,
+            &t.urgency,
+            current_chapter,
+            cfg,
+        );
+        match class {
+            ForeshadowDebtClass::Fresh => out.fresh += 1,
+            ForeshadowDebtClass::Near => out.near += 1,
+            ForeshadowDebtClass::Mid => out.mid += 1,
+            ForeshadowDebtClass::Far => out.far += 1,
+        }
+        if class.counts_for_batch(cfg) {
+            out.pressure += 1;
+        }
+    }
+    out
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ForeshadowIndex {
@@ -157,7 +293,69 @@ mod tests {
     use crate::memory::{
         append_foreshadow_archive, save_memory, OpenThread, ProjectMemory, ARCHIVED_THREAD_LIMIT,
     };
+    use novelx_harness::ForeshadowDebtConfig;
     use std::fs;
+
+    #[test]
+    fn debt_tiers_exclude_fresh_and_far_from_pressure() {
+        let cfg = ForeshadowDebtConfig {
+            grace_chapters: 6,
+            far_after_chapters: 40,
+            batch_count_mid: true,
+        };
+        // Recently planted → fresh, not pressure.
+        assert_eq!(
+            classify_foreshadow_debt(5, "", "", 7, &cfg),
+            ForeshadowDebtClass::Fresh
+        );
+        // Overdue untagged within far_after → near pressure.
+        assert_eq!(
+            classify_foreshadow_debt(1, "", "", 10, &cfg),
+            ForeshadowDebtClass::Near
+        );
+        // Very old untagged → far (long-horizon inventory).
+        assert_eq!(
+            classify_foreshadow_debt(1, "", "", 50, &cfg),
+            ForeshadowDebtClass::Far
+        );
+        // Explicit far never pressures, even if "overdue".
+        assert_eq!(
+            classify_foreshadow_debt(1, "far", "", 20, &cfg),
+            ForeshadowDebtClass::Far
+        );
+        // urgency=low → far.
+        assert_eq!(
+            classify_foreshadow_debt(1, "", "low", 20, &cfg),
+            ForeshadowDebtClass::Far
+        );
+
+        let threads = vec![
+            OpenThread {
+                id: "a".into(),
+                planted_chapter: 6,
+                ..Default::default()
+            },
+            OpenThread {
+                id: "b".into(),
+                planted_chapter: 1,
+                horizon: "far".into(),
+                ..Default::default()
+            },
+            OpenThread {
+                id: "c".into(),
+                planted_chapter: 1,
+                ..Default::default()
+            },
+        ];
+        let b = foreshadow_debt_breakdown(&threads, 10, &cfg);
+        assert_eq!(b.total, 3);
+        assert_eq!(b.fresh, 1); // a age=4
+        assert_eq!(b.far, 1); // b
+        assert_eq!(b.near, 1); // c age=9
+        assert_eq!(b.pressure, 1);
+        assert!(!ForeshadowDebtClass::Fresh.counts_for_batch(&cfg));
+        assert!(ForeshadowDebtClass::Near.counts_for_batch(&cfg));
+    }
 
     #[test]
     fn rebuild_includes_archived_and_prefers_oldest() {
@@ -174,14 +372,14 @@ mod tests {
                 text: "热窗口新伏笔".into(),
                 status: "open".into(),
                 planted_chapter: 50,
-                resolved_chapter: 0,
+                ..Default::default()
             }],
             archived_threads: vec![OpenThread {
                 id: "b".into(),
                 text: "归档旧伏笔".into(),
                 status: "open".into(),
                 planted_chapter: 1,
-                resolved_chapter: 0,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -220,7 +418,7 @@ mod tests {
                     text: format!("热归档{i}"),
                     status: "open".into(),
                     planted_chapter: 100 + i,
-                    resolved_chapter: 0,
+                    ..Default::default()
                 })
                 .collect(),
             ..Default::default()
@@ -233,7 +431,7 @@ mod tests {
                 text: "冷归档远古伏笔".into(),
                 status: "open".into(),
                 planted_chapter: 2,
-                resolved_chapter: 0,
+                ..Default::default()
             }],
         )
         .unwrap();

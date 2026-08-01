@@ -312,11 +312,45 @@ impl NovelxCore {
                     t.outline_rewrite_active = true;
                 }
                 let project = pending.project.clone();
-                let nudge = format!(
-                    "请继续推进项目「{project}」未完成步骤。立即调用工具；\
-                     除非用户明确要写章，禁止 continue_writing。完成后一句话确认。"
-                );
-                let summary = "好的，继续推进…";
+                let (nudge, summary) = if let StudioNextContext::PlotWrite {
+                    kind,
+                    title,
+                    ..
+                } = &pending.context
+                {
+                    if kind == "missing_exit" {
+                        let title = if title.is_empty() {
+                            "当前进行中剧情卡".to_string()
+                        } else {
+                            title.clone()
+                        };
+                        (
+                            format!(
+                                "项目「{project}」写章被拦：剧情卡「{title}」缺少可检验的「收束条件」。\
+                                 请立即补全该卡 frontmatter exit_condition 与正文「## 收束条件」\
+                                 （可核验的叙事落点，勿写成整卷终止）；可用 design_plot(force=true) \
+                                 重写该卡并保留其余要点。禁止 continue_writing。完成后一句话确认。"
+                            ),
+                            "好的，正在补全收束条件…",
+                        )
+                    } else {
+                        (
+                            format!(
+                                "请继续推进项目「{project}」未完成步骤。立即调用工具；\
+                                 除非用户明确要写章，禁止 continue_writing。完成后一句话确认。"
+                            ),
+                            "好的，继续推进…",
+                        )
+                    }
+                } else {
+                    (
+                        format!(
+                            "请继续推进项目「{project}」未完成步骤。立即调用工具；\
+                             除非用户明确要写章，禁止 continue_writing。完成后一句话确认。"
+                        ),
+                        "好的，继续推进…",
+                    )
+                };
                 self.emit_studio_next_summary(thread_id, turn_id, summary, false)
                     .await?;
                 self.enqueue_pending_user_text(thread_id, &nudge).await;
@@ -478,6 +512,7 @@ impl NovelxCore {
             "audit_setting" => "已收到选择，正在跑设定审计…",
             "design_plot" => "已收到选择，正在设计剧情卡…",
             "continue_writing" => "已收到选择，正在写章…",
+            "continue_writing_batch" => "已收到选择，正在连写（先处理未发布草稿）…",
             "audit_chapter" | "audit_chapters" => "已收到选择，正在审校…",
             "revise_chapter" => "已收到选择，正在修订…",
             "review_expected_events" => "已收到选择，正在检阅预期…",
@@ -507,28 +542,30 @@ impl NovelxCore {
             },
         )
         .await;
+        // StudioNext card already is the user's confirmation — skip a second mutation card.
+        let args = novelx_tools::with_confirm_skip(args.clone());
         let (output, data) = self
             .run_one_tool(thread_id, turn_id, tool_name, &args.to_string())
             .await?;
         let needs_confirm = data.get("needs_confirm").and_then(|v| v.as_bool()) == Some(true);
         let mut summary = format!("{intro}\n\n{output}");
         let gate_open = if needs_confirm {
-            self.maybe_offer_mutation_confirm(thread_id, turn_id, tool_name, args, &data)
+            self.maybe_offer_mutation_confirm(thread_id, turn_id, tool_name, &args, &data)
                 .await?
         } else {
             let asked_impact = self
-                .maybe_offer_impact_cascade(thread_id, turn_id, tool_name, args, &data)
+                .maybe_offer_impact_cascade(thread_id, turn_id, tool_name, &args, &data)
                 .await?;
             let asked_setup = if asked_impact {
                 false
             } else {
-                self.maybe_offer_setup_confirm(thread_id, turn_id, tool_name, args, &data)
+                self.maybe_offer_setup_confirm(thread_id, turn_id, tool_name, &args, &data)
                     .await?
             };
             let asked_followup = if asked_impact || asked_setup {
                 false
             } else {
-                self.maybe_offer_mutation_followup(thread_id, turn_id, tool_name, args, &data)
+                self.maybe_offer_mutation_followup(thread_id, turn_id, tool_name, &args, &data)
                     .await?
             };
             if asked_impact {

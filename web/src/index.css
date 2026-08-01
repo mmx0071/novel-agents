@@ -596,6 +596,44 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   text-decoration: underline;
 }
 
+.longform-health-debt-hint {
+  display: block;
+  margin-top: 0.2rem;
+  opacity: 0.7;
+  font-size: 0.72em;
+}
+
+.longform-debt-tag {
+  display: inline-block;
+  margin-right: 0.35rem;
+  padding: 0.05rem 0.35rem;
+  border-radius: 3px;
+  font-size: 0.72em;
+  line-height: 1.3;
+  vertical-align: 0.05em;
+  letter-spacing: 0.02em;
+}
+
+.longform-debt-tag.debt-near {
+  background: rgba(196, 92, 74, 0.22);
+  color: #e8a090;
+}
+
+.longform-debt-tag.debt-mid {
+  background: rgba(196, 146, 58, 0.22);
+  color: #e0c080;
+}
+
+.longform-debt-tag.debt-fresh {
+  background: rgba(90, 143, 106, 0.22);
+  color: #9ec9a8;
+}
+
+.longform-debt-tag.debt-far {
+  background: rgba(106, 122, 143, 0.22);
+  color: #a8b4c4;
+}
+
 .reader-volume-strip {
   display: flex;
   flex-wrap: wrap;
@@ -2646,6 +2684,41 @@ pre.nx-msg-text {
 .writing-prefs-empty {
   font-size: 0.78rem;
   color: #6b7280;
+}
+
+.version-nodes-list {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 280px;
+  overflow: auto;
+}
+
+.version-nodes-list li {
+  border-top: 1px solid rgba(120, 130, 150, 0.2);
+  padding-top: 8px;
+}
+
+.version-node-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 0.72rem;
+  color: #9ca3af;
+}
+
+.version-node-meta code {
+  font-size: 0.7rem;
+  color: #d1d5db;
+}
+
+.version-node-summary {
+  font-size: 0.75rem;
+  color: #e5e7eb;
+  margin: 4px 0 6px;
 }
 
 .engine-drawer-root {

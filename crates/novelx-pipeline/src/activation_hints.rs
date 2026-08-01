@@ -56,6 +56,13 @@ pub fn collect_studio_activation_hints(
 
 fn hint_for_suggestion(s: &ActivationSuggestion, project_name: &str) -> Option<StudioActivationHint> {
     match s.agent.as_str() {
+        "material_researcher" => Some(StudioActivationHint {
+            agent: s.agent.clone(),
+            reason: s.reason.clone(),
+            tool_hint: format!(
+                "research_materials(project=\"{project_name}\", reason=\"plot_drought\")"
+            ),
+        }),
         "volume_auditor" => Some(StudioActivationHint {
             agent: s.agent.clone(),
             reason: s.reason.clone(),

@@ -18,7 +18,9 @@ pub use activation::{
 pub use chapter_budget::{
     consecutive_soft_short_from_meta, set_consecutive_soft_short, ChapterBudget, LengthAssessment,
 };
-pub use longform::{AuditTier, ImpactScanMode, LongformConfig, QualityTier};
+pub use longform::{
+    AuditTier, ForeshadowDebtConfig, ImpactScanMode, LongformConfig, QualityTier,
+};
 pub use continuity::{ContinuityBudget, ContinuityTier};
 pub use content_rules::{
     check_draft, check_draft_with, has_blocking_violation, rewrite_meta_chapter_refs_in_body,

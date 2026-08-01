@@ -107,6 +107,12 @@ pub fn init_project(
 
     let bible = format!("# {name}\n\n题材：{genre}\n\n（世界观 Bible 待完善）\n");
     fs::write(dir.join("artifacts/bible.md"), &bible)?;
+    // Best-effort shadow git for version nodes (ignore if git missing).
+    if crate::version_nodes::git_available() {
+        if let Err(e) = crate::version_nodes::ensure_repo(&dir) {
+            tracing::warn!(error = %e, "version repo init skipped");
+        }
+    }
     Ok(dir)
 }
 
@@ -365,8 +371,44 @@ pub fn read_chapter_outline(project_dir: &Path, chapter: u32) -> Option<String> 
 }
 
 /// Validate and write `outline.json` (JSON object or fenced JSON text).
+/// Legacy-compatible: allows `key_events` above the chapter budget (Web / migrate).
 pub fn write_chapter_outline(project_dir: &Path, chapter: u32, outline: &str) -> Result<()> {
-    let parsed = crate::schemas::parse_chapter_outline_text(outline)?;
+    write_chapter_outline_with(
+        project_dir,
+        chapter,
+        outline,
+        crate::schemas::OutlineValidateMode::Compatible,
+    )
+}
+
+/// Write outline enforcing chapter budget (`key_events` ≤ 4). Use for planner / revise_outline.
+pub fn write_chapter_outline_budget(
+    project_dir: &Path,
+    chapter: u32,
+    outline: &str,
+) -> Result<()> {
+    write_chapter_outline_with(
+        project_dir,
+        chapter,
+        outline,
+        crate::schemas::OutlineValidateMode::EnforceBudget,
+    )
+}
+
+fn write_chapter_outline_with(
+    project_dir: &Path,
+    chapter: u32,
+    outline: &str,
+    mode: crate::schemas::OutlineValidateMode,
+) -> Result<()> {
+    let parsed = match mode {
+        crate::schemas::OutlineValidateMode::Compatible => {
+            crate::schemas::parse_chapter_outline_text(outline)?
+        }
+        crate::schemas::OutlineValidateMode::EnforceBudget => {
+            crate::schemas::parse_chapter_outline_text_budget(outline)?
+        }
+    };
     let dir = chapter_dir(project_dir, chapter);
     fs::create_dir_all(&dir)?;
     let pretty = serde_json::to_string_pretty(&parsed)?;
@@ -613,7 +655,7 @@ mod tests {
                 text: "第二章才埋的线".into(),
                 status: "open".into(),
                 planted_chapter: 2,
-                resolved_chapter: 0,
+                ..Default::default()
             }],
             ..Default::default()
         };

@@ -92,6 +92,12 @@ pub struct OpenThread {
     pub planted_chapter: u32,
     #[serde(default)]
     pub resolved_chapter: u32,
+    /// Expected payoff distance: `near` | `mid` | `far` (empty = auto by age).
+    #[serde(default)]
+    pub horizon: String,
+    /// Tracker urgency: `low` | `mid` | `high` (empty = unknown).
+    #[serde(default)]
+    pub urgency: String,
 }
 
 fn default_open() -> String {
@@ -336,7 +342,7 @@ pub fn apply_summary_json(project_dir: &Path, chapter: u32, summary_raw: &str) -
                 text,
                 status: "open".into(),
                 planted_chapter: chapter,
-                resolved_chapter: 0,
+                ..Default::default()
             });
         }
     }
@@ -1542,22 +1548,13 @@ pub fn longform_health_snapshot(project_dir: &Path) -> Value {
     // Index is authoritative after rebuild (hot + archived + open cold, deduped).
     // Studio / Web debt panel needs the full list (prompt context still uses dangling_show).
     let dangling_total = idx.dangling.len();
-    let mut oldest = idx.dangling.clone();
-    oldest.sort_by(foreshadow_age_priority);
-    let oldest_lines: Vec<Value> = oldest
-        .iter()
-        .map(|t| {
-            serde_json::json!({
-                "id": t.id,
-                "text": truncate_chars(&t.text, 120),
-                "planted_chapter": t.planted_chapter,
-                "status": if t.status.is_empty() { "open" } else { &t.status },
-            })
-        })
-        .collect();
     let rolls = load_all_volume_rollups(project_dir);
     let state = crate::project::load_project_state(project_dir).ok();
     let published = state.as_ref().map(|s| s.published_count).unwrap_or(0);
+    let current_for_debt = state
+        .as_ref()
+        .map(|s| s.next_chapter.max(1))
+        .unwrap_or(1);
     let vol = crate::volume::active_volume_for_chapter(project_dir, published.max(1));
     let mid_threshold = crate::volume_audit_gate::mid_audit_threshold_resolved(project_dir);
     let thick_threshold = crate::volume_audit_gate::thick_volume_threshold_resolved(project_dir);
@@ -1610,7 +1607,9 @@ pub fn longform_health_snapshot(project_dir: &Path) -> Value {
             match word_budget.assess_body_chars(n) {
                 novelx_harness::LengthAssessment::HardShort => recent_hard += 1,
                 novelx_harness::LengthAssessment::SoftShort => recent_soft += 1,
-                novelx_harness::LengthAssessment::Ok => recent_ok += 1,
+                novelx_harness::LengthAssessment::HardLong
+                | novelx_harness::LengthAssessment::SoftLong
+                | novelx_harness::LengthAssessment::Ok => recent_ok += 1,
             }
         }
     }
@@ -1624,12 +1623,46 @@ pub fn longform_health_snapshot(project_dir: &Path) -> Value {
     let lf = crate::volume_audit_gate::find_config_root(project_dir)
         .map(|r| novelx_harness::LongformConfig::load_from_config_root(&r))
         .unwrap_or_default();
+    let debt = crate::foreshadow::foreshadow_debt_breakdown(
+        &idx.dangling,
+        current_for_debt,
+        &lf.foreshadow_debt,
+    );
+    let mut oldest = idx.dangling.clone();
+    oldest.sort_by(foreshadow_age_priority);
+    let oldest_lines: Vec<Value> = oldest
+        .iter()
+        .map(|t| {
+            let class = crate::foreshadow::classify_foreshadow_debt(
+                t.planted_chapter,
+                &t.horizon,
+                &t.urgency,
+                current_for_debt,
+                &lf.foreshadow_debt,
+            );
+            serde_json::json!({
+                "id": t.id,
+                "text": truncate_chars(&t.text, 120),
+                "planted_chapter": t.planted_chapter,
+                "status": if t.status.is_empty() { "open" } else { &t.status },
+                "horizon": t.horizon,
+                "urgency": t.urgency,
+                "debt_class": class.as_str(),
+            })
+        })
+        .collect();
     serde_json::json!({
         "foreshadow": {
             "open_hot": open_hot,
             "open_archived": open_archived,
             "open_cold": open_cold,
             "dangling_total": dangling_total,
+            "dangling_fresh": debt.fresh,
+            "dangling_near": debt.near,
+            "dangling_mid": debt.mid,
+            "dangling_far": debt.far,
+            "dangling_pressure": debt.pressure,
+            "debt_current_chapter": current_for_debt,
             "oldest": oldest_lines,
         },
         "volume": {
@@ -1646,6 +1679,7 @@ pub fn longform_health_snapshot(project_dir: &Path) -> Value {
             "word_min": word_budget.word_min,
             "word_max": word_budget.word_max,
             "word_hard_min": word_budget.word_hard_min,
+            "word_hard_max": word_budget.word_hard_max,
             "consecutive_soft_short": soft_short_streak,
             "recent_sampled": recent_n,
             "recent_soft_short": recent_soft,
@@ -1820,7 +1854,7 @@ mod tests {
                 text: format!("伏笔线索{i}矿井"),
                 status: "open".into(),
                 planted_chapter: i,
-                resolved_chapter: 0,
+                ..Default::default()
             });
         }
         prune_open_threads_into_archive(None, &mut mem).unwrap();
@@ -1857,7 +1891,7 @@ mod tests {
                 text: "远古驿站密信尚未揭开".into(),
                 status: "open".into(),
                 planted_chapter: 2,
-                resolved_chapter: 0,
+                ..Default::default()
             }],
         )
         .unwrap();
@@ -1889,7 +1923,7 @@ mod tests {
                 text: format!("长线伏笔{i}驿站密信"),
                 status: "open".into(),
                 planted_chapter: i,
-                resolved_chapter: 0,
+                ..Default::default()
             });
         }
         prune_open_threads_into_archive(Some(&dir), &mut mem).unwrap();
@@ -1982,17 +2016,23 @@ mod tests {
                 text: format!("伏笔线索{i}"),
                 status: "open".into(),
                 planted_chapter: i,
-                resolved_chapter: 0,
+                ..Default::default()
             });
         }
         save_memory(&dir, &mem).unwrap();
         let _ = crate::foreshadow::rebuild_foreshadow_index(&dir);
+        // next_chapter defaults to 1 when no state.json → most plants look "future";
+        // still expose tier fields for Studio.
         let snap = longform_health_snapshot(&dir);
         let fs = &snap["foreshadow"];
         assert_eq!(fs["dangling_total"], 12);
+        assert!(fs.get("dangling_pressure").is_some());
+        assert!(fs.get("dangling_fresh").is_some());
+        assert!(fs.get("dangling_far").is_some());
         let oldest = fs["oldest"].as_array().expect("oldest array");
         assert_eq!(oldest.len(), 12, "studio debt list must not truncate: {oldest:?}");
         assert_eq!(oldest[0]["planted_chapter"], 1);
+        assert!(oldest[0].get("debt_class").is_some());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2011,7 +2051,7 @@ mod tests {
                 text: "矿井下仍有回声".into(),
                 status: "open".into(),
                 planted_chapter: 4,
-                resolved_chapter: 0,
+                ..Default::default()
             }],
         )
         .unwrap();

@@ -96,8 +96,6 @@ agents:
     activation:
       - condition: no_nomenclature
         reason: 尚无名词表，需建立与能力绑定的命名体系
-      - condition: has_bible
-        reason: 世界观已建立，启用取名 Agent 管理全书名词
       - condition: has_new_entity_hints
         reason: 本章出现未登记的新实体待命名
 
@@ -158,8 +156,10 @@ agents:
         threshold: 0
         reason: 已有未收伏笔，须每章核销/延期
       - condition: chapter_count_gt
-        threshold: 2
-        reason: 第 3 章起系统化伏笔管理，降低长程丢失
+        threshold: 10
+        reason: >-
+          第 11 章起建议巡检（摘要可先埋线）；longform lean 在无未收且奇数章会跳过，
+          偶数章保留种植/巡检 cadence
 
   pacing_reviewer:
     name: 节奏审查
@@ -228,3 +228,24 @@ agents:
     description: 检阅预处理预期事件是否可纳入当前章/卷；不改正文，决策权在用户
     # 不进章流水线；由 Studio `review_expected_events` 按需调用
     activation: []
+
+  decision_council:
+    name: 评审团
+    layer: qa
+    tier: extended
+    description: 决策冲突加审；对候选选项打分，共识可自动修订，死锁才人审
+    # 不进章流水线；仅 Council 冲突加审时 spawn
+    activation: []
+
+  material_researcher:
+    name: 素材研究
+    layer: story
+    tier: extended
+    description: >-
+      剧情枯竭/需灵感时按需产出参考素材卡（非 Canon）；默认不进章流水线。
+      由 Studio `research_materials` 或 activate_agents 显式调用。
+    activation:
+      - condition: plot_drought
+        reason: 剧情冲突/钩子耗尽，建议补充背景素材
+      - condition: inspiration_needed
+        reason: 支路难分或质感不足，建议补充题材相关灵感素材

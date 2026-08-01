@@ -8,6 +8,10 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::path::Path;
 
+/// How many prior chapters to scan for injury / ability-locus facts.
+/// Wider than early MVP (4) so 800–1000ch longform keeps mid-arc wounds/loci hot.
+pub const BODY_STATE_LOOKBACK: usize = 8;
+
 /// Build a short locked board of injury / ability-locus facts for chapter N
 /// (sourced from prior digests + previous chapter summary).
 pub fn format_body_state_board(project_dir: &Path, chapter: u32) -> String {
@@ -82,7 +86,7 @@ fn collect_body_state_lines(project_dir: &Path, chapter: u32) -> Vec<(u32, Strin
         }
         cs.sort_unstable();
         cs.dedup();
-        cs.into_iter().rev().take(4).collect()
+        cs.into_iter().rev().take(BODY_STATE_LOOKBACK).collect()
     };
 
     for ch in prior_chs.iter().copied().rev() {
@@ -122,8 +126,9 @@ fn render_board(lines: &[(u32, String)]) -> String {
 
     let mut out = Vec::new();
     out.push(
-        "开写前锁定：本章描写伤势侧别/部位、能力寄宿/附着/载体与肢体控制时必须与下表一致；\
-若要改变，须写出可见转移过程（不得默默挪位）。"
+        "开写前锁定：脑中固定下表伤势侧别/部位与能力寄宿/附着/载体；\
+场面承接优先用症状与动作限制（颤抖、冷汗、握力发虚等），非分侧剧情勿反复点名左右；\
+必须分侧或变更时须与下表一致，并写出可见转移/愈合过程（不得默默挪位）。"
             .into(),
     );
     if !injuries.is_empty() {
@@ -205,6 +210,10 @@ fn has_side_or_site(s: &str) -> bool {
 }
 
 fn is_injury_fact(s: &str) -> bool {
+    // Ability-locus board lines may say «尚未造成伤痕» — not an injury side-lock.
+    if s.contains("能力位置：") {
+        return false;
+    }
     if s.starts_with("伤势：") || s.contains("伤势：") {
         return has_side_or_site(s) || s.contains("伤");
     }
@@ -255,15 +264,34 @@ const BODY_SITES: &[&str] = &[
     "肩", "臂", "手", "掌", "腕", "腿", "膝", "踝", "指", "肋",
 ];
 
+fn fact_mentions_side_site(fact: &str, side: char, site: &str) -> bool {
+    let direct = format!("{side}{site}");
+    if fact.contains(&direct) {
+        return true;
+    }
+    // «左小腿» / «右大腿» still count as the 腿 site.
+    for mid in ["小", "大"] {
+        if fact.contains(&format!("{side}{mid}{site}")) {
+            return true;
+        }
+    }
+    false
+}
+
 fn extract_side_site_locks(fact: &str) -> Vec<(char, &'static str)> {
     let mut out = Vec::new();
     for site in BODY_SITES {
-        let left = format!("左{site}");
-        let right = format!("右{site}");
-        if fact.contains(&left) {
+        let has_l = fact_mentions_side_site(fact, '左', site);
+        let has_r = fact_mentions_side_site(fact, '右', site);
+        // Comparative board lines («左腿伤、右腿可支撑») mention both sides — not an
+        // exclusive single-side lock; locking both makes normal prose impossible.
+        if has_l && has_r {
+            continue;
+        }
+        if has_l {
             out.push(('左', *site));
         }
-        if fact.contains(&right) {
+        if has_r {
             out.push(('右', *site));
         }
     }
@@ -271,24 +299,76 @@ fn extract_side_site_locks(fact: &str) -> Vec<(char, &'static str)> {
 }
 
 fn has_transfer_or_heal_marker(draft: &str) -> bool {
+    // Whole-draft exemption: only clear transfer/heal phrasing.
+    // Do NOT include bare「另一只手」— that would skip opposite-injury checks for the chapter.
     const MARKERS: &[&str] = &[
         "转移到",
         "挪到",
         "换到",
         "改用",
         "已经愈合",
-        "伤已",
-        "伤势已",
+        "伤已愈合",
+        "伤势已愈合",
+        "伤势已恢复",
         "包扎好",
         "换手",
         "换到另一",
         "移到另一",
+        "改用另一",
+        "换另一只",
     ];
     MARKERS.iter().any(|m| draft.contains(m))
 }
 
-/// Deterministic light check: if the board locks 左X / 右X and the draft uses the
-/// opposite side for the same site without a transfer/heal marker, block publish.
+/// Healed / residual injury lines must not act as exclusive side locks.
+fn is_inactive_side_lock_fact(fact: &str) -> bool {
+    // Avoid bare「伤势已」— it matches「伤势已加重/恶化」active worsenings.
+    const CUES: &[&str] = &[
+        "已愈合",
+        "已经愈合",
+        "伤已愈合",
+        "伤势已愈合",
+        "伤势已恢复",
+        "伤势已消退",
+        "消退至接近不可见",
+        "接近不可见",
+        "不影响动作",
+        "已恢复",
+        "已经恢复",
+        "并恢复",
+        "仅残留",
+        "残留痕迹",
+        "钝压感",
+        "退至",
+        "退回真皮",
+        "映射完成后退回",
+    ];
+    CUES.iter().any(|c| fact.contains(c))
+}
+
+/// Injury / wound cues — opposite-side words only block when co-occurring in-sentence.
+fn sentence_has_injury_cue(seg: &str) -> bool {
+    const CUES: &[&str] = &[
+        "伤", "伤口", "撕裂", "骨折", "渗血", "淤", "愈合", "痛得", "无法伸", "挫伤", "灼伤",
+        "扭伤", "血痕",
+    ];
+    CUES.iter().any(|c| seg.contains(c))
+}
+
+fn draft_has_opposite_injury_claim(draft: &str, opp: &str) -> bool {
+    draft
+        .split(|c| matches!(c, '。' | '！' | '？' | '\n' | '；' | ';'))
+        .any(|seg| {
+            let seg = seg.trim();
+            !seg.is_empty() && seg.contains(opp) && sentence_has_injury_cue(seg)
+        })
+}
+
+/// Deterministic light check: if the board locks 左X / 右X and a sentence both
+/// names the opposite side and carries an injury cue, block publish.
+///
+/// Incidental opposite-side actions (e.g. 「右手按内袋」) without injury language pass.
+/// Cross-fact bilateral locks on the same site skip exclusive opposite-side blocking.
 pub fn check_body_state_side_conflicts(
     project_dir: &Path,
     chapter: u32,
@@ -301,25 +381,46 @@ pub fn check_body_state_side_conflicts(
         return Vec::new();
     }
     let lines = collect_body_state_lines(project_dir, chapter);
-    let mut msgs = Vec::new();
-    let mut seen = HashSet::new();
+    let mut sides_by_site: std::collections::HashMap<&'static str, HashSet<char>> =
+        std::collections::HashMap::new();
+    let mut lock_facts: Vec<(char, &'static str, String)> = Vec::new();
     for (_ch, fact) in &lines {
-        if !(is_injury_fact(fact) || is_ability_locus_fact(fact) || is_control_side_fact(fact)) {
+        // Ability locus flips → check_body_state_locus_conflicts.
+        // Side exclusivity is for injury / control only.
+        if !(is_injury_fact(fact) || is_control_side_fact(fact)) {
+            continue;
+        }
+        if is_inactive_side_lock_fact(fact) {
             continue;
         }
         for (side, site) in extract_side_site_locks(fact) {
-            let opposite = if side == '左' { '右' } else { '左' };
-            let opp = format!("{opposite}{site}");
-            let key = format!("{side}{site}->{opp}");
-            if !seen.insert(key) {
-                continue;
-            }
-            if draft.contains(&opp) {
-                msgs.push(format!(
-                    "身体状态板锁定「{side}{site}」（依据：{}），正文却出现「{opp}」且未见转移/愈合交代。请对齐侧别或写出可见变更过程。",
-                    truncate_chars(fact, 60)
-                ));
-            }
+            sides_by_site.entry(site).or_default().insert(side);
+            lock_facts.push((side, site, fact.clone()));
+        }
+    }
+    let bilateral_sites: HashSet<&'static str> = sides_by_site
+        .iter()
+        .filter(|(_, sides)| sides.len() >= 2)
+        .map(|(site, _)| *site)
+        .collect();
+
+    let mut msgs = Vec::new();
+    let mut seen = HashSet::new();
+    for (side, site, fact) in &lock_facts {
+        if bilateral_sites.contains(site) {
+            continue;
+        }
+        let opposite = if *side == '左' { '右' } else { '左' };
+        let opp = format!("{opposite}{site}");
+        let key = format!("{side}{site}->{opp}");
+        if !seen.insert(key) {
+            continue;
+        }
+        if draft_has_opposite_injury_claim(draft, &opp) {
+            msgs.push(format!(
+                "身体状态板锁定「{side}{site}」（依据：{}），正文却在同一句把伤势/伤情写到「{opp}」且未见转移/愈合交代。请对齐侧别或改为症状/动作限制承接，或写出可见变更过程。",
+                truncate_chars(fact, 60)
+            ));
         }
     }
     msgs
@@ -478,7 +579,12 @@ mod tests {
         assert!(board.contains("伤势"), "{board}");
         assert!(board.contains("左肩"), "{board}");
         assert!(board.contains("能力位置") || board.contains("右手腕"), "{board}");
-        assert!(board.contains("不得默默挪位") || board.contains("可见转移"), "{board}");
+        assert!(
+            board.contains("不得默默挪位")
+                || board.contains("可见转移")
+                || board.contains("症状"),
+            "{board}"
+        );
         let flip = check_body_state_side_conflicts(
             &root,
             2,
@@ -494,6 +600,37 @@ mod tests {
             "他护着左肩，右手仍握着剑。\n",
         );
         assert!(ok.is_empty(), "no false positive: {ok:?}");
+        // Comparative injury fact locks neither side exclusively.
+        let ch2 = chapter_dir(&root, 2);
+        std::fs::create_dir_all(&ch2).unwrap();
+        std::fs::write(
+            ch2.join("summary.json"),
+            r#"{
+              "event_summary":"伤",
+              "ending_hook":"",
+              "new_facts":[
+                "周荣左小腿伤口仍在渗血，右腿可支撑、左腿不能负重"
+              ],
+              "body_state":{
+                "injuries":["周荣左小腿伤口，右腿可支撑"],
+                "ability_loci":["异能印记寄宿在左手掌心"]
+              }
+            }"#,
+        )
+        .unwrap();
+        let bilateral = check_body_state_side_conflicts(
+            &root,
+            3,
+            "周荣左腿发抖，右腿单独承重；陈衍用右手拾起铜戒，左手掌心的印记发紧。\n",
+        );
+        assert!(
+            bilateral.is_empty(),
+            "bilateral board + incidental opposite hand must not block: {bilateral:?}"
+        );
+        // Ability line mentioning「伤痕」must not become an injury side-lock on 左手.
+        assert!(
+            !is_injury_fact("能力位置：陈衍左手掌心：描摹密文符号后产生阻力，尚未造成可见伤痕。")
+        );
         let locus = check_body_state_locus_conflicts(
             &root,
             2,
@@ -517,6 +654,101 @@ mod tests {
         assert!(
             metaphor.is_empty(),
             "metaphor must not trip locus gate: {metaphor:?}"
+        );
+        let _ = std::fs::remove_dir_all(&projects);
+    }
+
+    #[test]
+    fn residual_and_cross_fact_bilateral_skip_exclusive_side_lock() {
+        let projects = tmp_root("res");
+        let root = init_project(&projects, "sample-novel", "未定", 10).unwrap();
+        let ch_dir = chapter_dir(&root, 1);
+        std::fs::create_dir_all(&ch_dir).unwrap();
+        std::fs::write(
+            ch_dir.join("summary.json"),
+            r#"{
+              "event_summary":"伤。",
+              "ending_hook":"门开了。",
+              "new_facts":[],
+              "body_state":{
+                "injuries":[
+                  "主角左手中指伤势仍在，握力受限",
+                  "主角右手手背暗铜色细线消退至接近不可见，仅残留痕迹"
+                ],
+                "ability_loci":[]
+              }
+            }"#,
+        )
+        .unwrap();
+        // Residual right-hand line is inactive; left lock remains — symptom prose OK.
+        let symptoms = check_body_state_side_conflicts(
+            &root,
+            2,
+            "他抬手时指尖微微颤抖，额角渗出冷汗，不敢用力握物。\n",
+        );
+        assert!(symptoms.is_empty(), "symptom carry must pass: {symptoms:?}");
+        // Incidental 右手 without injury cue must pass.
+        let right = check_body_state_side_conflicts(&root, 2, "他抬起右手去开门。\n");
+        assert!(
+            right.is_empty(),
+            "opposite hand action without injury cue must pass: {right:?}"
+        );
+        // Same-sentence opposite side + injury cue still blocks.
+        let flip = check_body_state_side_conflicts(&root, 2, "他护着右手，伤口完全不在话下。\n");
+        assert!(
+            flip.iter().any(|m| m.contains("左手")),
+            "true flip with injury cue must block: {flip:?}"
+        );
+        let wound = check_body_state_side_conflicts(&root, 2, "右手伤口撕裂，鲜血渗出。\n");
+        assert!(
+            wound.iter().any(|m| m.contains("右手")),
+            "opposite wound claim must block: {wound:?}"
+        );
+        // Bare「另一只手」must NOT exempt a later opposite-injury sentence.
+        let other_hand = check_body_state_side_conflicts(
+            &root,
+            2,
+            "他伸出另一只手开门。右手伤口撕裂，鲜血渗出。\n",
+        );
+        assert!(
+            other_hand.iter().any(|m| m.contains("右手")),
+            "另一只手 must not whole-draft bypass: {other_hand:?}"
+        );
+        assert!(
+            !is_inactive_side_lock_fact("主角左手伤势已加重，握力更差"),
+            "伤势已加重 must stay an active side lock"
+        );
+        assert!(
+            is_inactive_side_lock_fact("主角左手伤势已愈合，仅残留痕迹"),
+            "伤势已愈合 must be inactive"
+        );
+        // Two active opposite-side injuries on 手 → bilateral skip.
+        let ch2 = chapter_dir(&root, 2);
+        std::fs::create_dir_all(&ch2).unwrap();
+        std::fs::write(
+            ch2.join("summary.json"),
+            r#"{
+              "event_summary":"双侧伤。",
+              "ending_hook":"",
+              "new_facts":[],
+              "body_state":{
+                "injuries":[
+                  "主角左手掌心灼伤，握拳疼痛",
+                  "主角右手手背割伤，渗血"
+                ],
+                "ability_loci":[]
+              }
+            }"#,
+        )
+        .unwrap();
+        let both = check_body_state_side_conflicts(
+            &root,
+            3,
+            "他左手扶墙，右手推门，额角冒冷汗。\n",
+        );
+        assert!(
+            both.is_empty(),
+            "cross-fact bilateral must not deadlock: {both:?}"
         );
         let _ = std::fs::remove_dir_all(&projects);
     }

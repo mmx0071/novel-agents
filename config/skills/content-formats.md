@@ -44,7 +44,7 @@ description: >-
 ```
 
 - 首行必须 `# 第N章 …`（阿拉伯数字；「第一章」会被归一）
-- 标题行后正文须达 `config/chapter.yaml` 硬门控（默认 ≥4500 字才可发布）；创作目标 **5000–6000**（与 writer Skill 一致；勿为凑字注水）
+- 标题行后正文须达 `config/chapter.yaml` 硬门控（默认 ≥4500 字才可发布）；创作目标 **5000–6000**（与 writer Skill 一致；勿为凑字注水）；超过 `word_hard_max`（默认 11000）HardLong 阻断，可用 `split_chapter` 拆成两章或压缩修订
 - 禁止整篇包在 ` ```json `
 - 除标题行外禁止「第N章」元叙述
 
@@ -56,16 +56,20 @@ description: >-
 
 `title, pov, time_location, goal, conflict, emotion_curve, key_events[], characters[], scene_tags[], cliffhanger, lore_queries[]`
 
-推荐（驱动设定卡加载；缺省 `[]`）：
+推荐（缺省 `[]`；新章纲应填写）：
 
-`items[], locations[]`
+`plot_includes[], plot_defers[], items[], locations[]`
 
-- `key_events` ≥ 2
+- `plot_includes`：本章必须写到的剧情推进点（短句；合计估可写成 5000–6000 字；**新生成**至少 1 条）
+- `plot_defers`：明确顺延后章的点；有进行中剧情卡时至少 1 条（**新生成** soft repair）
+- `key_events`：至少 2 条；**新生成/修订章纲**硬上限 4（只展开 includes）；**读旧稿 / Web 原样保存**可超过 4
+- `items[]` / `locations[]`：驱动设定卡加载
 - 名单用规范名，与实体卡 `name` 对齐
+- 防超量优先靠章纲预算；HardLong 自动拆章仅为兜底
 
 Web 展示结构（由系统生成，勿手写第二份）：
 
-`# 标题` → 视角/时空 → 目标/冲突/情绪 → 关键事件 → 出场人物/物品/地点 → 钩子
+`# 标题` → 视角/时空 → 目标/冲突/情绪 → 本章纳入/顺延后章 → 关键事件 → 出场人物/物品/地点 → 钩子
 
 ---
 

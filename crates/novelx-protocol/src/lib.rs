@@ -94,6 +94,20 @@ pub enum AgentLifecycle {
     Interrupted,
 }
 
+/// Composer / dialogue readiness for a root (or parent) thread.
+///
+/// - `working`: active turn and/or descendant agents still running
+/// - `awaiting_human`: a Studio gate needs a choice (overrides working for the input box)
+/// - `idle`: nothing running and no open gate — waiting for the next user message
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerPhase {
+    #[default]
+    Idle,
+    Working,
+    AwaitingHuman,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentStatus {
@@ -330,6 +344,13 @@ pub enum EventMsg {
     AgentStatusChanged {
         status: AgentStatus,
     },
+    /// Authoritative composer busy/idle signal (turn + agent tree + human gates).
+    SessionPhaseChanged {
+        thread_id: ThreadId,
+        phase: ComposerPhase,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_turn_id: Option<TurnId>,
+    },
     Error {
         thread_id: Option<ThreadId>,
         message: String,
@@ -521,6 +542,8 @@ pub enum OpsJournalKind {
     AuditReport,
     HardBlock,
     HistoryReset,
+    CheckpointCreated,
+    CheckpointRestored,
 }
 
 impl OpsJournalKind {
@@ -546,6 +569,8 @@ impl OpsJournalKind {
             Self::AuditReport => "audit_report",
             Self::HardBlock => "hard_block",
             Self::HistoryReset => "history_reset",
+            Self::CheckpointCreated => "checkpoint_created",
+            Self::CheckpointRestored => "checkpoint_restored",
         }
     }
 
@@ -571,6 +596,8 @@ impl OpsJournalKind {
             "audit_report" => Some(Self::AuditReport),
             "hard_block" => Some(Self::HardBlock),
             "history_reset" => Some(Self::HistoryReset),
+            "checkpoint_created" => Some(Self::CheckpointCreated),
+            "checkpoint_restored" => Some(Self::CheckpointRestored),
             _ => None,
         }
     }
@@ -632,6 +659,26 @@ mod tests {
     }
 
     #[test]
+    fn session_phase_changed_roundtrip() {
+        let ev = EventMsg::SessionPhaseChanged {
+            thread_id: "thr_1".into(),
+            phase: ComposerPhase::AwaitingHuman,
+            active_turn_id: None,
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        assert!(s.contains("session_phase_changed"));
+        assert!(s.contains("awaiting_human"));
+        let back: EventMsg = serde_json::from_str(&s).unwrap();
+        assert!(matches!(
+            back,
+            EventMsg::SessionPhaseChanged {
+                phase: ComposerPhase::AwaitingHuman,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn start_turn_canonicalizes() {
         let op = Op::StartTurn {
             thread_id: "t".into(),
@@ -674,5 +721,13 @@ mod tests {
         let back: OpsJournalEntry = serde_json::from_str(&s).unwrap();
         assert_eq!(back.kind, OpsJournalKind::MutationApplied);
         assert_eq!(OpsJournalKind::parse("gate_opened"), Some(OpsJournalKind::GateOpened));
+        assert_eq!(
+            OpsJournalKind::parse("checkpoint_created"),
+            Some(OpsJournalKind::CheckpointCreated)
+        );
+        assert_eq!(
+            OpsJournalKind::parse("checkpoint_restored"),
+            Some(OpsJournalKind::CheckpointRestored)
+        );
     }
 }

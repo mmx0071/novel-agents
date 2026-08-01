@@ -511,6 +511,8 @@ export default function NovelXChat({
   const [turns, setTurns] = useState([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
+  /** Server-authoritative: idle | working | awaiting_human */
+  const [composerPhase, setComposerPhase] = useState('idle')
   const [wsState, setWsState] = useState('idle')
   const [skills, setSkills] = useState([])
   const [skillOpen, setSkillOpen] = useState(false)
@@ -534,6 +536,7 @@ export default function NovelXChat({
   const readyRef = useRef(false)
   const loadingRef = useRef(false)
   loadingRef.current = loading
+  const composerPhaseRef = useRef('idle')
   /**
    * True after RequestUserInput with options until the user starts a new turn.
    * Late pipeline ticks must not re-lock the composer (that grayed out「修正本章」).
@@ -544,8 +547,6 @@ export default function NovelXChat({
   const taskQueueRef = useRef([])
   taskQueueRef.current = taskQueue
   const flushQueueIfIdleRef = useRef(() => {})
-  /** Heartbeat for idle unlock — chapter writes often exceed 25s with live WS ticks. */
-  const lastEventAtRef = useRef(Date.now())
   const turnsRef = useRef(turns)
   turnsRef.current = turns
   const previewRefreshAtRef = useRef(0)
@@ -786,12 +787,45 @@ export default function NovelXChat({
     }
   }, [flushToolDeltaBuf])
 
+  /** Drive composer from server ComposerPhase (or optimistic local mirror). */
+  const applyComposerPhase = useCallback((phase, opts = {}) => {
+    const p = phase === 'working' || phase === 'awaiting_human' ? phase : 'idle'
+    composerPhaseRef.current = p
+    setComposerPhase(p)
+    if (p === 'working') {
+      humanGateOpenRef.current = false
+      loadingRef.current = true
+      setLoading(true)
+      if (opts.activeTurnId) {
+        activeTurnRef.current = opts.activeTurnId
+        setLiveTurnId(opts.activeTurnId)
+      }
+      if (opts.activityText) setActivity(opts.activityText)
+    } else if (p === 'awaiting_human') {
+      humanGateOpenRef.current = true
+      loadingRef.current = false
+      setLoading(false)
+      activeTurnRef.current = ''
+      setLiveTurnId('')
+      setActivity(opts.activityText != null ? opts.activityText : 'waiting for input')
+    } else {
+      humanGateOpenRef.current = false
+      loadingRef.current = false
+      setLoading(false)
+      activeTurnRef.current = ''
+      setLiveTurnId('')
+      if (opts.activityText !== undefined) setActivity(opts.activityText)
+      else setActivity('')
+      window.setTimeout(() => flushQueueIfIdleRef.current?.(), 50)
+    }
+  }, [])
+
   const markTurnLive = useCallback((turnId, activityText) => {
-    // Gate already asking for a choice — ignore late ▶/✓ / 生成中 ticks.
-    if (humanGateOpenRef.current) return
+    // Server / gate says human must choose — ignore late ▶/✓ / 生成中 ticks.
+    if (composerPhaseRef.current === 'awaiting_human' || humanGateOpenRef.current) return
     const turns = turnsRef.current || []
     if (turns.some((t) => t?.approval?.options?.length)) {
-      humanGateOpenRef.current = true
+      applyComposerPhase('awaiting_human')
       return
     }
     if (turnId) {
@@ -804,30 +838,36 @@ export default function NovelXChat({
       ) {
         return
       }
-      activeTurnRef.current = turnId
-      setLiveTurnId(turnId)
     }
-    loadingRef.current = true
-    setLoading(true)
-    if (activityText) setActivity(activityText)
-  }, [])
+    applyComposerPhase('working', { activeTurnId: turnId, activityText })
+  }, [applyComposerPhase])
 
   const handleEvent = useCallback(
     (ev) => {
       if (!ev || !ev.type) return
-      lastEventAtRef.current = Date.now()
       switch (ev.type) {
         case 'session_configured':
           setThreadId(ev.thread_id)
           break
+        case 'session_phase_changed': {
+          const phase = ev.phase || 'idle'
+          applyComposerPhase(phase, {
+            activeTurnId: ev.active_turn_id || undefined,
+            activityText: phase === 'working'
+              ? undefined
+              : (phase === 'awaiting_human' ? 'waiting for input' : ''),
+          })
+          if (phase === 'working') {
+            setActivity((prev) => (prev && prev !== 'waiting for input' ? prev : 'working…'))
+          }
+          break
+        }
         case 'turn_started': {
           const serverTurn = ev.turn_id
-          humanGateOpenRef.current = false
-          loadingRef.current = true
-          setLoading(true)
-          setActivity('working…')
-          activeTurnRef.current = serverTurn
-          setLiveTurnId(serverTurn)
+          applyComposerPhase('working', {
+            activeTurnId: serverTurn,
+            activityText: 'working…',
+          })
           // Merge optimistic `local_*` into the server turn. Never drop an existing
           // approval on the server turn (RequestUserInput may have already arrived).
           setTurns((prev) => {
@@ -922,18 +962,8 @@ export default function NovelXChat({
             if (release && id === activeBefore) return ''
             return id
           })
-          // Interrupt+sendNow may already own a newer turn — do not unlock / flush then.
-          if (release) {
-            activeTurnRef.current = ''
-            loadingRef.current = false
-            setLoading(false)
-            setActivity('')
-            syncPreview({ keepSelection: false, immediate: true })
-            // Defer so a same-batch RequestUserInput can land on turnsRef first.
-            window.setTimeout(() => flushQueueIfIdleRef.current?.(), 50)
-          } else {
-            syncPreview({ keepSelection: false, immediate: true })
-          }
+          // Composer unlock is owned by session_phase_changed (after TurnGate release).
+          syncPreview({ keepSelection: false, immediate: true })
           break
         }
         case 'turn_aborted': {
@@ -957,13 +987,8 @@ export default function NovelXChat({
             return id
           })
           // Do not auto-flush the task queue on abort (Stop should leave items queued).
-          // Also skip unlock if a newer turn already started after interrupt+sendNow.
-          if (release) {
-            activeTurnRef.current = ''
-            loadingRef.current = false
-            setLoading(false)
-            setActivity('已中断')
-          }
+          // Composer phase event unlocks; surface interrupt hint immediately.
+          if (release) setActivity('已中断')
           break
         }
         case 'item_started':
@@ -1278,8 +1303,7 @@ export default function NovelXChat({
             const stepName = (step?.[1] || done?.[1] || '').trim()
             const stepZh = stepLabelZh(stepName)
             const localRev = /local_reviser|局部修订/i.test(stepName) || /局部修订/.test(d)
-            // Pipeline ticks mean the turn is still live — re-lock if a short
-            // watchdog previously unlocked the composer mid-write.
+            // Pipeline ticks mean the turn is still live — keep composer busy.
             if (writingNew || revising || step || draftChars || genChars || wait
               || /生成中|流式生成中|正文已写入|↻\s*draft|调用模型|等待首包/i.test(d)) {
               markTurnLive(
@@ -1354,8 +1378,7 @@ export default function NovelXChat({
               items: finishAuditTools(finishOpenItems(t.items)),
               status: (t.status === 'running' || t.status === 'awaiting') ? 'complete' : t.status,
             })))
-            setLiveTurnId('')
-            setLoading(false)
+            // Leave composer to session_phase_changed (queue done ≠ agents idle).
           }
           break
         }
@@ -1433,7 +1456,6 @@ export default function NovelXChat({
           const activeId = activeTurnRef.current
           // Empty options = queue finished / dismiss all gate cards.
           if (!opts.length) {
-            humanGateOpenRef.current = false
             setSetupGateOpen(false)
             let activeStillRunning = false
             setTurns((prev) => prev.map((t) => {
@@ -1452,23 +1474,16 @@ export default function NovelXChat({
                   : finishAuditTools(finishOpenItems(t.items)),
               }
             }))
-            if (!activeStillRunning) {
-              activeTurnRef.current = ''
-              loadingRef.current = false
-              setLiveTurnId('')
-              setLoading(false)
-              setActivity(ev.prompt || '')
-              // Prior turn_complete may have skipped flush while approval was open.
-              window.setTimeout(() => flushQueueIfIdleRef.current?.(), 50)
+            // Phase event is authoritative; optimistic mirror if still working / idle.
+            if (activeStillRunning) {
+              applyComposerPhase('working', { activeTurnId: activeId })
+            } else if (composerPhaseRef.current === 'awaiting_human') {
+              applyComposerPhase('idle', { activityText: ev.prompt || '' })
             }
             break
           }
           // Human must choose — unlock immediately; ignore late pipeline re-locks.
-          humanGateOpenRef.current = true
-          loadingRef.current = false
-          setLoading(false)
-          setLiveTurnId('')
-          activeTurnRef.current = ''
+          applyComposerPhase('awaiting_human', { activityText: 'waiting for input' })
           const isSetupGate = opts.some((o) => o.id === 'sc_approve' || o.id === 'sc_revise'
             || o.label === '确认定稿' || o.label === '修改再生成')
           if (isSetupGate) setSetupGateOpen(true)
@@ -1517,20 +1532,18 @@ export default function NovelXChat({
               }
             })
           })
-          setActivity('waiting for input')
           // Gates often follow a write (plot/chapter); sync reader before user decides.
           syncPreview({ keepSelection: true })
           break
         }
         case 'error':
           setActivity(ev.message || 'error')
-          setLoading(false)
           break
         default:
           break
       }
     },
-    [dropToolDeltaBufForTurn, flushToolDeltaBuf, markTurnLive, onProjectBound, project, queueToolOutputDelta, syncPreview, upsertTurn],
+    [applyComposerPhase, dropToolDeltaBufForTurn, flushToolDeltaBuf, markTurnLive, onProjectBound, project, queueToolOutputDelta, syncPreview, upsertTurn],
   )
 
   handleEventRef.current = handleEvent
@@ -1639,8 +1652,11 @@ export default function NovelXChat({
       setTodos([])
       setLiveTurnId('')
       activeTurnRef.current = ''
+      composerPhaseRef.current = 'idle'
+      setComposerPhase('idle')
       setLoading(false)
       loadingRef.current = false
+      humanGateOpenRef.current = false
       setActivity('')
       setSetupGateOpen(false)
       setShowOther(false)
@@ -1720,6 +1736,8 @@ export default function NovelXChat({
           || started.pending_impact
         )
         setSetupGateOpen(!!started.pending_setup && !turnActive)
+        const serverPhase = started.composer_phase
+          || (turnActive ? 'working' : (hasHumanGate ? 'awaiting_human' : 'idle'))
         if (nextTurns?.length && restoredGate) {
           nextTurns = nextTurns.map((t, idx) => {
             const last = idx === nextTurns.length - 1
@@ -1731,12 +1749,6 @@ export default function NovelXChat({
             }
           })
           nextTurns = attachGatePreviewItems(nextTurns, restoredGate)
-          humanGateOpenRef.current = true
-          activeTurnRef.current = ''
-          setLiveTurnId('')
-          loadingRef.current = false
-          setLoading(false)
-          setActivity('waiting for input')
         } else if (nextTurns?.length && !hasHumanGate) {
           // Drop stale approval cards; also clear「调用模型中」if the turn already ended.
           nextTurns = nextTurns.map((t) => {
@@ -1750,19 +1762,18 @@ export default function NovelXChat({
                 : finishAuditTools(t.items || []),
             }
           })
-          if (turnActive) {
-            const live = [...nextTurns].reverse().find((t) => t.status === 'running')
-            if (live?.id) {
-              activeTurnRef.current = live.id
-              setLiveTurnId(live.id)
-              setLoading(true)
-            }
-          } else {
-            setLiveTurnId('')
-            setLoading(false)
-            setActivity('')
-          }
         }
+        const liveId = turnActive
+          ? (started.active_turn_id
+            || [...(nextTurns || [])].reverse().find((t) => t.status === 'running')?.id
+            || '')
+          : ''
+        applyComposerPhase(serverPhase, {
+          activeTurnId: liveId || undefined,
+          activityText: serverPhase === 'awaiting_human'
+            ? 'waiting for input'
+            : (serverPhase === 'working' ? 'working…' : ''),
+        })
         if (cancelled || boundProjectRef.current !== project) return
         if (nextTurns?.length) {
           setTurns((prev) => {
@@ -1849,10 +1860,7 @@ export default function NovelXChat({
   }
 
   const forceUnlockComposer = () => {
-    loadingRef.current = false
-    setLoading(false)
-    setLiveTurnId('')
-    activeTurnRef.current = ''
+    applyComposerPhase('idle')
   }
 
   const looksStatusQuestion = (msg) => (
@@ -1889,20 +1897,18 @@ export default function NovelXChat({
     // Guard double-start; busy path should enqueue / sendNow instead.
     if (loadingRef.current) return
 
-    humanGateOpenRef.current = false
-    loadingRef.current = true
-    setLoading(true)
     followChatBottomRef.current = true
     setShowOther(false)
     setOtherText('')
-    setActivity('sending…')
     // Choosing a next step dismisses any pending approval cards.
     setSetupGateOpen(false)
 
     // Optimistic local turn (Codex shows user input immediately)
     const localTurnId = newOptimisticTurnId()
-    activeTurnRef.current = localTurnId
-    setLiveTurnId(localTurnId)
+    applyComposerPhase('working', {
+      activeTurnId: localTurnId,
+      activityText: 'sending…',
+    })
     setTurns((prev) => {
       const sealed = sealOtherTurns(prev, localTurnId)
       return [
@@ -1980,8 +1986,8 @@ export default function NovelXChat({
   }
 
   const flushQueueIfIdle = () => {
-    if (loadingRef.current) return
-    // TurnComplete often follows RequestUserInput; never auto-run while a gate is open.
+    // Only drain when server says idle (not working, not awaiting_human).
+    if (composerPhaseRef.current !== 'idle' || loadingRef.current) return
     const gateOpen = (turnsRef.current || []).some(
       (t) => t?.approval || t?.status === 'awaiting',
     )
@@ -2090,12 +2096,10 @@ export default function NovelXChat({
 
   useEffect(() => {
     if (typeof onBusyChange !== 'function') return undefined
-    const gateOpen = turns.some((t) => t?.approval?.options?.length)
-      || humanGateOpenRef.current
-    // Desk CTA / 审校附栏 must stay clickable while a human gate is open.
-    onBusyChange(Boolean(loading) && !gateOpen)
+    // Desk CTA / 审校附栏 must stay clickable while awaiting human or idle.
+    onBusyChange(composerPhase === 'working')
     return undefined
-  }, [loading, turns, onBusyChange])
+  }, [composerPhase, onBusyChange])
 
   // Sync draft patches to writing desk for side-by-side review.
   useEffect(() => {
@@ -2142,19 +2146,6 @@ export default function NovelXChat({
     onSetupGateChange?.(open)
   }, [turns, setupGateOpen, onSetupGateChange])
 
-  // Safety unlock when the turn goes silent (no WS ticks). Queue + interrupt are the
-  // primary busy-path UX; this only recovers a stuck loading flag.
-  useEffect(() => {
-    if (!loading) return undefined
-    const t = window.setInterval(() => {
-      if (!loadingRef.current) return
-      if (Date.now() - lastEventAtRef.current < 120_000) return
-      forceUnlockComposer()
-      setActivity('上一轮长时间无响应 — 已解锁；可加入队列、中断，或中断并发送')
-    }, 15_000)
-    return () => window.clearInterval(t)
-  }, [loading])
-
   const handleNewTask = async () => {
     const label = project || '当前会话'
     if (!window.confirm(
@@ -2179,9 +2170,7 @@ export default function NovelXChat({
     setSkillOpen(false)
     setSetupGateOpen(false)
     setActivity('新开任务…')
-    setLoading(false)
-    activeTurnRef.current = ''
-    setLiveTurnId('')
+    applyComposerPhase('idle', { activityText: '新开任务…' })
     try {
       wsRef.current?.close()
     } catch {
@@ -2224,16 +2213,21 @@ export default function NovelXChat({
 
   const placeholder = useMemo(
     () => {
-      if (loading) {
+      if (composerPhase === 'working' || loading) {
         return project
           ? `对《${project}》排队下一条… Enter 入队 · ⌘/Ctrl+Enter 中断并发送`
           : '排队下一条… Enter 入队 · ⌘/Ctrl+Enter 中断并发送'
+      }
+      if (composerPhase === 'awaiting_human') {
+        return project
+          ? `对《${project}》选择上方选项，或输入补充…`
+          : '选择上方选项，或输入补充…'
       }
       return project
         ? `对《${project}》下指令… Enter 发送 · $ 选能力`
         : '描述你想写的小说… Enter 发送 · $ 选能力'
     },
-    [project, loading],
+    [project, loading, composerPhase],
   )
 
   const truncateQueueText = (text, max = 72) => {
@@ -2430,9 +2424,11 @@ export default function NovelXChat({
           </div>
         </div>
         <div className="nx-composer-hint">
-          {loading
+          {composerPhase === 'working' || loading
             ? '忙时 Enter 入队 · ⌘/Ctrl+Enter 中断并发送'
-            : 'Enter 发送 · $ 选能力 · 进度与审阅在上方'}
+            : composerPhase === 'awaiting_human'
+              ? '请先点上方选项；也可输入补充后发送'
+              : 'Enter 发送 · $ 选能力 · 进度与审阅在上方'}
           {project ? ` · 《${project}》` : ''}
         </div>
       </div>

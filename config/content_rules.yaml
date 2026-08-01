@@ -131,6 +131,13 @@ rules:
       - 回忆
       - 梦里
       - 梦中
+      # Relative-day recall — 「昨天下午」must not advance the narrative clock.
+      - 昨天
+      - 昨日
+      - 前天
+      - 大前天
+      - 那天
+      - 前一天
     schedule_range_patterns:
       - 到凌晨
       - 至凌晨

@@ -39,7 +39,7 @@ cargo run -p novelx-cli -- run my-novel 1
 # 局部优先修订
 cargo run -p novelx-cli -- run my-novel 1 --revise --instructions "改第2段，加强冲突"
 
-# 批写到卡点（遇一致性 / 卷审 / 卷末 / 字数等硬门即停）
+# 批写到卡点（max-chapters=成功发布上限；遇一致性 FAIL / 卷审 / 卷末 / 字数等硬门即停）
 cargo run -p novelx-cli -- run my-novel --batch --max-chapters 10
 
 # 状态 / 项目列表 / Agent 注册表

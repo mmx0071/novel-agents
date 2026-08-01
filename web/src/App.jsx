@@ -858,14 +858,28 @@ export default function App() {
         : '')
     : ''
 
-  // 长篇健康交通灯：ok 绿 / warn 黄 / bad 红
+  // 长篇健康交通灯：ok 绿 / warn 黄 / bad 红（伏笔看压力近债，不看总量）
   const foreshadowLevel = (() => {
-    const n = foreshadowDebt?.dangling_total ?? 0
+    const pressure = foreshadowDebt?.dangling_pressure ?? 0
     const cold = foreshadowDebt?.open_cold ?? 0
-    if (n > 24 || cold > 40) return 'bad'
-    if (n > 8 || cold > 0) return 'warn'
+    if (pressure > 24 || cold > 40) return 'bad'
+    if (pressure > 8 || cold > 0) return 'warn'
     return 'ok'
   })()
+  const foreshadowDebtClassLabel = (c) => {
+    switch (String(c || '').toLowerCase()) {
+      case 'near':
+        return '近债'
+      case 'mid':
+        return '中期'
+      case 'far':
+        return '远期'
+      case 'fresh':
+        return '宽限'
+      default:
+        return ''
+    }
+  }
   const volumeLevel = (() => {
     if (!volumeHealth?.active_index) return 'warn'
     if (volumeHealth.thick_volume_warning) return 'bad'
@@ -1464,8 +1478,19 @@ export default function App() {
                         </span>
                       </div>
                       <div className="longform-health-body">
-                        未收 {foreshadowDebt?.dangling_total ?? 0}
+                        总量 {foreshadowDebt?.dangling_total ?? 0}
+                        {foreshadowDebt?.dangling_pressure != null
+                          ? ` · 近债 ${foreshadowDebt.dangling_pressure}`
+                          : ''}
                         {foreshadowDebt?.open_cold ? ` · 冷档 ${foreshadowDebt.open_cold}` : ''}
+                      </div>
+                      <div className="longform-health-sub">
+                        宽限 {foreshadowDebt?.dangling_fresh ?? 0}
+                        {' · '}中期 {foreshadowDebt?.dangling_mid ?? 0}
+                        {' · '}远期 {foreshadowDebt?.dangling_far ?? 0}
+                        <span className="longform-health-debt-hint">
+                          （批写只拦近债/中期压力）
+                        </span>
                       </div>
                       {Array.isArray(foreshadowDebt?.oldest) && foreshadowDebt.oldest.length > 0 && (
                         <>
@@ -1477,11 +1502,21 @@ export default function App() {
                             {(foreshadowDebtExpanded
                               ? foreshadowDebt.oldest
                               : foreshadowDebt.oldest.slice(0, 5)
-                            ).map((t) => (
-                              <li key={t.id || `${t.planted_chapter}-${t.text}`}>
-                                第{t.planted_chapter || '?'}章 · {t.text}
-                              </li>
-                            ))}
+                            ).map((t) => {
+                              const cls = foreshadowDebtClassLabel(t.debt_class)
+                              return (
+                                <li key={t.id || `${t.planted_chapter}-${t.text}`}>
+                                  {cls ? (
+                                    <span
+                                      className={`longform-debt-tag debt-${t.debt_class || 'fresh'}`}
+                                    >
+                                      {cls}
+                                    </span>
+                                  ) : null}
+                                  第{t.planted_chapter || '?'}章 · {t.text}
+                                </li>
+                              )
+                            })}
                           </ul>
                           {foreshadowDebt.oldest.length > 5 && (
                             <button

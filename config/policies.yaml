@@ -3,9 +3,10 @@
 version: 1
 
 # Bare「继续」:
-# - next_chapter already has a draft → clarify + draft_exists gate (don't tool-call / wipe chat)
+# - next_chapter already has a draft → resume continue_writing_batch
+#   (audit/publish that draft first, then keep writing — recovers interrupted 连写)
 # - next_chapter empty → deterministic continue_writing
-# 「继续创作」等见 clear_history_on_write.exact；草稿歧义时同样走 clarify（Rust 合并匹配）。
+# 「继续创作」等见 clear_history_on_write.exact；有未发布草稿时同样恢复批写。
 bare_continue:
   phrases:
     - 继续
@@ -13,6 +14,10 @@ bare_continue:
     - 往下写
     - 接着
     - 继续吧
+    - 继续连写
+    - 继续批写
+    - 接着连写
+    - 接着批写
   # Treat next_chapter draft as "substantial" at this length (chars).
   draft_min_chars: 400
 
@@ -57,6 +62,14 @@ full_rewrite:
     - rewrite
     - too short
     - longer
+    # Timeline / daypart hard rules — local patch rarely fixes cross-paragraph jumps.
+    - 时段
+    - 回跳
+    - 跨日
+    - 翌日
+    - TIMELINE
+    - timeline_daypart
+    - timeline_period
 
 # Manual sync without an open volume gate (explicit phrasing only).
 volume_sync_manual:

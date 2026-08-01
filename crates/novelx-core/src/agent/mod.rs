@@ -74,6 +74,15 @@ impl AgentHub {
             .or_default()
             .push(child.to_string());
     }
+
+    pub async fn children_of(&self, parent: &str) -> Vec<ThreadId> {
+        self.children
+            .lock()
+            .await
+            .get(parent)
+            .cloned()
+            .unwrap_or_default()
+    }
 }
 
 pub struct CoreAgentRuntime {

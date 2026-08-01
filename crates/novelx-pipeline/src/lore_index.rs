@@ -227,6 +227,58 @@ pub fn query_open_foreshadow_from_index(
     idx.query_open_foreshadow(limit).ok()
 }
 
+/// Wipe and rebuild SQLite lore index from on-disk entities + chapters.
+/// Used after version-node restore so retrieval matches restored Canon.
+pub fn rebuild_lore_index_from_disk(project_dir: &Path) -> Result<()> {
+    let path = index_path(project_dir);
+    if path.is_file() {
+        let _ = std::fs::remove_file(&path);
+    }
+    // SQLite sidecars.
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let p = PathBuf::from(format!("{}{suffix}", path.display()));
+        let _ = std::fs::remove_file(&p);
+    }
+    let idx = ensure_lore_index(project_dir)?;
+    for (group, kind) in [
+        ("characters", "character"),
+        ("items", "item"),
+        ("locations", "location"),
+    ] {
+        let folder = project_dir.join("entities").join(group);
+        if !folder.is_dir() {
+            continue;
+        }
+        for card in crate::cards::load_markdown_cards(&folder, group) {
+            let status = card
+                .meta
+                .get("status")
+                .cloned()
+                .unwrap_or_default();
+            let rel = format!("entities/{group}/{}.md", card.slug);
+            let _ = idx.upsert_entity(kind, &card.title, &rel, &status);
+        }
+    }
+    for ch in crate::project::list_chapter_numbers(project_dir) {
+        let title = crate::project::read_chapter_outline(project_dir, ch)
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|o| {
+                o.get("title")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_default();
+        let published = project_dir
+            .join("chapters")
+            .join(format!("{ch:03}"))
+            .join("summary.json")
+            .is_file();
+        let digest = title.chars().take(80).collect::<String>();
+        let _ = idx.upsert_chapter(ch, &title, &digest, published);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

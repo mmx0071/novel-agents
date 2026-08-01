@@ -14,8 +14,10 @@ mod plot;
 pub use arc::{display_arc_outline, normalize_arc_outline_input, validate_arc_outline};
 pub use bible::{display_bible, validate_bible};
 pub use chapter_outline::{
-    display_chapter_outline, outline_entity_roster, parse_chapter_outline_text,
-    validate_chapter_outline, ChapterOutline, OutlineEntityRoster,
+    display_chapter_outline, outline_budget_repair_hint, outline_entity_roster,
+    parse_chapter_outline_text, parse_chapter_outline_text_budget, validate_chapter_outline,
+    validate_chapter_outline_budget, validate_chapter_outline_with, ChapterOutline,
+    OutlineEntityRoster, OutlineValidateMode, MAX_KEY_EVENTS,
 };
 pub use draft::{
     display_draft, draft_body_chars, normalize_draft_best_effort, validate_draft,

@@ -80,4 +80,6 @@ agents:
   plot_acceptor: analysis
   lore_librarian: analysis
   expectation_reviewer: analysis
+  decision_council: analysis
+  material_researcher: analysis
 default_provider: deepseek

@@ -244,8 +244,8 @@ gates:
         aliases: [暂不处理, 取消, 稍后]
 
   # After chapter write/revise: server filters by publish result.
-  # published → cn_continue only; content-rule / length / plot_accept fail → cn_revise only
-  # (accept fail blocks publish). Legacy published+accept-fail may still show both.
+  # published → cn_continue (+ batch); hard_long → cn_split + cn_revise(compress);
+  # other length / content-rule / plot_accept fail → cn_revise.
   # IDs must NOT collide with audit / volume_sync bare ids.
   chapter_next:
     options:
@@ -258,6 +258,13 @@ gates:
         # (write next chapter / clarify). Listing it as a gate token makes stale-gate
         # handling treat「继续」as an expired audit choice.
         aliases: [继续创作, 继续写, 下一章, 续写, 继续推进, 继续推进本卡]
+      - id: cn_split
+        label: 拆成两章
+        tool: split_chapter
+        args:
+          project: "{{project}}"
+          chapter: "{{chapter}}"
+        aliases: [拆成两章, 拆章, 分成两章, 拆成两章发布, split_chapter]
       - id: cn_revise
         label: 修正本章
         tool: revise_chapter

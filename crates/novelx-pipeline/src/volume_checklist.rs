@@ -1,7 +1,7 @@
 //! Deterministic volume-memory checklist before confirm_volume_memory.
 
 use crate::cards::load_markdown_cards;
-use crate::foreshadow::load_foreshadow_index;
+use crate::foreshadow::{foreshadow_debt_breakdown, load_foreshadow_index};
 use crate::memory::load_memory;
 use crate::project::{list_chapter_numbers, read_chapter_draft};
 use crate::schemas::draft_body_chars;
@@ -68,7 +68,9 @@ pub fn run_volume_memory_checklist(
         match budget.assess_body_chars(draft_body_chars(&draft)) {
             LengthAssessment::HardShort => hard += 1,
             LengthAssessment::SoftShort => soft += 1,
-            LengthAssessment::Ok => ok += 1,
+            LengthAssessment::HardLong | LengthAssessment::SoftLong | LengthAssessment::Ok => {
+                ok += 1
+            }
         }
     }
     let n = soft + hard + ok;
@@ -89,20 +91,35 @@ pub fn run_volume_memory_checklist(
         });
     }
 
-    // 2) Open foreshadow debt.
+    // 2) Open foreshadow debt (inventory + pressure tiers).
     let idx = load_foreshadow_index(project_dir);
     let dangling = idx.dangling.len();
-    if dangling > 24 {
+    let state = crate::project::load_project_state(project_dir).ok();
+    let current = state
+        .as_ref()
+        .map(|s| s.next_chapter.max(1))
+        .unwrap_or(1);
+    let lf = crate::volume_audit_gate::find_config_root(project_dir)
+        .map(|r| novelx_harness::LongformConfig::load_from_config_root(&r))
+        .unwrap_or_default();
+    let debt = foreshadow_debt_breakdown(&idx.dangling, current, &lf.foreshadow_debt);
+    if debt.pressure > 24 {
         items.push(ChecklistItem {
             severity: "WARN".into(),
             code: "foreshadow_debt".into(),
-            note: format!("未回收伏笔约 {dangling} 条，建议卷末优先回收或归档说明"),
+            note: format!(
+                "近债/压力伏笔约 {} 条（总量 {dangling}，远期 {}），建议优先回收近期应兑现线索",
+                debt.pressure, debt.far
+            ),
         });
     } else if dangling > 0 {
         items.push(ChecklistItem {
             severity: "OK".into(),
             code: "foreshadow_open".into(),
-            note: format!("开放伏笔 {dangling} 条（可控）"),
+            note: format!(
+                "开放伏笔 {dangling} 条（近债 {} / 远期 {}，可控）",
+                debt.pressure, debt.far
+            ),
         });
     }
 

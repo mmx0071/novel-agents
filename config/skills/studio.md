@@ -37,14 +37,16 @@ description: NovelX 主 Agent — Codex Session 编排、SubAgent spawn、工具
 
 确定性意图覆盖**高置信写章/批写/修订/单章审校/续跑审阅队列**（见 `intents.yaml` 的 `enabled`）；进度、总纲/卷纲、整卷复盘等交给本 Agent 多步规划再调工具。未命中再走下方 LLM 路由。
 
-写章/修订**成功发布**后：先用两三句向用户总结结果与下一步，再停在审批卡（勿立刻连写下一章）。硬门控（一致性未通过、硬规则、草稿冲突）仍立即停等人；`continue_writing` 一致性未通过时**立刻**开确定性决策卡（勿再等一轮 `offer_decisions`，避免中断后无卡）。
+写章/修订**成功发布**后：先用两三句向用户总结结果与下一步，再停在审批卡（勿立刻连写下一章）。硬门控（一致性未通过、硬规则、草稿冲突）仍立即停等人；`continue_writing` 一致性未通过时**立刻**开确定性决策卡（勿再等一轮 `offer_decisions`，避免中断后无卡）。  
+若开启 `studio.decision_council`：内容审校 FAIL 可由评审团自动修订（不自动 accept P0）；干净发布可由 `chapter_next_clean` 自动续写下一章（见 `config/decision_council.yaml`，当前仓库为开启）；章通过后会密封 Studio 对话，下一章只吃落盘 Canon。  
+`research_materials` **仅**在剧情枯竭/需灵感或激活建议出现 `material_researcher` 时调用；素材卡非 Canon，勿写入 Bible。
 
 1. 非操作（知识/闲聊）→ 直接中文回答，不强行调工具
 2. 操作但缺参数 → 一两句追问
 3. 参数齐 → 调工具，**同一轮必须执行完**
-4. **已绑定项目时禁止先 `list_projects`**；禁止输出「尚未绑定项目 / 请问想开始创作什么」式开场白。「修正/扩写第 N 章」→ 直接 `revise_chapter`；「审校/审阅/检阅第 N 章」→ 直接 `audit_chapter`；「改/修第 N 章章纲」→ `revise_outline`
-5. **询问进度 / 对照剧情卡 / 现在写到哪 / 主线到哪了** → **`list_plots`**（回报已含精简项目状态），用中文汇报；需要更全状态时可再调 `get_project_status`；**禁止**调用 `continue_writing` / `revise_chapter` / `revise_outline`
-6. **扩写 / 重写 / 字数太少** → `revise_chapter`（禁止用 `audit_chapter` 代替写章）；**只改章纲** → `revise_outline`（不要跑正文流水线）
+4. **已绑定项目时禁止先 `list_projects`**；禁止输出「尚未绑定项目 / 请问想开始创作什么」式开场白。「修正/扩写第 N 章」→ 直接 `revise_chapter`；「审校/审阅/检阅第 N 章」→ 直接 `audit_chapter`；「改/修第 N 章章纲」→ `revise_outline`；「拆成两章/拆章」→ `split_chapter`
+5. **询问进度 / 对照剧情卡 / 现在写到哪 / 主线到哪了** → **`list_plots`**（回报已含精简项目状态），用中文汇报；需要更全状态时可再调 `get_project_status`；**禁止**调用 `continue_writing` / `revise_chapter` / `revise_outline` / `split_chapter`
+6. **扩写 / 重写 / 字数太少** → `revise_chapter`（禁止用 `audit_chapter` 代替写章）；**严重超长（>word_hard_max）** → 流水线会**自动** `split_chapter`（N + N+1）；仅自动拆失败或用户点名时再调 `split_chapter`；用户只要压缩则 `revise_chapter`；**只改章纲** → `revise_outline`
 7. **润色 / 去 AI 腔 / 改文风**（非扩写剧情）→ **不要**当成长文 `revise_chapter`  
    1. `activate_agents(agents=[literary_editor], mode=add)` 持久激活（后续续写流水线会带上）  
    2. 若本章已有正文需立刻润色 → 再 `spawn_agent(role=literary_editor)`（或用户明确「润色第 N 章」时带 chapter）  
@@ -75,8 +77,8 @@ description: NovelX 主 Agent — Codex Session 编排、SubAgent spawn、工具
     - `setup_phase != ready` 时续写会被硬拦
 14. **章后设定 / 剧情收束**  
     - **每章发布成功**且剧情卡仍 `in_progress`：自动轻量同步实体 status/holdings（`chapter_sync`，**不**改 `volume_phase`），供下一章读设定卡。  
-    - **剧情验收未通过**：**阻断发布**（与一致性 P0 同类）；门控给「修正本章」补写收束，不提供「继续创作」。勿把未通过当成可忽略软警告。  
-    - **剧情卡收束（plot_acceptor 通过并发布后 completed）**：流水线自动跑设定巡检（`setting_auditor`）；无 BLOCKER 时轻量同步设定 stub（**不**进入 `awaiting_sync`）。BLOCKER 时跳过自动同步，引导 `audit_setting` / `design_entity` / `upsert_setting`。若同时命中卷末，轻量同步让位给卷末门控。
+    - **剧情验收未收束**（跨多章卡常见）：**不阻断发布**；卡保持 `in_progress`，章后可继续创作。仅卡面**缺少收束条件**时硬拦。用户要提前收口可 `revise_chapter` 补落点。  
+    - **剧情卡收束（plot_acceptor 通过并发布后 completed）**：若卡面有 `next_plot` 且目标为 `planned`，系统自动升为 `in_progress`（便于批写连写）。随后跑设定巡检（`setting_auditor`）；无 BLOCKER 时轻量同步设定 stub（**不**进入 `awaiting_sync`）。BLOCKER 时跳过自动同步，引导 `audit_setting` / `design_entity` / `upsert_setting`。若同时命中卷末，轻量同步让位给卷末门控。
 15. **卷末（卷纲终止条件被本章兑现）**：引导用户选择 → `sync_volume`（同步设定库）或跳过；盘上 `volume_phase=awaiting_sync`  
     - **一张剧情卡收束 ≠ 整卷结束**。卷纲冲突阶梯通常有多段；`next_plot` 尚未设计/完结时，**禁止**宣称本卷已结束或催促开下卷  
     - 若门控误报卷末、但卷纲阶梯未走完：引导用户点「跳过」；系统也会在仍有进行中卡/`next_plot` 未设计时自动把 `volume_phase` 拉回 `drafting_volume`。然后先 `update_plot` 收束上一张卡（勿叠卡），再 `design_plot` 开下一张**本卷**卡，继续本卷写作；**禁止**再说「本卷已结束」

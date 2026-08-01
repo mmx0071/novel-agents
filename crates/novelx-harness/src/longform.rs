@@ -81,6 +81,45 @@ impl ImpactScanMode {
     }
 }
 
+/// Foreshadow debt tiers for batch brake vs Studio inventory.
+///
+/// Batch only counts **pressure** debt (overdue near/mid). Fresh plants within
+/// grace and explicit `far` / low-urgency long-horizon lines do not block
+/// recent-chapter publishing.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ForeshadowDebtConfig {
+    /// Chapters after plant before an open thread can count as pressure debt.
+    #[serde(default = "default_debt_grace")]
+    pub grace_chapters: u32,
+    /// Age above this (and not explicit far) is treated as long-horizon for batch
+    /// (excluded from brake; still visible in total dangling).
+    #[serde(default = "default_debt_far_after")]
+    pub far_after_chapters: u32,
+    /// When true, mid-band overdue (between grace and far_after) counts for batch.
+    #[serde(default = "default_true")]
+    pub batch_count_mid: bool,
+}
+
+fn default_debt_grace() -> u32 {
+    6
+}
+fn default_debt_far_after() -> u32 {
+    40
+}
+fn default_true() -> bool {
+    true
+}
+
+impl Default for ForeshadowDebtConfig {
+    fn default() -> Self {
+        Self {
+            grace_chapters: default_debt_grace(),
+            far_after_chapters: default_debt_far_after(),
+            batch_count_mid: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct LongformConfig {
     #[serde(default)]
@@ -91,15 +130,24 @@ pub struct LongformConfig {
     pub impact_scan_mode: ImpactScanMode,
     #[serde(default = "default_batch_max")]
     pub batch_max_chapters: u32,
+    /// Max auto-revise attempts per chapter in continue_writing_batch (hard/consistency/length).
+    #[serde(default = "default_batch_max_auto_revise")]
+    pub batch_max_auto_revise: u32,
     #[serde(default = "default_soft_short_streak")]
     pub soft_short_auto_revise_after: u32,
-    /// Pause continue_writing_batch when open foreshadow debt exceeds this (0 = disabled).
+    /// Pause continue_writing_batch when **pressure** foreshadow debt exceeds this (0 = off).
+    /// Pressure = overdue near (+ mid if enabled); not total dangling / not far-horizon.
     #[serde(default = "default_batch_max_dangling")]
     pub batch_max_dangling_foreshadow: u32,
+    #[serde(default)]
+    pub foreshadow_debt: ForeshadowDebtConfig,
 }
 
 fn default_batch_max() -> u32 {
     20
+}
+fn default_batch_max_auto_revise() -> u32 {
+    2
 }
 fn default_soft_short_streak() -> u32 {
     3
@@ -115,8 +163,10 @@ impl Default for LongformConfig {
             audit_tier: AuditTier::Layered,
             impact_scan_mode: ImpactScanMode::Indexed,
             batch_max_chapters: default_batch_max(),
+            batch_max_auto_revise: default_batch_max_auto_revise(),
             soft_short_auto_revise_after: default_soft_short_streak(),
             batch_max_dangling_foreshadow: default_batch_max_dangling(),
+            foreshadow_debt: ForeshadowDebtConfig::default(),
         }
     }
 }
@@ -131,6 +181,10 @@ impl LongformConfig {
                 if c.batch_max_chapters == 0 {
                     c.batch_max_chapters = default_batch_max();
                 }
+                if c.batch_max_auto_revise == 0 {
+                    c.batch_max_auto_revise = default_batch_max_auto_revise();
+                }
+                c.batch_max_auto_revise = c.batch_max_auto_revise.min(5);
                 c
             }
             Err(e) => {
@@ -156,7 +210,11 @@ mod tests {
         assert_eq!(c.audit_tier, AuditTier::Layered);
         assert_eq!(c.impact_scan_mode, ImpactScanMode::Indexed);
         assert_eq!(c.batch_max_chapters, 20);
+        assert_eq!(c.batch_max_auto_revise, 2);
         assert_eq!(c.soft_short_auto_revise_after, 3);
+        assert_eq!(c.foreshadow_debt.grace_chapters, 6);
+        assert_eq!(c.foreshadow_debt.far_after_chapters, 40);
+        assert!(c.foreshadow_debt.batch_count_mid);
     }
 
     #[test]
@@ -166,7 +224,8 @@ mod tests {
         let path = dir.join("longform.yaml");
         std::fs::write(
             &path,
-            "quality_tier: economy\naudit_tier: full\nimpact_scan_mode: volume\nbatch_max_chapters: 5\n",
+            "quality_tier: economy\naudit_tier: full\nimpact_scan_mode: volume\nbatch_max_chapters: 5\n\
+             foreshadow_debt:\n  grace_chapters: 3\n  far_after_chapters: 20\n  batch_count_mid: false\n",
         )
         .unwrap();
         let c = LongformConfig::load(&path);
@@ -174,5 +233,8 @@ mod tests {
         assert_eq!(c.audit_tier, AuditTier::Full);
         assert_eq!(c.impact_scan_mode, ImpactScanMode::Volume);
         assert_eq!(c.batch_max_chapters, 5);
+        assert_eq!(c.foreshadow_debt.grace_chapters, 3);
+        assert_eq!(c.foreshadow_debt.far_after_chapters, 20);
+        assert!(!c.foreshadow_debt.batch_count_mid);
     }
 }

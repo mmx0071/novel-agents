@@ -66,6 +66,7 @@ async fn dispatch_one(
             } else if let Some(active) = turn_gate.active_id().await {
                 turn_gate.end_if(&active).await;
             }
+            core.publish_session_phase(thread_id).await;
         }
         Op::UserInput { items, skills, .. } => {
             user_input_or_turn(
@@ -164,6 +165,8 @@ async fn user_input_or_turn(
             .await;
         return Ok(());
     }
+    // Gate claimed — surface `working` before TurnStarted lands on the wire.
+    core.publish_session_phase(thread_id).await;
     // Codex: spawn_task — do not block submission_loop.
     spawn_regular_task(
         Arc::clone(core),
@@ -225,6 +228,7 @@ async fn handle_mailbox(
         if !turn_gate.try_begin(turn_id.clone()).await {
             return Ok(());
         }
+        core.publish_session_phase(thread_id).await;
         spawn_regular_task(
             Arc::clone(core),
             thread_id.to_string(),

@@ -1,8 +1,10 @@
 # 章正文篇幅目标（写入 Writer / 修订 prompt）
 # word_hard_min：低于此阻断发布；word_min：低于此软警告（不阻断，除非连续偏短）
+# word_max：高于此 SoftLong 软警告；word_hard_max：高于此 HardLong 阻断（可拆章/压缩）
 word_min: 5000
 word_max: 6000
 word_hard_min: 4500
+word_hard_max: 11000
 # 连续 SoftShort 达到此次数时，本次 SoftShort 升格为阻断（迫使扩写）。
 # 0 = 关闭升格（仅警告）。也可由 longform.yaml 同名字段覆盖。
 soft_short_auto_revise_after: 3

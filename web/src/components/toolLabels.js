@@ -58,6 +58,8 @@ const TOOL_LABELS_ZH = {
   audit_setting: '设定审计',
   delete_entity: '删除设定卡',
   list_projects: '列出项目',
+  list_version_nodes: '版本节点',
+  restore_version_node: '回退版本',
 }
 
 /** Status verb on tool cells. */

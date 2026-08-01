@@ -30,6 +30,10 @@ pub struct ActivationSignals {
     pub bible_stale: bool,
     /// Volume phase is handoff / awaiting sync (long-range QA hint).
     pub volume_handoff: bool,
+    /// Plot drought flag (`.novelx/plot_drought.json`) — suggest material_researcher.
+    pub plot_drought: bool,
+    /// Inspiration needed flag (`.novelx/inspiration_needed.json`).
+    pub inspiration_needed: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,6 +129,8 @@ fn condition_matches(rule: &ActivationRule, s: &ActivationSignals) -> bool {
         "has_new_entity_hints" => s.has_new_entity_hints,
         "audit_fail_rate_gt" => s.audit_fail_rate > thr,
         "bible_stale" => s.bible_stale,
+        "plot_drought" => s.plot_drought,
+        "inspiration_needed" => s.inspiration_needed,
         "always_after_auditor" => true,
         _ => false,
     }
@@ -230,8 +236,13 @@ pub fn resolve_pipeline_agents_with_tier(
         if economy && !pinned.contains("literary_editor") {
             set.remove("literary_editor");
         }
-        if economy && !pinned.contains("nomenclature_curator") && sig.published_count >= 5 {
-            // After early chapters, skip nomenclature unless pinned.
+        // Nomenclature: skip when no new-entity signal (balanced+economy).
+        // economy also peels after early chapters even if hints are noisy.
+        let peel_nom = !pinned.contains("nomenclature_curator")
+            && !sig.has_new_entity_hints
+            && sig.published_count >= 5
+            && (economy || sig.has_nomenclature);
+        if peel_nom {
             set.remove("nomenclature_curator");
         }
     }
@@ -280,6 +291,8 @@ pub fn collect_signals(
     let has_new_entity_hints = detect_new_entity_hints(draft, &entity_names);
     let audit_fail_rate = recent_audit_fail_rate(project_dir, published_count);
     let bible_stale = is_bible_stale(project_dir);
+    let plot_drought = flag_json_active(project_dir, "plot_drought.json");
+    let inspiration_needed = flag_json_active(project_dir, "inspiration_needed.json");
 
     ActivationSignals {
         published_count,
@@ -299,7 +312,20 @@ pub fn collect_signals(
         audit_fail_rate,
         bible_stale,
         volume_handoff: false,
+        plot_drought,
+        inspiration_needed,
     }
+}
+
+fn flag_json_active(project_dir: &Path, name: &str) -> bool {
+    let path = project_dir.join(".novelx").join(name);
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| v.get("active").and_then(|x| x.as_bool()))
+        .unwrap_or(false)
 }
 
 fn find_latest_outline(project_dir: &Path, published_count: u32) -> String {
@@ -547,6 +573,29 @@ mod tests {
     }
 
     #[test]
+    fn plot_drought_and_inspiration_conditions() {
+        let drought = ActivationRule {
+            condition: "plot_drought".into(),
+            threshold: None,
+            tags: vec![],
+            reason: "drought".into(),
+        };
+        let insp = ActivationRule {
+            condition: "inspiration_needed".into(),
+            threshold: None,
+            tags: vec![],
+            reason: "insp".into(),
+        };
+        let mut s = ActivationSignals::default();
+        assert!(!condition_matches(&drought, &s));
+        assert!(!condition_matches(&insp, &s));
+        s.plot_drought = true;
+        s.inspiration_needed = true;
+        assert!(condition_matches(&drought, &s));
+        assert!(condition_matches(&insp, &s));
+    }
+
+    #[test]
     fn chapters_in_arc_uses_arc_field_not_published() {
         let rule = ActivationRule {
             condition: "chapters_in_arc_gt".into(),
@@ -665,5 +714,35 @@ mod tests {
         let got3 = resolve_pipeline_agents_filtered(&pinned, &pipe, &[], Some(&quiet));
         assert!(got3.iter().any(|a| a == "dialogue_specialist"));
         assert!(got3.iter().any(|a| a == "scene_specialist"));
+    }
+
+    #[test]
+    fn lean_drops_nomenclature_without_new_entity_hints() {
+        let pipe = PipelineConfig::defaults();
+        let suggestions = vec![ActivationSuggestion {
+            agent: "nomenclature_curator".into(),
+            reason: "legacy has_bible".into(),
+        }];
+        let quiet = ActivationSignals {
+            published_count: 12,
+            chapter: 12,
+            has_nomenclature: true,
+            has_new_entity_hints: false,
+            ..Default::default()
+        };
+        let got = resolve_pipeline_agents_filtered(&[], &pipe, &suggestions, Some(&quiet));
+        assert!(
+            !got.iter().any(|a| a == "nomenclature_curator"),
+            "balanced lean must peel nomenclature when table exists and no new entities"
+        );
+        let with_hints = ActivationSignals {
+            published_count: 12,
+            chapter: 12,
+            has_nomenclature: true,
+            has_new_entity_hints: true,
+            ..Default::default()
+        };
+        let got2 = resolve_pipeline_agents_filtered(&[], &pipe, &suggestions, Some(&with_hints));
+        assert!(got2.iter().any(|a| a == "nomenclature_curator"));
     }
 }

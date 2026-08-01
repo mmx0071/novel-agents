@@ -4,6 +4,21 @@ use super::error::SchemaError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Max scene-level beats in one chapter outline (budget ≈ 5000–6000 words).
+pub const MAX_KEY_EVENTS: usize = 4;
+
+/// Soft cap on a single include / key_event string (chars). Overlong → repair hint.
+pub const MAX_OUTLINE_BEAT_CHARS: usize = 48;
+
+/// How strictly to enforce chapter length budget on outline JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutlineValidateMode {
+    /// Read / legacy round-trip: allow `key_events` above [`MAX_KEY_EVENTS`].
+    Compatible,
+    /// New planner / revise_outline output: enforce event budget.
+    EnforceBudget,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChapterOutline {
     pub title: String,
@@ -12,6 +27,12 @@ pub struct ChapterOutline {
     pub goal: String,
     pub conflict: String,
     pub emotion_curve: String,
+    /// Plot beats this chapter must cover (short; budget for 5k–6k). Missing → [].
+    #[serde(default)]
+    pub plot_includes: Vec<String>,
+    /// Plot beats explicitly deferred to later chapters. Missing → [].
+    #[serde(default)]
+    pub plot_defers: Vec<String>,
     pub key_events: Vec<String>,
     pub characters: Vec<String>,
     /// Active item cards this chapter (canonical names). Missing → [].
@@ -50,6 +71,67 @@ pub fn outline_entity_roster(outline: &str) -> OutlineEntityRoster {
         .unwrap_or_default()
 }
 
+/// Soft budget gaps for a follow-up planner repair (empty = OK).
+pub fn outline_budget_repair_hint(o: &ChapterOutline, has_active_plot: bool) -> Option<String> {
+    let mut parts = Vec::new();
+    if o.key_events.len() > MAX_KEY_EVENTS {
+        parts.push(format!(
+            "key_events 至多 {MAX_KEY_EVENTS} 条（单章篇幅预算），当前 {}",
+            o.key_events.len()
+        ));
+    }
+    if o.plot_includes.is_empty() {
+        parts.push(
+            "plot_includes 至少 1 条：写明本章必须推进的短句（估可写成 5000–6000 字）".into(),
+        );
+    }
+    if has_active_plot && o.plot_defers.is_empty() {
+        parts.push(
+            "存在进行中剧情卡时 plot_defers 至少 1 条：写明本章不写/不兑现的走向点（含默认不兑现收束条件）"
+                .into(),
+        );
+    }
+    let dense_includes: Vec<usize> = o
+        .plot_includes
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.chars().count() > MAX_OUTLINE_BEAT_CHARS)
+        .map(|(i, _)| i + 1)
+        .collect();
+    if !dense_includes.is_empty() {
+        parts.push(format!(
+            "plot_includes 第{}条过长（单条宜≤{MAX_OUTLINE_BEAT_CHARS}字短句锚点）；拆条或删细节，多余推进挪入 plot_defers",
+            dense_includes
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join("、")
+        ));
+    }
+    let dense_events: Vec<usize> = o
+        .key_events
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.chars().count() > MAX_OUTLINE_BEAT_CHARS)
+        .map(|(i, _)| i + 1)
+        .collect();
+    if !dense_events.is_empty() {
+        parts.push(format!(
+            "key_events 第{}条过长（单条宜≤{MAX_OUTLINE_BEAT_CHARS}字场面锚点）；拆成短句或把次要节拍挪入 plot_defers，总数仍≤{MAX_KEY_EVENTS}",
+            dense_events
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join("、")
+        ));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("；"))
+    }
+}
+
 const REQUIRED_STRINGS: &[&str] = &[
     "title",
     "pov",
@@ -60,8 +142,20 @@ const REQUIRED_STRINGS: &[&str] = &[
     "cliffhanger",
 ];
 
-/// Strip optional ```json fences and parse.
+/// Strip optional ```json fences and parse (legacy-compatible: `key_events` may exceed 4).
 pub fn parse_chapter_outline_text(text: &str) -> Result<ChapterOutline, SchemaError> {
+    parse_chapter_outline_text_with(text, OutlineValidateMode::Compatible)
+}
+
+/// Parse and enforce chapter budget (`key_events` ≤ [`MAX_KEY_EVENTS`]).
+pub fn parse_chapter_outline_text_budget(text: &str) -> Result<ChapterOutline, SchemaError> {
+    parse_chapter_outline_text_with(text, OutlineValidateMode::EnforceBudget)
+}
+
+fn parse_chapter_outline_text_with(
+    text: &str,
+    mode: OutlineValidateMode,
+) -> Result<ChapterOutline, SchemaError> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return Err(SchemaError::new(
@@ -91,7 +185,7 @@ pub fn parse_chapter_outline_text(text: &str) -> Result<ChapterOutline, SchemaEr
             continue;
         }
         match serde_json::from_str::<Value>(c) {
-            Ok(v) => return validate_chapter_outline(&v),
+            Ok(v) => return validate_chapter_outline_with(&v, mode),
             Err(e) => last_err = e.to_string(),
         }
     }
@@ -218,7 +312,20 @@ fn repair_model_json(s: &str) -> String {
     out
 }
 
+/// Validate outline JSON (legacy-compatible: does not reject oversized `key_events`).
 pub fn validate_chapter_outline(v: &Value) -> Result<ChapterOutline, SchemaError> {
+    validate_chapter_outline_with(v, OutlineValidateMode::Compatible)
+}
+
+/// Validate and enforce chapter budget (`key_events` ≤ [`MAX_KEY_EVENTS`]).
+pub fn validate_chapter_outline_budget(v: &Value) -> Result<ChapterOutline, SchemaError> {
+    validate_chapter_outline_with(v, OutlineValidateMode::EnforceBudget)
+}
+
+pub fn validate_chapter_outline_with(
+    v: &Value,
+    mode: OutlineValidateMode,
+) -> Result<ChapterOutline, SchemaError> {
     let obj = v.as_object().ok_or_else(|| {
         SchemaError::new("chapter_outline", "root", "章纲必须是 JSON 对象")
     })?;
@@ -235,7 +342,9 @@ pub fn validate_chapter_outline(v: &Value) -> Result<ChapterOutline, SchemaError
 
     let key_events = require_string_array(obj, "key_events", &mut missing)?;
     let characters = require_string_array(obj, "characters", &mut missing)?;
-    // items / locations: preferred for card loading; omit → [] (legacy outlines).
+    // plot_includes / plot_defers / items / locations: omit → [] (legacy outlines).
+    let plot_includes = optional_string_array(obj, "plot_includes", &mut missing)?;
+    let plot_defers = optional_string_array(obj, "plot_defers", &mut missing)?;
     let items = optional_string_array(obj, "items", &mut missing)?;
     let locations = optional_string_array(obj, "locations", &mut missing)?;
     let scene_tags = require_string_array(obj, "scene_tags", &mut missing)?;
@@ -256,6 +365,22 @@ pub fn validate_chapter_outline(v: &Value) -> Result<ChapterOutline, SchemaError
             format!("key_events 至少 2 条，当前 {}", key_events.len()),
         ));
     }
+    if mode == OutlineValidateMode::EnforceBudget && key_events.len() > MAX_KEY_EVENTS {
+        return Err(SchemaError::new(
+            "chapter_outline",
+            "key_events",
+            format!(
+                "key_events 至多 {MAX_KEY_EVENTS} 条（单章篇幅预算），当前 {}",
+                key_events.len()
+            ),
+        ));
+    } else if mode == OutlineValidateMode::Compatible && key_events.len() > MAX_KEY_EVENTS {
+        tracing::debug!(
+            n = key_events.len(),
+            max = MAX_KEY_EVENTS,
+            "legacy outline key_events above budget; accepted in Compatible mode"
+        );
+    }
 
     Ok(ChapterOutline {
         title: str_field(obj, "title"),
@@ -264,6 +389,8 @@ pub fn validate_chapter_outline(v: &Value) -> Result<ChapterOutline, SchemaError
         goal: str_field(obj, "goal"),
         conflict: str_field(obj, "conflict"),
         emotion_curve: str_field(obj, "emotion_curve"),
+        plot_includes,
+        plot_defers,
         key_events,
         characters,
         items,
@@ -291,8 +418,26 @@ pub fn display_chapter_outline(o: &ChapterOutline) -> String {
         "## 情绪曲线".into(),
         o.emotion_curve.clone(),
         String::new(),
-        "## 关键事件".into(),
+        "## 本章纳入".into(),
     ];
+    if o.plot_includes.is_empty() {
+        lines.push("- （未标注）".into());
+    } else {
+        for e in &o.plot_includes {
+            lines.push(format!("- {e}"));
+        }
+    }
+    lines.push(String::new());
+    lines.push("## 顺延后章".into());
+    if o.plot_defers.is_empty() {
+        lines.push("- （未标注）".into());
+    } else {
+        for e in &o.plot_defers {
+            lines.push(format!("- {e}"));
+        }
+    }
+    lines.push(String::new());
+    lines.push("## 关键事件".into());
     for (i, e) in o.key_events.iter().enumerate() {
         lines.push(format!("{}. {e}", i + 1));
     }
@@ -436,6 +581,8 @@ mod tests {
             "goal": "到达",
             "conflict": "阻拦",
             "emotion_curve": "紧→松",
+            "plot_includes": ["抵达城门并受阻"],
+            "plot_defers": ["本章不兑现主线收束落点"],
             "key_events": ["开场危机", "中段转折"],
             "characters": ["甲"],
             "items": ["旧钥"],
@@ -452,8 +599,12 @@ mod tests {
         assert_eq!(o.title, "试章");
         assert_eq!(o.items, vec!["旧钥".to_string()]);
         assert_eq!(o.locations, vec!["城门".to_string()]);
+        assert_eq!(o.plot_includes, vec!["抵达城门并受阻".to_string()]);
+        assert_eq!(o.plot_defers.len(), 1);
         let md = display_chapter_outline(&o);
         assert!(md.contains("## 关键事件"));
+        assert!(md.contains("## 本章纳入"));
+        assert!(md.contains("## 顺延后章"));
         assert!(md.contains("## 本章物品"));
         assert!(md.contains("旧钥"));
     }
@@ -464,9 +615,47 @@ mod tests {
         let obj = v.as_object_mut().unwrap();
         obj.remove("items");
         obj.remove("locations");
+        obj.remove("plot_includes");
+        obj.remove("plot_defers");
         let o = validate_chapter_outline(&v).unwrap();
         assert!(o.items.is_empty());
         assert!(o.locations.is_empty());
+        assert!(o.plot_includes.is_empty());
+        assert!(o.plot_defers.is_empty());
+    }
+
+    #[test]
+    fn rejects_too_many_key_events_in_budget_mode() {
+        let mut v = sample();
+        v["key_events"] = json!(["a", "b", "c", "d", "e"]);
+        assert!(validate_chapter_outline(&v).is_ok(), "Compatible accepts legacy");
+        let e = validate_chapter_outline_budget(&v).unwrap_err();
+        assert!(e.message.contains("至多"), "got: {}", e.message);
+    }
+
+    #[test]
+    fn budget_repair_hint_covers_includes_and_defers() {
+        let mut o = validate_chapter_outline(&sample()).unwrap();
+        o.plot_includes.clear();
+        o.plot_defers.clear();
+        let hint = outline_budget_repair_hint(&o, true).unwrap();
+        assert!(hint.contains("plot_includes"));
+        assert!(hint.contains("plot_defers"));
+        assert!(outline_budget_repair_hint(&o, false).unwrap().contains("plot_includes"));
+    }
+
+    #[test]
+    fn budget_repair_hint_flags_overlong_single_beat() {
+        let mut o = validate_chapter_outline(&sample()).unwrap();
+        o.plot_includes = vec!["短推进".into()];
+        o.plot_defers = vec!["顺延收束".into()];
+        o.key_events = vec![
+            "短事件一".into(),
+            "这是一条故意写得很长的关键事件描述，把沟通、决策、挂断电话与多件道具揭示全部塞进一句里，明显超过四十八字限制".into(),
+        ];
+        let hint = outline_budget_repair_hint(&o, true).unwrap();
+        assert!(hint.contains("key_events"), "{hint}");
+        assert!(hint.contains("过长") || hint.contains(&MAX_OUTLINE_BEAT_CHARS.to_string()), "{hint}");
     }
 
     #[test]

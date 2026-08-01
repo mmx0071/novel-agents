@@ -105,9 +105,9 @@ description: >-
 ## 流水线与发布
 
 - 顺序以 `pipeline.yaml` 为准：先生产 → 专改 → 一致性 → 摘要 → `plot_acceptor`。
-- 一致性 P0 **挡发布**；节奏 P0 **不挡**；`plot_acceptor` 通过并发布成功才 `completed`。
+- 一致性 P0 **挡发布**；节奏 P0 **不挡**；`plot_acceptor` 未收束 **不挡**发布（跨多章铺垫）；通过并发布成功才 `completed`（可自动升 `next_plot`）。
 - 发布收尾只在**完整章流水线末尾**一次；单步 spawn 不推进 `next_chapter`。
-- 发布链：`validate_draft` → 字数硬门 → `content_rules` → 一致性 P0 → plot_acceptor。
+- 发布链：`validate_draft` → 字数硬门 → `content_rules` → 一致性 P0；缺收束条件硬拦，未收束仅记录。
 - 门控文案须吃透真实 `rule id` / `gate_prompt`，勿用泛化「第N章/禁名」fallback 盖掉细节。
 
 ## 测试与迁移

@@ -24,11 +24,17 @@ pub struct ConsistencyGateResult {
 
 pub fn on_consistency_result(passed: bool, issues: &[Value], continuous: bool) -> ConsistencyGateResult {
     let (auto, rest) = partition_issues(issues);
-    if passed && rest.is_empty() && auto.is_empty() {
+    // Passed + no P0/P1 auto-fixables: Continue even if advisory P2 remain.
+    // Previously P2-only fell through to AwaitHuman and blocked unattended publish.
+    if passed && auto.is_empty() {
         return ConsistencyGateResult {
             decision: GateDecision::Continue,
             auto_fix_issues: vec![],
-            message: "一致性审计通过".into(),
+            message: if rest.is_empty() {
+                "一致性审计通过".into()
+            } else {
+                format!("一致性审计通过（另有 {} 条非阻断建议）", rest.len())
+            },
         };
     }
     if !auto.is_empty() && continuous {
@@ -136,6 +142,18 @@ mod tests {
         let gate = on_consistency_result(false, &issues, true);
         assert_eq!(gate.decision, GateDecision::AutoFix);
         assert!(gate.message.contains("整章修订"), "{}", gate.message);
+    }
+
+    #[test]
+    fn passed_with_p2_only_continues_not_await_human() {
+        let issues = vec![json!({
+            "type": "TIMELINE",
+            "priority": "P2",
+            "message": "时间流速略显压缩",
+        })];
+        let gate = on_consistency_result(true, &issues, true);
+        assert_eq!(gate.decision, GateDecision::Continue);
+        assert!(gate.message.contains("非阻断") || gate.message.contains("通过"));
     }
 
     #[test]

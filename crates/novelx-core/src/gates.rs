@@ -115,17 +115,19 @@ impl GateCatalog {
     }
 
     /// chapter_next: published → continue (+ batch); blocked → revise;
-    /// published + plot still open (accept failed) → continue/revise/batch.
-    /// Display order follows gates.yaml: continue → revise → batch.
+    /// hard_long → split + revise; published + plot open → continue/revise/batch.
+    /// Display order follows gates.yaml: continue → split → revise → batch.
     pub fn chapter_next_options(
         &self,
         published: bool,
         plot_accept_open: bool,
+        hard_long: bool,
     ) -> Vec<UserInputOption> {
         let opts = self.options("chapter_next");
         opts.into_iter()
             .filter(|o| match o.id.as_str() {
                 "cn_continue" => published,
+                "cn_split" => !published && hard_long,
                 "cn_revise" => !published || plot_accept_open,
                 "cn_batch" => published,
                 _ => false,
@@ -504,12 +506,13 @@ impl GateCatalog {
         chapter: u32,
         published: bool,
         plot_accept_open: bool,
+        hard_long: bool,
     ) -> Option<GateResolve> {
         if let Some(r) = self.resolve_chapter_next(text, project, chapter) {
             return Some(r);
         }
         let idx = parse_one_based_index(text)?;
-        let opts = self.chapter_next_options(published, plot_accept_open);
+        let opts = self.chapter_next_options(published, plot_accept_open, hard_long);
         let id = opts.get(idx.checked_sub(1)?)?.id.clone();
         self.resolve_chapter_next(&id, project, chapter)
     }
@@ -665,14 +668,18 @@ mod tests {
             GateResolve::Tool { name, .. } => assert_eq!(name, "continue_writing"),
             _ => panic!("expected continue_writing"),
         }
-        let cont = g.chapter_next_options(true, false);
+        let cont = g.chapter_next_options(true, false, false);
         assert_eq!(cont.len(), 2);
         assert_eq!(cont[0].id, "cn_continue");
         assert_eq!(cont[1].id, "cn_batch");
-        let fix = g.chapter_next_options(false, false);
+        let fix = g.chapter_next_options(false, false, false);
         assert_eq!(fix.len(), 1);
         assert_eq!(fix[0].id, "cn_revise");
-        let open = g.chapter_next_options(true, true);
+        let long = g.chapter_next_options(false, false, true);
+        assert_eq!(long.len(), 2);
+        assert_eq!(long[0].id, "cn_split");
+        assert_eq!(long[1].id, "cn_revise");
+        let open = g.chapter_next_options(true, true, false);
         assert_eq!(open.len(), 3);
         assert_eq!(open[0].id, "cn_continue");
         assert_eq!(open[1].id, "cn_revise");
@@ -685,9 +692,17 @@ mod tests {
             }
             _ => panic!("expected revise_chapter"),
         }
+        let r = g.resolve_chapter_next("拆成两章", "demo", 13).unwrap();
+        match r {
+            GateResolve::Tool { name, args } => {
+                assert_eq!(name, "split_chapter");
+                assert_eq!(args["chapter"], 13);
+            }
+            _ => panic!("expected split_chapter"),
+        }
         // UI shows「1. 修正本章」even though id is cn_revise — typed「1」must work.
         let r = g
-            .resolve_chapter_next_visible("1", "demo", 10, false, false)
+            .resolve_chapter_next_visible("1", "demo", 10, false, false, false)
             .unwrap();
         match r {
             GateResolve::Tool { name, args } => {
@@ -697,14 +712,21 @@ mod tests {
             _ => panic!("expected revise via display index"),
         }
         let r = g
-            .resolve_chapter_next_visible("1", "demo", 3, true, false)
+            .resolve_chapter_next_visible("1", "demo", 13, false, false, true)
+            .unwrap();
+        match r {
+            GateResolve::Tool { name, .. } => assert_eq!(name, "split_chapter"),
+            _ => panic!("expected split as first option when hard_long"),
+        }
+        let r = g
+            .resolve_chapter_next_visible("1", "demo", 3, true, false, false)
             .unwrap();
         match r {
             GateResolve::Tool { name, .. } => assert_eq!(name, "continue_writing"),
             _ => panic!("expected continue via display index"),
         }
         let r = g
-            .resolve_chapter_next_visible("2", "demo", 3, true, true)
+            .resolve_chapter_next_visible("2", "demo", 3, true, true, false)
             .unwrap();
         match r {
             GateResolve::Tool { name, .. } => assert_eq!(name, "revise_chapter"),

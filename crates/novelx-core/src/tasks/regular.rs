@@ -70,6 +70,9 @@ pub async fn run_regular_task(
 
     // Only clear if we still own the gate (interrupt may have started a newer turn).
     turn_gate.end_if(&turn_id).await;
+    // TurnComplete/Aborted often fire while the gate is still held — refresh after release
+    // so the composer can leave `working` for `idle` / `awaiting_human`.
+    core.publish_session_phase(&thread_id).await;
 
     if let Err(err) = result {
         core.emit_to_thread(

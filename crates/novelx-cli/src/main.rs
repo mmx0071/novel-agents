@@ -43,10 +43,10 @@ enum Commands {
         /// Unattended batch continue until a hard gate
         #[arg(long)]
         batch: bool,
-        /// Max chapters in --batch (default from longform.yaml)
+        /// Max successful publishes in --batch (default from longform.yaml)
         #[arg(long)]
         max_chapters: Option<u32>,
-        /// Stop after publishing this chapter (batch)
+        /// Stop after publishing this chapter (batch); falls back to target_chapters
         #[arg(long)]
         until_chapter: Option<u32>,
         /// Skip mid-volume audit soft gate (batch)
@@ -85,10 +85,35 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// List or restore shadow-git version nodes
+    Versions {
+        /// Project directory name under projects/
+        name: String,
+        #[command(subcommand)]
+        action: VersionsCmd,
+    },
     /// Start NovelX web server
     Web {
         #[arg(long, default_value = "127.0.0.1:8765")]
         bind: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum VersionsCmd {
+    /// List recent version nodes
+    List {
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Restore worktree to a node sha (creates pre-restore safety node first)
+    Restore {
+        sha: String,
+        /// Skip interactive confirmation
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -246,6 +271,79 @@ async fn main() -> Result<()> {
             } else {
                 for e in &entries {
                     println!("{}", novelx_core::ops_journal::format_entry_line(e));
+                }
+            }
+        }
+        Commands::Versions { name, action } => {
+            let dir = projects.join(&name);
+            if !dir.is_dir() {
+                anyhow::bail!("项目不存在：{}", dir.display());
+            }
+            match action {
+                VersionsCmd::List { limit, json } => {
+                    if novelx_pipeline::version_git_available() {
+                        let _ = novelx_pipeline::ensure_version_repo(&dir);
+                    }
+                    let nodes = novelx_pipeline::list_version_nodes(&dir, limit.clamp(1, 500))?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&nodes)?);
+                    } else if nodes.is_empty() {
+                        println!("(empty) projects/{name}/.novelx/version_nodes.jsonl");
+                    } else {
+                        for n in &nodes {
+                            let short = &n.sha[..n.sha.len().min(10)];
+                            let ch = n
+                                .chapter
+                                .map(|c| format!(" ch{c}"))
+                                .unwrap_or_default();
+                            println!("{short}  {}  {}{ch}", n.label, n.summary);
+                        }
+                    }
+                }
+                VersionsCmd::Restore { sha, yes } => {
+                    if !novelx_pipeline::version_git_available() {
+                        anyhow::bail!("本机未安装 git");
+                    }
+                    if !yes {
+                        eprint!(
+                            "将回退 projects/{name} 到 {sha}（先打 pre-restore 安全点）。确认？[y/N] "
+                        );
+                        let mut line = String::new();
+                        std::io::stdin().read_line(&mut line)?;
+                        let t = line.trim().to_ascii_lowercase();
+                        if t != "y" && t != "yes" {
+                            println!("已取消");
+                            return Ok(());
+                        }
+                    }
+                    let node = novelx_pipeline::restore_version_node(&dir, &sha)?;
+                    let restored_sha = node
+                        .meta
+                        .as_ref()
+                        .and_then(|m| m.get("restored_sha"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&sha);
+                    let entry = novelx_core::ops_journal::build_entry(
+                        &name,
+                        None,
+                        None,
+                        None,
+                        None,
+                        novelx_protocol::OpsJournalKind::CheckpointRestored,
+                        format!("restored worktree to {restored_sha}"),
+                        serde_json::json!({
+                            "milestone_sha": node.sha,
+                            "restored_sha": restored_sha,
+                            "label": node.label,
+                            "via": "cli",
+                        }),
+                    );
+                    let _ = novelx_core::ops_journal::append_entry(&projects, &entry);
+                    println!(
+                        "restored worktree → {} (milestone {})",
+                        &restored_sha[..restored_sha.len().min(12)],
+                        &node.sha[..node.sha.len().min(12)],
+                    );
                 }
             }
         }
