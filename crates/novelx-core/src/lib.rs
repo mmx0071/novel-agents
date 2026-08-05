@@ -2469,6 +2469,7 @@ impl NovelxCore {
             }
             // Gate already confirmed intent — skip a second mutation card for continue/batch.
             let args = if tool_name == "continue_writing"
+                || tool_name == "continue_episode"
                 || tool_name == "continue_writing_batch"
             {
                 novelx_tools::with_confirm_skip(args)
@@ -2761,6 +2762,7 @@ impl NovelxCore {
             // continue/batch: intent already confirmed.
             // revise keeps diff preview →「应用修改」(Cursor-style before/after).
             let args = if tool_name == "continue_writing"
+                || tool_name == "continue_episode"
                 || tool_name == "continue_writing_batch"
             {
                 novelx_tools::with_confirm_skip(args)
@@ -3629,6 +3631,91 @@ impl NovelxCore {
                 summary.push_str(
                     "\n\n下一步：design_plot → update_plot(in_progress) → continue_writing。",
                 );
+            }
+            // Schema / hard block on setup tools: restore pending_setup and re-offer next step
+            // (e.g. short_drama master outline rejected → user still sees「生成总纲」).
+            let setup_blocked = data.get("blocked").and_then(|v| v.as_bool()) == Some(true)
+                && matches!(
+                    tool_name.as_str(),
+                    "design_master_outline"
+                        | "design_arc_outline"
+                        | "upsert_setting"
+                        | "supplement_setting"
+                        | "lock_brief"
+                );
+            if setup_blocked {
+                let err = data
+                    .get("schema_error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(output.as_str());
+                let err_short: String = err.chars().take(240).collect();
+                summary = format!(
+                    "{intro}\n\n未成功：{err_short}\n\n定稿未完成，请按下方选项重试。"
+                );
+                if let Some(pending) = pending_snap.clone() {
+                    if let Some(t) = self.threads.write().await.get_mut(&thread_id) {
+                        t.pending_setup = Some(pending);
+                    }
+                }
+                let asked = self
+                    .maybe_offer_setup_confirm(&thread_id, &turn_id, &tool_name, &args, &data)
+                    .await?;
+                if !asked {
+                    // Ensure a setup card even if confirm helper skipped (e.g. no disk change).
+                    let project = args
+                        .get("project")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if !project.is_empty() {
+                        let _ = self
+                            .maybe_offer_setup_confirm(
+                                &thread_id,
+                                &turn_id,
+                                "get_project_status",
+                                &serde_json::json!({ "project": project }),
+                                &serde_json::json!({}),
+                            )
+                            .await?;
+                    }
+                }
+                if let Some(t) = self.threads.write().await.get_mut(&thread_id) {
+                    t.messages.push(ChatMessage {
+                        role: "assistant".into(),
+                        content: summary.clone(),
+                        tool_call_id: None,
+                        tool_calls: None,
+                        ..Default::default()
+                    });
+                    t.ui_turns = update_ui_turn_summary(
+                        std::mem::take(&mut t.ui_turns),
+                        &turn_id,
+                        &summary,
+                    );
+                }
+                self.emit_to_thread(
+                    &thread_id,
+                    EventMsg::ItemCompleted {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                        item: TurnItem::AgentMessage {
+                            id: agent_item_id,
+                            text: summary,
+                            status: ItemStatus::Completed,
+                        },
+                    },
+                )
+                .await;
+                let _ = self.persist_thread(&thread_id).await;
+                self.emit_to_thread(
+                    &thread_id,
+                    EventMsg::TurnComplete {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                    },
+                )
+                .await;
+                return Ok(());
             }
             // Direct apply (confirm off / confirm_skip): impact before setup resume.
             let asked_impact = self
@@ -4664,7 +4751,7 @@ impl NovelxCore {
                         bound_project.as_deref().unwrap_or("?")
                     )
                 }
-            } else if tool_name == "continue_writing" {
+            } else if tool_name == "continue_writing" || tool_name == "continue_episode" {
                 let ch = args.get("chapter").and_then(|v| v.as_u64());
                 if let Some(n) = ch {
                     format!(
@@ -4776,7 +4863,7 @@ impl NovelxCore {
             // Escaping into write/revise/batch must drop stale audit gates (zombie pending_audit).
             if matches!(
                 tool_name.as_str(),
-                "continue_writing" | "continue_writing_batch" | "revise_chapter"
+                "continue_writing" | "continue_episode" | "continue_writing_batch" | "revise_chapter" | "revise_episode"
             ) {
                 if let Some(t) = self.threads.write().await.get_mut(&thread_id) {
                     t.pending_audit = None;
@@ -5154,7 +5241,7 @@ impl NovelxCore {
                     tool_calls: None,
                     ..Default::default()
                 });
-                if tool_name == "continue_writing" || tool_name == "revise_chapter" {
+                if tool_name == "continue_writing" || tool_name == "continue_episode" || tool_name == "revise_chapter" || tool_name == "revise_episode" {
                     t.ui_turns = update_ui_turn_summary(
                         std::mem::take(&mut t.ui_turns),
                         &turn_id,
@@ -6103,7 +6190,7 @@ impl NovelxCore {
                 // Batch uses flattened last-chapter payload so stop reasons open the same gates.
                 if matches!(
                     tc.name.as_str(),
-                    "continue_writing" | "continue_writing_batch" | "revise_chapter"
+                    "continue_writing" | "continue_episode" | "continue_writing_batch" | "revise_chapter" | "revise_episode"
                 ) {
                     if self
                         .maybe_offer_draft_exists(
@@ -12491,7 +12578,7 @@ fn write_result_is_clean_publish(tool_name: &str, data: &Value) -> bool {
 fn is_chapter_gate_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "continue_writing" | "continue_writing_batch" | "revise_chapter"
+        "continue_writing" | "continue_episode" | "continue_writing_batch" | "revise_chapter" | "revise_episode"
             | "audit_chapter" | "audit_chapters"
     )
 }

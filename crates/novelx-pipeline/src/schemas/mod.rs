@@ -10,6 +10,7 @@ mod master;
 mod md;
 mod migrate;
 mod plot;
+mod script;
 
 pub use arc::{display_arc_outline, normalize_arc_outline_input, validate_arc_outline};
 pub use bible::{display_bible, validate_bible};
@@ -33,6 +34,9 @@ pub use migrate::{migrate_project_reader_formats, MigrateReport};
 pub use plot::{
     display_plot_card_body, normalize_plot_card_best_effort, validate_plot_card,
     validate_plot_card_body_edit,
+};
+pub use script::{
+    display_script, normalize_script_best_effort, validate_script, MIN_SCRIPT_BODY_CHARS,
 };
 
 /// Fixed entity-gaps reader text (computed list; no on-disk file).

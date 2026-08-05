@@ -5,6 +5,9 @@ description: >-
   落盘便于 Agent 加载；Web 展示简洁易读。生成时必须遵守。
 ---
 
+> 短剧/漫剧剧本格式见 [`content-formats-script.md`](content-formats-script.md)（`project_mode=short_drama`）。
+
+
 # 内容格式契约（生成锚定）
 
 题材中立。机器硬校验以 `novelx_pipeline::schemas` 为准；人读摘要见 `config/schemas/README.md`。

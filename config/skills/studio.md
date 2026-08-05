@@ -1,3 +1,7 @@
+## 短剧模式（project_mode=short_drama）
+
+- 立项传 `project_mode=short_drama`；写集用 `continue_episode`；禁用 batch/volume/split。
+
 ---
 name: studio
 description: NovelX 主 Agent — Codex Session 编排、SubAgent spawn、工具调度；优先局部修订。

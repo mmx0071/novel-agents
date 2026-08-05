@@ -107,21 +107,23 @@ pub use phases::{
 };
 pub use project::{
     chapter_dir, chapter_memory_artifact_matches_draft, delete_chapter, draft_fingerprint,
-    init_project, list_chapter_numbers, list_projects, load_project_state, project_dir,
-    read_chapter_draft, read_chapter_outline, refresh_meta_flags, save_project_state,
-    sync_records_novel_json, update_target_chapters, write_chapter_draft,
-    write_chapter_memory_artifact, write_chapter_outline, write_chapter_outline_budget,
-    DeleteChapterResult, ProjectState,
+    init_project, init_project_with_mode, is_short_drama, list_chapter_numbers, list_projects,
+    load_project_state, project_dir, read_chapter_draft, read_chapter_outline, refresh_meta_flags,
+    resolve_project_mode, save_project_state, sync_records_novel_json, unit_body_filename,
+    update_target_chapters, write_chapter_draft, write_chapter_memory_artifact, write_chapter_outline,
+    write_chapter_outline_budget, DeleteChapterResult, ProjectMode, ProjectState,
 };
 pub use schemas::{
     display_arc_outline, display_bible, display_chapter_outline, display_draft, display_entity_card,
-    display_entity_gaps, display_master_outline, display_plot_card_body, draft_body_chars,
-    migrate_project_reader_formats, outline_budget_repair_hint, outline_entity_roster,
-    parse_chapter_outline_text, parse_chapter_outline_text_budget, validate_arc_outline,
-    validate_bible, normalize_draft_best_effort, normalize_plot_card_best_effort,
-    validate_chapter_outline, validate_chapter_outline_budget, validate_draft, validate_entity_card,
-    validate_master_outline, validate_plot_card, ChapterOutline, EntityKind, MigrateReport,
+    display_entity_gaps, display_master_outline, display_plot_card_body, display_script,
+    draft_body_chars, migrate_project_reader_formats, normalize_script_best_effort,
+    outline_budget_repair_hint, outline_entity_roster, parse_chapter_outline_text,
+    parse_chapter_outline_text_budget, validate_arc_outline, validate_bible,
+    normalize_draft_best_effort, normalize_plot_card_best_effort, validate_chapter_outline,
+    validate_chapter_outline_budget, validate_draft, validate_entity_card, validate_master_outline,
+    validate_plot_card, validate_script, ChapterOutline, EntityKind, MigrateReport,
     OutlineEntityRoster, OutlineValidateMode, SchemaError, MAX_KEY_EVENTS, MIN_DRAFT_BODY_CHARS,
+    MIN_SCRIPT_BODY_CHARS,
 };
 pub use run::{
     apply_cached_local_patches, execute_pipeline, execute_pipeline_with_steps,

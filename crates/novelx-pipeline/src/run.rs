@@ -27,10 +27,11 @@ use crate::memory::{apply_summary_json, load_memory, save_memory, OpenThread};
 use crate::project::{
     chapter_memory_artifact_matches_draft, load_project_state, read_chapter_draft,
     read_chapter_outline, save_project_state, write_chapter_draft, write_chapter_memory_artifact,
-    write_chapter_outline_budget, ProjectState,
+    write_chapter_outline, write_chapter_outline_budget, ProjectState,
 };
 use crate::schemas::{
-    draft_body_chars, normalize_draft_best_effort, validate_draft, MIN_DRAFT_BODY_CHARS,
+    draft_body_chars, normalize_draft_best_effort, normalize_script_best_effort,
+    validate_draft, validate_script, MIN_DRAFT_BODY_CHARS,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,7 +193,9 @@ pub fn plan_chapter_steps_with_activation_for(
     draft: &str,
     chapter: u32,
 ) -> Vec<String> {
-    let pipe = PipelineConfig::load(config_root);
+    let mode_key = crate::project::resolve_project_mode(project_dir).as_str();
+    let short = crate::project::is_short_drama(project_dir);
+    let pipe = PipelineConfig::load_for_mode(config_root, mode_key);
     let mut signals = collect_signals(project_dir, state.published_count, draft);
     signals.chapter = chapter;
     if let Some(vol) = crate::volume::active_volume_for_chapter(project_dir, chapter) {
@@ -215,7 +218,8 @@ pub fn plan_chapter_steps_with_activation_for(
             "agent activation suggestions"
         );
     }
-    let lean = longform_lean_enabled(config_root).then_some(&signals);
+    // Short-drama: no longform lean filtering (foreshadow/volume agents not in pipeline).
+    let lean = (!short && longform_lean_enabled(config_root)).then_some(&signals);
     let tier = novelx_harness::LongformConfig::load_from_config_root(config_root).quality_tier;
     novelx_harness::resolve_pipeline_agents_with_tier(
         &state.active_agents,
@@ -294,9 +298,12 @@ pub fn plan_steps_for_mode(
     let state = load_project_state(&project_dir)?;
     let existing_draft = read_chapter_draft(&project_dir, chapter).unwrap_or_default();
     if matches!(mode, RunMode::AuditOnly) && existing_draft.trim().is_empty() {
-        anyhow::bail!("第{chapter}章尚无正文（draft.md），无法审校");
+        let unit = if crate::project::is_short_drama(&project_dir) { "集" } else { "章" };
+        let body = crate::project::unit_body_filename(&project_dir);
+        anyhow::bail!("第{chapter}{unit}尚无正文（{body}），无法审校");
     }
-    let pipe = PipelineConfig::load(config_root);
+    let mode_key = crate::project::resolve_project_mode(&project_dir).as_str();
+    let pipe = PipelineConfig::load_for_mode(config_root, mode_key);
     let prefer_local = revision.prefer_local_patch
         && (revision.revision_mode
             || matches!(mode, RunMode::Revise)
@@ -346,6 +353,31 @@ pub async fn execute_single_agent_step(
         false,
     )
     .await
+}
+
+
+fn normalize_unit_body_best_effort(
+    project_dir: &Path,
+    unit: u32,
+    text: &str,
+) -> (String, Vec<String>) {
+    if crate::project::is_short_drama(project_dir) {
+        normalize_script_best_effort(unit, text)
+    } else {
+        normalize_draft_best_effort(unit, text)
+    }
+}
+
+fn validate_unit_body(
+    project_dir: &Path,
+    unit: u32,
+    text: &str,
+) -> Result<String, crate::schemas::SchemaError> {
+    if crate::project::is_short_drama(project_dir) {
+        validate_script(unit, text)
+    } else {
+        validate_draft(unit, text)
+    }
 }
 
 pub async fn execute_pipeline(
@@ -408,7 +440,9 @@ pub async fn execute_pipeline_with_steps(
 
     let existing_draft = read_chapter_draft(&project_dir, chapter).unwrap_or_default();
     if matches!(mode, RunMode::AuditOnly) && existing_draft.trim().is_empty() {
-        anyhow::bail!("第{chapter}章尚无正文（draft.md），无法审校");
+        let unit = if crate::project::is_short_drama(&project_dir) { "集" } else { "章" };
+        let body = crate::project::unit_body_filename(&project_dir);
+        anyhow::bail!("第{chapter}{unit}尚无正文（{body}），无法审校");
     }
     // Any re-audit with prior open issues defaults to verify (stops rediscovery growth),
     // unless caller forces full_rescan.
@@ -482,8 +516,11 @@ pub async fn execute_pipeline_with_steps(
     let naming = NamingRules::load_from_config_root(config_root);
     let naming_block = naming.prompt_block();
     let content_rules = ContentRulesConfig::load_from_config_root(config_root);
-    let chapter_budget = ChapterBudget::load_from_config_root(config_root);
-    let pipe = PipelineConfig::load(config_root);
+    let project_mode = crate::project::resolve_project_mode(&project_dir);
+    let mode_key = project_mode.as_str();
+    let short_drama = project_mode == crate::project::ProjectMode::ShortDrama;
+    let chapter_budget = ChapterBudget::load_for_mode(config_root, mode_key);
+    let pipe = PipelineConfig::load_for_mode(config_root, mode_key);
 
     let mut draft = existing_draft.clone();
     let mut outline = read_chapter_outline(&project_dir, chapter).unwrap_or_default();
@@ -515,7 +552,11 @@ pub async fn execute_pipeline_with_steps(
         // local_reviser reuses writer skill for full-revise fallback; local patches use a
         // short system prompt inside revise_by_local_patches.
         let skill_key = if agent == "local_reviser" {
-            "writer".to_string()
+            if short_drama {
+                "script-writer".to_string()
+            } else {
+                "writer".to_string()
+            }
         } else {
             agent.replace('_', "-")
         };
@@ -553,7 +594,12 @@ pub async fn execute_pipeline_with_steps(
                 .await?;
                 let mut write_err = None;
                 for attempt in 0..2u8 {
-                    match write_chapter_outline_budget(&project_dir, chapter, &generated) {
+                    let write_outline = if short_drama {
+                        write_chapter_outline(&project_dir, chapter, &generated)
+                    } else {
+                        write_chapter_outline_budget(&project_dir, chapter, &generated)
+                    };
+                    match write_outline {
                         Ok(()) => {
                             write_err = None;
                             break;
@@ -611,8 +657,12 @@ pub async fn execute_pipeline_with_steps(
                                 &hint,
                             )
                             .await?;
-                            match write_chapter_outline_budget(&project_dir, chapter, &repaired)
-                            {
+                            let write_repaired = if short_drama {
+                                write_chapter_outline(&project_dir, chapter, &repaired)
+                            } else {
+                                write_chapter_outline_budget(&project_dir, chapter, &repaired)
+                            };
+                            match write_repaired {
                                 Ok(()) => generated = repaired,
                                 Err(e) => {
                                     tracing::warn!(
@@ -714,7 +764,7 @@ pub async fn execute_pipeline_with_steps(
                     .unwrap_or(draft);
                 }
                 // Save-first: never discard a non-empty generation on schema mismatch.
-                let (shaped, mut shape_issues) = normalize_draft_best_effort(chapter, &draft);
+                let (shaped, mut shape_issues) = normalize_unit_body_best_effort(&project_dir, chapter, &draft);
                 if shaped.trim().is_empty() {
                     anyhow::bail!("writer 产出为空，无法保留");
                 }
@@ -753,7 +803,7 @@ pub async fn execute_pipeline_with_steps(
                 }
 
                 if shape_issues.is_empty() {
-                    if let Ok(ok) = validate_draft(chapter, &draft) {
+                    if let Ok(ok) = validate_unit_body(&project_dir, chapter, &draft) {
                         draft = ok;
                         write_chapter_draft(&project_dir, chapter, &draft)?;
                     }
@@ -1444,7 +1494,7 @@ pub async fn execute_pipeline_with_steps(
             }
             LengthAssessment::HardLong => {
                 let mut handled = false;
-                if auto_split_hard_long_enabled(config_root) {
+                if !short_drama && auto_split_hard_long_enabled(config_root) {
                     match crate::split_chapter::split_chapter_draft(
                         &project_dir,
                         chapter,
@@ -1571,19 +1621,29 @@ pub async fn execute_pipeline_with_steps(
         }
     }
 
-    // Final shape gate: specialists / AutoFix may drop `# 第N章` — coerce then hard-block.
+    // Final shape gate: specialists / AutoFix may drop title — coerce then hard-block.
     if allow_publish && !draft.trim().is_empty() {
-        let (shaped, shape_issues) = normalize_draft_best_effort(chapter, &draft);
+        let (shaped, shape_issues) = if short_drama {
+            normalize_script_best_effort(chapter, &draft)
+        } else {
+            normalize_draft_best_effort(chapter, &draft)
+        };
         if !shaped.trim().is_empty() && shaped != draft {
             draft = shaped;
             let _ = write_chapter_draft(&project_dir, chapter, &draft);
         }
-        if let Err(e) = validate_draft(chapter, &draft) {
+        let shape_err = if short_drama {
+            validate_script(chapter, &draft).err()
+        } else {
+            validate_draft(chapter, &draft).err()
+        };
+        if let Some(e) = shape_err {
             has_blocking = true;
             run.needs_user_choice = true;
-            let msg = format!("正文形状不合规，已拦发布：{}", e.message);
-            tracing::warn!(chapter, error = %e.message, "pre-publish validate_draft failed");
-            report_parts.push(format!("## 正文形状门控（阻断发布）\n{msg}"));
+            let label = if short_drama { "剧本" } else { "正文" };
+            let msg = format!("{label}形状不合规，已拦发布：{}", e.message);
+            tracing::warn!(chapter, error = %e.message, "pre-publish shape validate failed");
+            report_parts.push(format!("## {label}形状门控（阻断发布）\n{msg}"));
             if !shape_issues.is_empty() {
                 report_parts.push(format!("残留问题：{}", shape_issues.join("；")));
             }
@@ -2051,29 +2111,35 @@ async fn run_writer(
     }
 
     // new chapter generation — stream so UI doesn't look stuck
-    let target_line = budget.writer_target_line();
+    let mode_key = crate::project::resolve_project_mode(project_dir).as_str();
+    let short = crate::project::is_short_drama(project_dir);
+    let target_line = budget.writer_target_line_for_mode(mode_key);
+    let unit_label = if short { "集" } else { "章" };
+    let outline_label = if short { "集纲" } else { "章纲" };
+    let empty_outline = if short {
+        "（无集纲，按题材与 CanonContext 规划一集漫剧剧本）"
+    } else {
+        "（无章纲，按题材与 CanonContext 规划一章）"
+    };
     let user = format!(
-        "小说《{}》第{chapter}章。\n\
+        "作品《{}》第{chapter}{unit_label}。\n\
          正文必须服从 CanonContext（尤其【身体与能力状态板】、人物状态、名词、世界观、剧情走向）。\n\
          写前先扫一眼状态板：伤势侧别/部位与能力寄宿点抄错即属 P0。\n\
          命名遵守取名硬约束，禁止语料脸谱名。\n\
          {WRITER_HARD_CONSTRAINTS}\n\n\
-         {naming_block}\n\n{canon}\n\n# 章纲\n{}\n\n{target_line}",
+         {naming_block}\n\n{canon}\n\n# {outline_label}\n{}\n\n{target_line}",
         state.name,
-        if outline.is_empty() {
-            "（无章纲，按题材与 CanonContext 规划一章）"
-        } else {
-            outline
-        }
+        if outline.is_empty() { empty_outline } else { outline }
     );
-    let model = llm.model_for_agent("writer");
+    let writer_agent = if short { "script_writer" } else { "writer" };
+    let model = llm.model_for_agent(writer_agent);
     // Codex-like: stream tool output deltas (coalesced in core) + intermittent draft.md flush.
     let draft = stream_agent_llm(
         llm,
         skill,
         &user,
         &model,
-        "writer",
+        writer_agent,
         tx,
         true,
         Some(DraftFlushSink {

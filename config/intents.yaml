@@ -161,6 +161,26 @@ intents:
       - 到哪了
       - 进度
 
+  # 「写第3集 / 续写下一集」→ continue_episode（short_drama）
+  - id: write_episode
+    tool: continue_episode
+    priority: 72
+    require_project: true
+    extract: chapter_optional
+    clear_history: on_start
+    any_keywords:
+      - 写下一集
+      - 续写下一集
+      - continue_episode
+    all_keyword_groups:
+      - [写第, 集]
+      - [续写, 集]
+    none_keywords:
+      - 章
+      - 批写
+      - sync_volume
+      - design_plot
+
   # 「写第10章 / 续写 / 写下一章」→ continue_writing
   # 衔接章由剧情卡 needs_bridge（Agent）决定，0 或 1 章，用户无需声明
   # 复合任务（去重/卷纲/design_plot…再写第N章）勿命中：应交 LLM 分步执行

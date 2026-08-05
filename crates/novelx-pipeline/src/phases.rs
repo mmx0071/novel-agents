@@ -141,7 +141,12 @@ fn path_nonempty(path: &Path) -> bool {
 fn has_master_outline(project_dir: &Path) -> bool {
     path_nonempty(&project_dir.join("artifacts/master_outline.md"))
         || path_nonempty(&project_dir.join("artifacts/master_planner.md"))
+        || path_nonempty(&project_dir.join("artifacts/series_outline.md"))
         || path_nonempty(&project_dir.join("artifacts/story_outline.json"))
+}
+
+fn is_short_drama(project_dir: &Path) -> bool {
+    crate::project::is_short_drama(project_dir)
 }
 
 fn has_arc_outline(project_dir: &Path) -> bool {
@@ -190,7 +195,12 @@ pub fn resolve_setup_phase(project_dir: &Path) -> SetupPhase {
     {
         return s;
     }
-    if has_master_outline(project_dir) && has_arc_outline(project_dir) {
+    let outlines_ready = if is_short_drama(project_dir) {
+        has_master_outline(project_dir)
+    } else {
+        has_master_outline(project_dir) && has_arc_outline(project_dir)
+    };
+    if outlines_ready {
         return SetupPhase::AwaitingConfirm;
     }
     // Has project files but no outlines yet.
@@ -233,7 +243,12 @@ pub fn maybe_advance_setup_after_outlines(project_dir: &Path) -> Result<SetupPha
     if current == SetupPhase::Ready {
         return Ok(current);
     }
-    if has_master_outline(project_dir) && has_arc_outline(project_dir) {
+    let outlines_ready = if is_short_drama(project_dir) {
+        has_master_outline(project_dir)
+    } else {
+        has_master_outline(project_dir) && has_arc_outline(project_dir)
+    };
+    if outlines_ready {
         set_setup_phase(project_dir, SetupPhase::AwaitingConfirm)?;
         return Ok(SetupPhase::AwaitingConfirm);
     }
@@ -276,7 +291,13 @@ pub fn bible_setup_gap_reason(project_dir: &Path) -> Option<String> {
 }
 
 pub fn confirm_setup_approve(project_dir: &Path) -> Result<SetupPhase> {
-    if !has_master_outline(project_dir) || !has_arc_outline(project_dir) {
+    if is_short_drama(project_dir) {
+        if !has_master_outline(project_dir) {
+            anyhow::bail!(
+                "系列/短剧总纲尚未齐全，无法确认定稿。请先 design_master_outline（可写 series_outline.md）。"
+            );
+        }
+    } else if !has_master_outline(project_dir) || !has_arc_outline(project_dir) {
         anyhow::bail!("总纲与卷纲尚未齐全，无法确认定稿。请先 design_master_outline / design_arc_outline。");
     }
     if let Some(reason) = bible_setup_gap_reason(project_dir) {
@@ -384,7 +405,8 @@ pub fn resolve_setup_next_step(project_dir: &Path) -> Option<SetupNextStep> {
             if !has_master_outline(project_dir) {
                 return Some(SetupNextStep::NeedMaster);
             }
-            if !has_arc_outline(project_dir) {
+            // Short-drama: series outline + bible; no volume arc required.
+            if !is_short_drama(project_dir) && !has_arc_outline(project_dir) {
                 return Some(SetupNextStep::NeedArc);
             }
             if !has_valid_bible(project_dir) {
@@ -399,16 +421,30 @@ pub fn resolve_setup_next_step(project_dir: &Path) -> Option<SetupNextStep> {
 pub fn setup_write_block_reason(project_dir: &Path) -> Option<String> {
     let next = resolve_setup_next_step(project_dir)?;
     let phase = resolve_setup_phase(project_dir);
+    let short = is_short_drama(project_dir);
     let step = match next {
         SetupNextStep::NeedBrief => {
             "请先 lock_brief（在对话中发送灵感/一句话卖点）".to_string()
         }
-        SetupNextStep::NeedMaster => "下一步：design_master_outline 生成总纲".to_string(),
+        SetupNextStep::NeedMaster => {
+            if short {
+                "下一步：design_master_outline 生成系列/短剧总纲（可落盘 series_outline.md）"
+                    .to_string()
+            } else {
+                "下一步：design_master_outline 生成总纲".to_string()
+            }
+        }
         SetupNextStep::NeedArc => "下一步：design_arc_outline 生成卷纲".to_string(),
         SetupNextStep::NeedBible => {
             "下一步：upsert_setting 补齐世界观 Bible（须含 ## 0./1./2./7.）".to_string()
         }
-        SetupNextStep::Confirm => "请用户选择「确认定稿」后再写章".to_string(),
+        SetupNextStep::Confirm => {
+            if short {
+                "请用户选择「确认定稿」后再写集".to_string()
+            } else {
+                "请用户选择「确认定稿」后再写章".to_string()
+            }
+        }
     };
     Some(format!(
         "定稿未完成（setup_phase={}）。{step}。",
@@ -418,6 +454,10 @@ pub fn setup_write_block_reason(project_dir: &Path) -> Option<String> {
 
 /// Resolve volume phase from state.meta, with inference for legacy projects.
 pub fn resolve_volume_phase(project_dir: &Path) -> VolumePhase {
+    // Short-drama never enters volume handoff.
+    if is_short_drama(project_dir) {
+        return VolumePhase::DraftingVolume;
+    }
     if let Ok(state) = load_project_state(project_dir) {
         if let Some(s) = state
             .meta
@@ -514,6 +554,9 @@ pub fn recover_false_volume_end(project_dir: &Path) -> Option<u32> {
 
 /// Block message when volume phase forbids writing.
 pub fn volume_write_block_reason(project_dir: &Path) -> Option<String> {
+    if is_short_drama(project_dir) {
+        return None;
+    }
     let _ = recover_false_volume_end(project_dir);
     match resolve_volume_phase(project_dir) {
         VolumePhase::DraftingVolume => None,
@@ -799,4 +842,39 @@ mod tests {
         assert!(!f.mutation_confirm);
         let _ = fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn short_drama_skips_arc_in_setup() {
+        let root = tmp_proj("short-drama-setup");
+        let dir = crate::project::init_project_with_mode(
+            &root,
+            "demo",
+            "未定",
+            12,
+            crate::project::ProjectMode::ShortDrama,
+        )
+        .unwrap();
+        assert!(crate::project::is_short_drama(&dir));
+        assert!(dir.join("episodes").is_dir());
+        lock_brief(&dir, "一句话卖点测试").unwrap();
+        // series outline counts as master
+        std::fs::write(
+            dir.join("artifacts/series_outline.md"),
+            "# 总纲\n\n## 一句话卖点\n测\n\n## 分集骨架\n第1-3集\n\n## 主角弧\n成长\n\n## 主线冲突\n对抗\n",
+        )
+        .unwrap();
+        // minimal valid bible
+        std::fs::write(
+            dir.join("artifacts/bible.md"),
+            "# 世界观 Bible\n\n## 0. 总览\nx\n\n## 1. 规则\nx\n\n## 2. 力量\nx\n\n## 7. 禁忌\nx\n",
+        )
+        .unwrap();
+        let next = resolve_setup_next_step(&dir);
+        assert_eq!(next, Some(SetupNextStep::Confirm));
+        assert!(volume_write_block_reason(&dir).is_none());
+        confirm_setup_approve(&dir).unwrap();
+        assert_eq!(resolve_setup_phase(&dir), SetupPhase::Ready);
+        assert!(setup_write_block_reason(&dir).is_none());
+    }
+
 }

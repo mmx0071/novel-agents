@@ -23,11 +23,24 @@ pub fn validate_master_outline(text: &str) -> Result<String, SchemaError> {
     if !has_h2(&t, &["一句话卖点", "Logline", "logline", "卖点"]) {
         missing.push("## 一句话卖点（或 ## Logline）");
     }
-    if !has_h2(&t, &["三幕结构", "分卷", "分卷结构"])
-        && !has_h2_prefix(&t, "三幕结构")
+    // Longform: 三幕/分卷；short_drama series outline: 分集骨架（见 content-formats-script）。
+    if !has_h2(
+        &t,
+        &[
+            "三幕结构",
+            "分卷",
+            "分卷结构",
+            "分集骨架",
+            "分集",
+            "分季",
+            "分季结构",
+        ],
+    ) && !has_h2_prefix(&t, "三幕结构")
         && !has_h2_prefix(&t, "分卷")
+        && !has_h2_prefix(&t, "分集")
+        && !has_h2_prefix(&t, "分季")
     {
-        missing.push("## 三幕结构 或 ## 分卷");
+        missing.push("## 三幕结构 或 ## 分卷（短剧可用 ## 分集骨架）");
     }
     if !has_h2(&t, &["主角弧", "主角弧光"]) && !has_h2_prefix(&t, "主角弧") {
         missing.push("## 主角弧");
@@ -101,7 +114,18 @@ fn extract_fenced_markdown(text: &str) -> Option<String> {
 
 fn outline_has_required_signal(text: &str) -> bool {
     has_h2(text, &["一句话卖点", "Logline", "logline", "卖点"])
-        || has_h2(text, &["三幕结构", "分卷", "分卷结构"])
+        || has_h2(
+            text,
+            &[
+                "三幕结构",
+                "分卷",
+                "分卷结构",
+                "分集骨架",
+                "分集",
+                "分季",
+                "分季结构",
+            ],
+        )
         || text.lines().any(|l| {
             let t = l.trim();
             t.starts_with("# 总纲") || (t.starts_with("# ") && t.contains("总纲") && !t.starts_with("## "))
@@ -119,7 +143,9 @@ fn slice_from_outline_start(text: &str) -> &str {
             || tr.starts_with("## logline")
             || tr.starts_with("## 卖点")
             || tr.starts_with("## 三幕结构")
-            || tr.starts_with("## 分卷");
+            || tr.starts_with("## 分卷")
+            || tr.starts_with("## 分集")
+            || tr.starts_with("## 分季");
         if is_h1_total || is_required_h2 {
             return text[offset..].trim();
         }
@@ -241,6 +267,12 @@ mod tests {
     #[test]
     fn accepts_logline_alias() {
         let t = sample().replace("## 一句话卖点", "## Logline");
+        assert!(validate_master_outline(&t).is_ok());
+    }
+
+    #[test]
+    fn accepts_episode_skeleton_for_short_drama() {
+        let t = sample().replace("## 三幕结构", "## 分集骨架");
         assert!(validate_master_outline(&t).is_ok());
     }
 

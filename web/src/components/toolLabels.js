@@ -1,5 +1,6 @@
 /** English tool / pipeline step id → Chinese label for chat UI. */
 const TOOL_LABELS_ZH = {
+  continue_episode: '续写短剧',
   continue_writing: '继续创作',
   revise_chapter: '修订章节',
   revise_outline: '修订章纲',

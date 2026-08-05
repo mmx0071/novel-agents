@@ -235,6 +235,7 @@ export default function App() {
   const [newNovelTitle, setNewNovelTitle] = useState('')
   const [newNovelGenre, setNewNovelGenre] = useState('')
   const [newNovelBrief, setNewNovelBrief] = useState('')
+  const [newNovelMode, setNewNovelMode] = useState('longform')
   const [newNovelBusy, setNewNovelBusy] = useState(false)
   const [deskPatches, setDeskPatches] = useState([])
   const [deskPatchFocus, setDeskPatchFocus] = useState(null)
@@ -477,6 +478,7 @@ export default function App() {
       title,
       genre: newNovelGenre,
       brief: newNovelBrief,
+      mode: newNovelMode,
     })
     if (project) clearToDraft()
     setNewNovelBusy(true)
@@ -484,6 +486,7 @@ export default function App() {
     setNewNovelTitle('')
     setNewNovelGenre('')
     setNewNovelBrief('')
+    setNewNovelMode('longform')
     setShowNewNovelForm(false)
 
     const startPoll = () => {
@@ -531,6 +534,7 @@ export default function App() {
     clearToDraft,
     newNovelBrief,
     newNovelGenre,
+    newNovelMode,
     newNovelTitle,
     project,
     selectProject,
@@ -1013,8 +1017,8 @@ export default function App() {
       label: '本卷',
       show: Boolean(volumeGroups.length || project),
     },
-    { id: 'draft', label: '正文', show: Boolean(chapterData) },
-    { id: 'outline', label: '章纲', show: Boolean(chapterData) },
+    { id: 'draft', label: preview?.project_mode === 'short_drama' ? '剧本' : '正文', show: Boolean(chapterData) },
+    { id: 'outline', label: preview?.project_mode === 'short_drama' ? '集纲' : '章纲', show: Boolean(chapterData) },
     {
       id: 'master',
       label: '总纲',
@@ -1413,6 +1417,17 @@ export default function App() {
                     />
                   </label>
                   <label className="new-novel-field">
+                    <span>创作模式</span>
+                    <select
+                      value={newNovelMode}
+                      onChange={(e) => setNewNovelMode(e.target.value)}
+                      disabled={newNovelBusy}
+                    >
+                      <option value="longform">超长篇小说</option>
+                      <option value="short_drama">AI 漫剧短篇（剧本）</option>
+                    </select>
+                  </label>
+                  <label className="new-novel-field">
                     <span>灵感</span>
                     <textarea
                       value={newNovelBrief}
@@ -1651,7 +1666,7 @@ export default function App() {
           </div>
 
           {!hasReaderMaterial ? (
-            <div className="empty small">在 NovelX 创建小说后，卷大纲、设定卡与正文将显示在此</div>
+            <div className="empty small">在 NovelX 创建项目后，大纲、设定卡与正文/剧本将显示在此</div>
           ) : (
             <>
               <div className="reader-meta">

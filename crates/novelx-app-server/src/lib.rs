@@ -898,57 +898,39 @@ fn build_preview(repo_root: &std::path::Path, name: &str) -> serde_json::Value {
     let published = st.as_ref().map(|s| s.published_count).unwrap_or(0);
     let next = st.as_ref().map(|s| s.next_chapter).unwrap_or(1);
     let mut chapters = Vec::new();
-    let chapters_dir = dir.join("chapters");
-    if chapters_dir.exists() {
-        if let Ok(rd) = std::fs::read_dir(&chapters_dir) {
-            let mut nums: Vec<u32> = rd
-                .flatten()
-                .filter_map(|e| {
-                    e.file_name()
-                        .to_str()
-                        .and_then(|s| s.parse::<u32>().ok())
-                })
-                .collect();
-            nums.sort_unstable();
-            for n in nums {
-                let draft_raw = read_chapter_draft(&dir, n)
-                    .or_else(|| novelx_pipeline::read_chapter_draft_resolved(&dir, n))
-                    .unwrap_or_default();
-                let body_chars = if draft_raw.trim().is_empty() {
-                    0usize
-                } else {
-                    draft_body_chars(&draft_raw)
-                };
-                let has_outline = dir
-                    .join("chapters")
-                    .join(format!("{n:03}"))
-                    .join("outline.json")
-                    .exists()
-                    || dir
-                        .join("chapters")
-                        .join(format!("{n:03}"))
-                        .join("outline.md")
-                        .exists();
-                // Title: first markdown heading if present, else 第N章.
-                let title = draft_raw
-                    .lines()
-                    .next()
-                    .map(|l| l.trim().trim_start_matches('#').trim())
-                    .filter(|t| !t.is_empty() && t.chars().count() < 80)
-                    .map(|t| t.to_string())
-                    .unwrap_or_else(|| format!("第{n}章"));
-                chapters.push(serde_json::json!({
-                    "number": n,
-                    "title": title,
-                    "has_draft": body_chars > 0,
-                    "has_outline": has_outline,
-                    "body_chars": body_chars,
-                    // Bodies loaded on demand via GET /chapters/{n} (longform-safe).
-                    "draft": "",
-                    "outline": "",
-                }));
-            }
-        }
+    let short = novelx_pipeline::is_short_drama(&dir);
+    let unit_word = if short { "集" } else { "章" };
+    let nums = novelx_pipeline::list_chapter_numbers(&dir);
+    for n in nums {
+        let draft_raw = read_chapter_draft(&dir, n)
+            .or_else(|| novelx_pipeline::read_chapter_draft_resolved(&dir, n))
+            .unwrap_or_default();
+        let body_chars = if draft_raw.trim().is_empty() {
+            0usize
+        } else {
+            draft_body_chars(&draft_raw)
+        };
+        let unit_dir = novelx_pipeline::chapter_dir(&dir, n);
+        let has_outline = unit_dir.join("outline.json").exists()
+            || unit_dir.join("outline.md").exists();
+        // Title: first markdown heading if present, else 第N章/集.
+        let title = draft_raw
+            .lines()
+            .next()
+            .map(|l| l.trim().trim_start_matches('#').trim())
+            .filter(|t| !t.is_empty() && t.chars().count() < 80)
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| format!("第{n}{unit_word}"));
+        chapters.push(serde_json::json!({
+            "number": n,
+            "title": title,
+            "has_draft": body_chars > 0,
+            "has_outline": has_outline,
+            "body_chars": body_chars,
+            // Bodies loaded on demand via GET /chapters/{n} (longform-safe).
+            "draft": "",
+            "outline": "",
+        }));
     }
 
     let mut entities = serde_json::json!({
@@ -1104,6 +1086,7 @@ fn build_preview(repo_root: &std::path::Path, name: &str) -> serde_json::Value {
         "project": name,
         "name": name,
         "chapters": chapters,
+        "project_mode": if short { "short_drama" } else { "longform" },
         "story_outline": story_outline,
         "plots": plots,
         "entities": entities,

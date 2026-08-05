@@ -15,7 +15,7 @@
 | `mutation_policy.yaml` | 磁盘编辑 | 改盘严重度：routine 自确认 / high 人审；低风险 impact 自动级联；配合 `studio.mutation_severity_policy` |
 | `decision_council.yaml` | 磁盘编辑 | 评审团自动决策、章边界密封、按需素材 Agent；配合 `studio.decision_council` / `studio.seal_on_chapter_pass`；`chapter_next_clean` 干净发布自动续写 |
 | `chapter.yaml` | 磁盘编辑 | 章长目标 / 软硬上下限（`word_hard_max`→HardLong 可拆章）/ 连续偏短升格 |
-| `longform.yaml` | 磁盘编辑 | 超长篇：`quality_tier` / `audit_tier` / `impact_scan_mode` / `batch_max_chapters`（成功发布上限）/ `foreshadow_debt`（近债分级：宽限与远期不挡批写）；`audit_tier: layered` 常规章用轻量一致性上下文（高潮/奇数章/复审仍 full），省 token，偶发漏检风险略高于 `full` |
+| `longform.yaml`；短剧另见 `script.yaml` / `pipeline-script.yaml`（`project_mode=short_drama`） | 磁盘编辑 | 超长篇：`quality_tier` / `audit_tier` / `impact_scan_mode` / `batch_max_chapters`（成功发布上限）/ `foreshadow_debt`（近债分级：宽限与远期不挡批写）；`audit_tier: layered` 常规章用轻量一致性上下文（高潮/奇数章/复审仍 full），省 token，偶发漏检风险略高于 `full` |
 | `continuity.yaml` / `volume.yaml` | 磁盘编辑 | CanonContext 预算、薄卷阈值 |
 
 API Key 只写入仓库根 `.env`（gitignore），**不进** `llm.yaml`。`GET /api/config/llm` 只返回 `has_api_key` 与末 4 位 suffix，永不回传明文 Key；PUT 时 `api_key` 留空表示不修改。

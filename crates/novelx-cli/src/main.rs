@@ -2,7 +2,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use novelx_llm::{load_llm_config, LlmClient};
 use novelx_pipeline::{
-    init_project, list_projects, load_project_state, migrate_project_reader_formats,
+    init_project_with_mode, list_projects, load_project_state, migrate_project_reader_formats,
+    ProjectMode,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -28,6 +29,9 @@ enum Commands {
         genre: String,
         #[arg(long, default_value_t = 900)]
         chapters: u32,
+        /// Project mode: longform (default) or short_drama (AI comic script)
+        #[arg(long, default_value = "longform")]
+        mode: String,
     },
     /// Run chapter pipeline via Codex Session + SubAgent spawn chain
     Run {
@@ -135,9 +139,11 @@ async fn main() -> Result<()> {
             name,
             genre,
             chapters,
+            mode,
         } => {
-            let dir = init_project(&projects, &name, &genre, chapters)?;
-            println!("created {}", dir.display());
+            let mode = ProjectMode::parse(&mode);
+            let dir = init_project_with_mode(&projects, &name, &genre, chapters, mode)?;
+            println!("created {} (mode={})", dir.display(), mode.as_str());
         }
         Commands::Run {
             name,

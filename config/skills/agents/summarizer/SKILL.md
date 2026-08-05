@@ -63,3 +63,7 @@ description: 以客观细读生成章节摘要与新事实清单，供下章衔�
 - `ending_hook` 不得省略，否则下章无法衔接
 - `new_facts` 将被 Lore Librarian 入库——宁缺毋滥，但勿漏关键状态
 - 若本章已跑 `foreshadow_tracker`：`foreshadow_updates` 只记摘要级提示，**冲突时服从 tracker**；不要把已兑现伏笔写成仍悬空
+
+## 短剧模式（project_mode=short_drama）
+
+摘要对象为本集剧本：列出场次要点、状态变化、集末钩子与 NEW_FACT；勿按长篇 5k 字散文摘要习惯灌水。

@@ -25,8 +25,8 @@ use async_trait::async_trait;
 use novelx_llm::LlmClient;
 use novelx_harness::NamingRules;
 use novelx_pipeline::project::{
-    init_project, load_project_state, project_dir, read_chapter_outline, save_project_state,
-    write_chapter_outline_budget,
+    init_project_with_mode, is_short_drama, load_project_state, project_dir, read_chapter_outline,
+    save_project_state, write_chapter_outline_budget, ProjectMode,
 };
 use novelx_pipeline::{
     active_volume_for_chapter, bound_for_volume, build_chapter_context, build_setting_audit_pack,
@@ -146,9 +146,11 @@ pub trait ToolHandler: Send + Sync {
 
 pub struct ListProjects;
 pub struct ContinueWriting;
+pub struct ContinueEpisode;
 pub struct ContinueWritingBatch;
 pub struct ReplanVolume;
 pub struct ReviseChapter;
+pub struct ReviseEpisode;
 pub struct SplitChapter;
 pub struct AuditChapter;
 pub struct AuditChapters;
@@ -455,6 +457,17 @@ impl ToolHandler for ContinueWritingBatch {
         })
     }
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
+        let project = args["project"].as_str().unwrap_or("");
+        if !project.is_empty() {
+            let dir = project_dir(&ctx.projects_root, project);
+            if is_short_drama(&dir) {
+                return Ok(ToolResult {
+                    output: "短剧模式不支持 continue_writing_batch。请用 continue_episode 逐集推进。".into(),
+                    data: json!({"blocked": true, "reason": "short_drama_no_batch"}),
+                });
+            }
+        }
+
         let project = args["project"].as_str().unwrap_or("").to_string();
         if project.is_empty() {
             anyhow::bail!("project 必填");
@@ -564,6 +577,17 @@ impl ToolHandler for ReplanVolume {
         })
     }
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
+        let project = args["project"].as_str().unwrap_or("");
+        if !project.is_empty() {
+            let dir = project_dir(&ctx.projects_root, project);
+            if is_short_drama(&dir) {
+                return Ok(ToolResult {
+                    output: "短剧模式不使用 replan_volume。".into(),
+                    data: json!({"blocked": true, "reason": "short_drama_no_replan"}),
+                });
+            }
+        }
+
         let project = args["project"].as_str().unwrap_or("").to_string();
         let dir = project_dir(&ctx.projects_root, &project);
         let state = load_project_state(&dir)?;
@@ -909,6 +933,17 @@ impl ToolHandler for SplitChapter {
         })
     }
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
+        let project = args["project"].as_str().unwrap_or("");
+        if !project.is_empty() {
+            let dir = project_dir(&ctx.projects_root, project);
+            if is_short_drama(&dir) {
+                return Ok(ToolResult {
+                    output: "短剧模式不使用 split_chapter。请用 revise_episode 压缩或拆场。".into(),
+                    data: json!({"blocked": true, "reason": "short_drama_no_split"}),
+                });
+            }
+        }
+
         let project = args["project"].as_str().unwrap_or("").to_string();
         let chapter = args["chapter"].as_u64().unwrap_or(0) as u32;
         if project.is_empty() || chapter == 0 {
@@ -1493,6 +1528,17 @@ impl ToolHandler for AuditVolume {
     }
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
         let project = args["project"].as_str().unwrap_or("");
+        if !project.is_empty() {
+            let dir = project_dir(&ctx.projects_root, project);
+            if is_short_drama(&dir) {
+                return Ok(ToolResult {
+                    output: "短剧模式不使用 audit_volume。请用 audit_chapter / audit_chapters 审集。".into(),
+                    data: json!({"blocked": true, "reason": "short_drama_no_audit_volume"}),
+                });
+            }
+        }
+
+        let project = args["project"].as_str().unwrap_or("");
         if project.is_empty() {
             anyhow::bail!("project 必填");
         }
@@ -1878,7 +1924,7 @@ impl ToolHandler for InitNovel {
         "init_novel"
     }
     fn description(&self) -> &'static str {
-        "创建新小说项目"
+        "创建新项目。project_mode=longform（默认超长篇）或 short_drama（AI 漫剧短篇剧本）。"
     }
     fn parameters(&self) -> Value {
         json!({
@@ -1886,7 +1932,16 @@ impl ToolHandler for InitNovel {
             "properties":{
                 "name":{"type":"string"},
                 "genre":{"type":"string"},
-                "chapters":{"type":"integer"}
+                "chapters":{"type":"integer","description":"长篇目标章数软上限；短剧则为目标集数（默认 20）"},
+                "project_mode":{
+                    "type":"string",
+                    "enum":["longform","short_drama","novel"],
+                    "description":"longform/novel=超长篇；short_drama=AI 漫剧短篇剧本模式"
+                },
+                "mode":{
+                    "type":"string",
+                    "description":"project_mode 别名"
+                }
             },
             "required":["name"]
         })
@@ -1894,17 +1949,37 @@ impl ToolHandler for InitNovel {
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
         let name = args["name"].as_str().unwrap_or("untitled").to_string();
         let genre = args["genre"].as_str().unwrap_or("未定").to_string();
-        let chapters = args["chapters"].as_u64().unwrap_or(900) as u32;
-        let dir = init_project(&ctx.projects_root, &name, &genre, chapters)?;
+        let mode_raw = args
+            .get("project_mode")
+            .or_else(|| args.get("mode"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("longform");
+        let mode = ProjectMode::parse(mode_raw);
+        let default_n = if mode == ProjectMode::ShortDrama {
+            20
+        } else {
+            900
+        };
+        let chapters = args["chapters"].as_u64().unwrap_or(default_n) as u32;
+        let dir = init_project_with_mode(&ctx.projects_root, &name, &genre, chapters, mode)?;
         Ok(ToolResult {
-            output: format!("已创建项目 {}", dir.display()),
-            data: json!({"project": name, "path": dir}),
+            output: format!(
+                "已创建项目 {}（mode={}）",
+                dir.display(),
+                mode.as_str()
+            ),
+            data: json!({
+                "project": name,
+                "path": dir,
+                "project_mode": mode.as_str(),
+            }),
         })
     }
 }
 
 /// Read on-disk chapter draft / outline (not CanonContext).
 pub struct ReadChapter;
+pub struct ReadEpisode;
 
 #[async_trait]
 impl ToolHandler for ReadChapter {
@@ -2930,8 +3005,21 @@ impl ToolHandler for DesignMasterOutline {
         let dir = project_dir(&ctx.projects_root, project);
         let state = load_project_state(&dir)?;
         let art = dir.join("artifacts");
-        let path = art.join("master_outline.md");
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let short = is_short_drama(&dir);
+        let path = if short {
+            let series = art.join("series_outline.md");
+            if series.exists() || !art.join("master_outline.md").exists() {
+                series
+            } else {
+                art.join("master_outline.md")
+            }
+        } else {
+            art.join("master_outline.md")
+        };
+        let existing = std::fs::read_to_string(&path)
+            .or_else(|_| std::fs::read_to_string(art.join("master_outline.md")))
+            .or_else(|_| std::fs::read_to_string(art.join("series_outline.md")))
+            .unwrap_or_default();
         let text = if wants_apply(&args) {
             args.get("cached_body")
                 .and_then(|v| v.as_str())
@@ -2948,17 +3036,32 @@ impl ToolHandler for DesignMasterOutline {
                     .unwrap_or(state.target_chapters)
                     .max(1);
                 let scale = longform_scale_hint(target, brief);
-                let prompt = format!(
-                    "为小说《{}》（题材：{}；目标体量约 {target} 章）撰写/更新总纲 Markdown。\n\
-                     硬性输出要求：\n\
-                     - 只输出 Markdown 正文本身，第一行必须是 `# 总纲`（可带副标题）\n\
-                     - 必须含 H2：一句话卖点、分卷（超长篇优先 ## 分卷，勿用短篇三幕敷衍）、主角弧、主线冲突；可含中后期升级台阶\n\
-                     - 禁止寒暄、禁止自我介绍、禁止用 ``` 代码块包裹、禁止提及文件路径 / story_outline.json / JSON\n\
-                     - 禁止逐章列表（第1章/第2章…）；但必须按目标体量给出清晰分卷骨架与每卷目标/终止条件\n\
-                     {scale}\n\
-                     用户补充：{brief}\n\n现有总纲（可空，可在其上修订；命名以用户补充与 Bible 为准）：\n{existing}",
-                    state.name, state.genre
-                );
+                let prompt = if short {
+                    format!(
+                        "为短剧/漫剧《{}》（题材：{}；目标约 {target} 集）撰写/更新系列总纲 Markdown。\n\
+                         硬性输出要求：\n\
+                         - 只输出 Markdown 正文本身，第一行必须是 `# 总纲`（可带副标题）\n\
+                         - 必须含以下 H2 标题（字面匹配）：`## 一句话卖点`、`## 分集骨架`、`## 主角弧`、`## 主线冲突`\n\
+                         - `## 分集骨架` 按集数给弧线（勿用长篇「分卷/三幕」敷衍；勿逐集散文细纲）\n\
+                         - 面向 AI 漫剧：对白驱动、场次节奏、集末钩子\n\
+                         - 禁止寒暄、禁止代码块包裹、禁止提及文件路径 / JSON\n\
+                         用户补充：{brief}\n\n现有总纲（可空）：\n{existing}",
+                        state.name, state.genre
+                    )
+                } else {
+                    format!(
+                        "为小说《{}》（题材：{}；目标体量约 {target} 章）撰写/更新总纲 Markdown。\n\
+                         硬性输出要求：\n\
+                         - 只输出 Markdown 正文本身，第一行必须是 `# 总纲`（可带副标题）\n\
+                         - 必须含 H2：一句话卖点、分卷（超长篇优先 ## 分卷，勿用短篇三幕敷衍）、主角弧、主线冲突；可含中后期升级台阶\n\
+                         - 禁止寒暄、禁止自我介绍、禁止用 ``` 代码块包裹、禁止提及文件路径 / story_outline.json / JSON\n\
+                         - 禁止逐章列表（第1章/第2章…）；但必须按目标体量给出清晰分卷骨架与每卷目标/终止条件\n\
+                         {scale}\n\
+                         用户补充：{brief}\n\n现有总纲（可空，可在其上修订；命名以用户补充与 Bible 为准）：\n{existing}",
+                        state.name, state.genre
+                    )
+                };
+
                 ctx.llm
                     .complete(
                         &skill,
@@ -3010,6 +3113,10 @@ impl ToolHandler for DesignMasterOutline {
         }
         std::fs::create_dir_all(&art)?;
         std::fs::write(&path, &text)?;
+        if short {
+            let _ = std::fs::write(art.join("series_outline.md"), &text);
+            let _ = std::fs::write(art.join("master_outline.md"), &text);
+        }
         if !brief.is_empty() {
             let _ = lock_brief(&dir, brief);
         }
@@ -3291,6 +3398,17 @@ impl ToolHandler for SyncVolume {
         })
     }
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
+        let project = args["project"].as_str().unwrap_or("");
+        if !project.is_empty() {
+            let dir = project_dir(&ctx.projects_root, project);
+            if is_short_drama(&dir) {
+                return Ok(ToolResult {
+                    output: "短剧模式不使用 sync_volume（无卷相位）。".into(),
+                    data: json!({"blocked": true, "reason": "short_drama_no_sync_volume"}),
+                });
+            }
+        }
+
         let project = args["project"].as_str().unwrap_or("");
         if project.is_empty() {
             anyhow::bail!("project 必填");
@@ -4246,30 +4364,26 @@ impl ToolHandler for GetProjectStatus {
             .unwrap_or("")
             .to_string();
         let brief_preview: String = brief.chars().take(80).collect();
+        let short = is_short_drama(&dir);
         let mut chapters = Vec::new();
-        let ch_root = dir.join("chapters");
-        if let Ok(rd) = std::fs::read_dir(ch_root) {
-            for e in rd.flatten() {
-                let draft = e.path().join("draft.md");
-                let gz = e.path().join("draft.md.gz");
-                let stub = e.path().join("draft.md.stub");
-                if !(draft.exists() || gz.exists() || stub.exists()) {
-                    continue;
-                }
-                let n = e.file_name().to_string_lossy().to_string();
-                let ch_num = n.parse::<u32>().unwrap_or(0);
-                let len = if ch_num > 0 {
-                    read_chapter_draft_resolved(&dir, ch_num)
-                        .or_else(|| read_chapter_draft(&dir, ch_num))
-                        .map(|t| t.chars().count())
-                        .unwrap_or(0)
-                } else {
-                    std::fs::read_to_string(&draft)
-                        .map(|t| t.chars().count())
-                        .unwrap_or(0)
-                };
-                chapters.push(json!({"dir": n, "draft_chars": len}));
+        for ch_num in novelx_pipeline::list_chapter_numbers(&dir) {
+            let unit = novelx_pipeline::chapter_dir(&dir, ch_num);
+            let body = novelx_pipeline::unit_body_filename(&dir);
+            let draft = unit.join(body);
+            let gz = unit.join("draft.md.gz");
+            let stub = unit.join("draft.md.stub");
+            if !(draft.exists() || gz.exists() || stub.exists()) {
+                continue;
             }
+            let len = read_chapter_draft_resolved(&dir, ch_num)
+                .or_else(|| read_chapter_draft(&dir, ch_num))
+                .map(|t| t.chars().count())
+                .unwrap_or(0);
+            chapters.push(json!({
+                "dir": format!("{ch_num:03}"),
+                "draft_chars": len,
+                "unit": if short { "episode" } else { "chapter" },
+            }));
         }
         chapters.sort_by(|a, b| {
             let na = a["dir"]
@@ -4359,6 +4473,7 @@ impl ToolHandler for GetProjectStatus {
             data: json!({
                 "state": state_json,
                 "chapters": chapters,
+                "project_mode": if short { "short_drama" } else { "longform" },
                 "setup_phase": setup.as_str(),
                 "volume_phase": volume.as_str(),
                 "brief": brief,
@@ -5130,13 +5245,126 @@ impl ToolHandler for RestoreVersionNode {
     }
 }
 
+
+#[async_trait]
+impl ToolHandler for ContinueEpisode {
+    fn name(&self) -> &'static str {
+        "continue_episode"
+    }
+    fn description(&self) -> &'static str {
+        "短剧模式：续写下一集或指定集（产出 episodes/NNN/script.md）。长篇请用 continue_writing。"
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "project":{"type":"string"},
+                "episode":{"type":"integer","description":"目标集号；省略则用 next_chapter"},
+                "chapter":{"type":"integer","description":"episode 别名"}
+            },
+            "required":["project"]
+        })
+    }
+    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
+        let project = args["project"].as_str().unwrap_or("");
+        let dir = project_dir(&ctx.projects_root, project);
+        if !is_short_drama(&dir) {
+            return Ok(ToolResult {
+                output: "当前项目不是 short_drama。请用 continue_writing，或重建项目时指定 project_mode=short_drama。".into(),
+                data: json!({"blocked": true, "reason": "not_short_drama"}),
+            });
+        }
+        let mut args = args.clone();
+        if let Some(ep) = args.get("episode").cloned() {
+            if let Some(obj) = args.as_object_mut() {
+                obj.insert("chapter".into(), ep);
+            }
+        }
+        ContinueWriting.call(ctx, args).await
+    }
+}
+
+#[async_trait]
+impl ToolHandler for ReviseEpisode {
+    fn name(&self) -> &'static str {
+        "revise_episode"
+    }
+    fn description(&self) -> &'static str {
+        "短剧模式：修订指定集剧本。长篇请用 revise_chapter。"
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "project":{"type":"string"},
+                "episode":{"type":"integer"},
+                "chapter":{"type":"integer","description":"episode 别名"},
+                "instructions":{"type":"string"},
+                "apply":{"type":"boolean"},
+                "mutation_id":{"type":"string"}
+            },
+            "required":["project"]
+        })
+    }
+    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
+        let project = args["project"].as_str().unwrap_or("");
+        let dir = project_dir(&ctx.projects_root, project);
+        if !is_short_drama(&dir) {
+            return Ok(ToolResult {
+                output: "当前项目不是 short_drama。请用 revise_chapter。".into(),
+                data: json!({"blocked": true, "reason": "not_short_drama"}),
+            });
+        }
+        let mut args = args.clone();
+        if let Some(ep) = args.get("episode").cloned() {
+            if let Some(obj) = args.as_object_mut() {
+                obj.insert("chapter".into(), ep);
+            }
+        }
+        ReviseChapter.call(ctx, args).await
+    }
+}
+
+#[async_trait]
+impl ToolHandler for ReadEpisode {
+    fn name(&self) -> &'static str {
+        "read_episode"
+    }
+    fn description(&self) -> &'static str {
+        "短剧模式：读取指定集 script.md 与集纲 outline。"
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "project":{"type":"string"},
+                "episode":{"type":"integer"},
+                "chapter":{"type":"integer","description":"episode 别名"},
+                "max_chars":{"type":"integer"}
+            },
+            "required":["project"]
+        })
+    }
+    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
+        let mut args = args.clone();
+        if let Some(ep) = args.get("episode").cloned() {
+            if let Some(obj) = args.as_object_mut() {
+                obj.insert("chapter".into(), ep);
+            }
+        }
+        ReadChapter.call(ctx, args).await
+    }
+}
+
 pub fn all_tools() -> Vec<Arc<dyn ToolHandler>> {
     vec![
         Arc::new(ListProjects),
         Arc::new(ContinueWriting),
+        Arc::new(ContinueEpisode),
         Arc::new(ContinueWritingBatch),
         Arc::new(ReplanVolume),
         Arc::new(ReviseChapter),
+        Arc::new(ReviseEpisode),
         Arc::new(SplitChapter),
         Arc::new(ReviseOutline),
         Arc::new(AuditChapter),
@@ -5148,6 +5376,7 @@ pub fn all_tools() -> Vec<Arc<dyn ToolHandler>> {
         Arc::new(CreateNovel),
         Arc::new(QueryLore),
         Arc::new(ReadChapter),
+        Arc::new(ReadEpisode),
         Arc::new(QueryMemory),
         Arc::new(GetProjectStatus),
         Arc::new(LockBrief),

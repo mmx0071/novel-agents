@@ -362,15 +362,20 @@ export function resolveStudioCta(stage, audit = {}) {
 }
 
 /** Build create-novel prompt from form fields (genre-neutral). */
-export function buildCreateNovelMessage({ title, genre, brief }) {
+export function buildCreateNovelMessage({ title, genre, brief, mode }) {
   const name = String(title || '').trim()
   const g = String(genre || '').trim()
   const b = String(brief || '').trim()
-  const parts = ['我想写一本小说']
-  if (name) parts.push(`书名《${name}》`)
+  const m = String(mode || 'longform').trim()
+  const short = m === 'short_drama'
+  const parts = [short ? '我想写一部 AI 漫剧短篇' : '我想写一本小说']
+  if (name) parts.push(short ? `片名《${name}》` : `书名《${name}》`)
   if (g) parts.push(`题材：${g}`)
   let msg = parts.join('，')
   if (b) msg += `。灵感：${b}`
   else msg += '。请先帮我立项。'
+  if (short) {
+    msg += '。请用 create_novel / init_novel 并传 project_mode=short_drama（短剧剧本模式，按集产出 script.md）。'
+  }
   return msg
 }

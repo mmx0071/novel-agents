@@ -249,3 +249,26 @@ agents:
         reason: 剧情冲突/钩子耗尽，建议补充背景素材
       - condition: inspiration_needed
         reason: 支路难分或质感不足，建议补充题材相关灵感素材
+
+  # ── 短剧 / AI 漫剧（project_mode=short_drama）──
+  episode_planner:
+    name: 集纲规划
+    layer: story
+    tier: mvp
+    description: 短剧单集场次/beat 集纲（pipeline-script）
+    depends_on: []
+
+  script_writer:
+    name: 剧本草稿
+    layer: production
+    tier: mvp
+    description: 按集纲撰写漫剧剧本 script.md
+    depends_on: [episode_planner]
+
+  beat_acceptor:
+    name: Beat 验收
+    layer: story
+    tier: mvp
+    description: 对照 beat/剧情卡收束条件验收本集（短剧语义的 plot_acceptor）
+    depends_on: [summarizer]
+

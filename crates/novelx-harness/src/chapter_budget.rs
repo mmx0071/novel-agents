@@ -96,13 +96,39 @@ impl ChapterBudget {
     }
 
     pub fn load_from_config_root(config_root: &Path) -> Self {
-        let mut b = Self::load(&config_root.join("chapter.yaml"));
-        // longform.yaml may override streak threshold.
-        let lf = crate::longform::LongformConfig::load_from_config_root(config_root);
-        if lf.soft_short_auto_revise_after > 0 {
-            b.soft_short_auto_revise_after = lf.soft_short_auto_revise_after;
+        Self::load_for_mode(config_root, "longform")
+    }
+
+    /// Longform → `chapter.yaml`; short_drama → `script.yaml` (falls back to chapter.yaml).
+    pub fn load_for_mode(config_root: &Path, mode: &str) -> Self {
+        let path = match mode {
+            "short_drama" | "short-drama" | "script" => {
+                let script = config_root.join("script.yaml");
+                if script.exists() {
+                    script
+                } else {
+                    config_root.join("chapter.yaml")
+                }
+            }
+            _ => config_root.join("chapter.yaml"),
+        };
+        let mut b = Self::load(&path);
+        // longform.yaml may override streak threshold (longform only).
+        if !matches!(mode, "short_drama" | "short-drama" | "script") {
+            let lf = crate::longform::LongformConfig::load_from_config_root(config_root);
+            if lf.soft_short_auto_revise_after > 0 {
+                b.soft_short_auto_revise_after = lf.soft_short_auto_revise_after;
+            }
         }
         b
+    }
+
+    pub fn writer_target_line_for_mode(&self, mode: &str) -> String {
+        if matches!(mode, "short_drama" | "short-drama" | "script") {
+            format!("请撰写约 {} 字的漫剧剧本 Markdown（场次/画面/对白/钩子）。", self.range_label())
+        } else {
+            self.writer_target_line()
+        }
     }
 
     /// e.g. `5000–6000`

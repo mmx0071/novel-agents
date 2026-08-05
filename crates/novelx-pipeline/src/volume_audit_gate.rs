@@ -140,6 +140,9 @@ pub fn check_volume_audit_for_continue(
     if skip {
         return None;
     }
+    if crate::project::is_short_drama(project_dir) {
+        return None;
+    }
     if !feature_enabled(config_root, "studio.require_volume_audit_mid", true) {
         return None;
     }
@@ -171,6 +174,9 @@ pub fn check_volume_audit_for_sync(
     skip: bool,
 ) -> Option<VolumeAuditGateBlock> {
     if skip {
+        return None;
+    }
+    if crate::project::is_short_drama(project_dir) {
         return None;
     }
     if !feature_enabled(config_root, "studio.require_volume_audit_handoff", true) {

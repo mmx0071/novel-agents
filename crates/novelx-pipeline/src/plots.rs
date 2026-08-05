@@ -1141,6 +1141,7 @@ pub fn check_plot_write_gate_with(
     project_dir: &Path,
     enforce: crate::phases::PhaseEnforceFlags,
 ) -> PlotWriteGate {
+    let short = crate::project::is_short_drama(project_dir);
     if enforce.setup {
         if let Some(msg) = crate::phases::setup_write_block_reason(project_dir) {
             return PlotWriteGate::Block {
@@ -1150,7 +1151,8 @@ pub fn check_plot_write_gate_with(
             };
         }
     }
-    if enforce.volume {
+    // Short-drama bypasses volume handoff entirely.
+    if enforce.volume && !short {
         if let Some(msg) = crate::phases::volume_write_block_reason(project_dir) {
             return PlotWriteGate::Block {
                 message: msg,
@@ -1164,7 +1166,11 @@ pub fn check_plot_write_gate_with(
     let all: Vec<&PlotIndexEntry> = index.volumes.iter().flat_map(|v| v.plots.iter()).collect();
     if all.is_empty() {
         return PlotWriteGate::Block {
-            message: "尚无剧情卡。请先调用 design_plot 创建指引，再写章（剧情卡不预估章数）。".into(),
+            message: if short {
+                "尚无 beat 卡。请先调用 design_plot 创建冲突单元，再写集。".into()
+            } else {
+                "尚无剧情卡。请先调用 design_plot 创建指引，再写章（剧情卡不预估章数）。".into()
+            },
             reason: "need_design_plot",
             plot_title: None,
         };

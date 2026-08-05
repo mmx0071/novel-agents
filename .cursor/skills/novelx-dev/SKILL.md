@@ -140,3 +140,9 @@ description: >-
 | 配置编辑边界 | `config/README.md` |
 | 架构总览 | `README.md` |
 | 创作工作流 | `.cursor/skills/create-novel/SKILL.md` |
+
+## 项目模式（longform / short_drama）
+
+- `meta.json` → `project_mode`：`longform`（默认）或 `short_drama`（AI 漫剧剧本）。
+- 短剧落盘 `episodes/NNN/script.md` + `pipeline-script.yaml`；**勿**套用 `chapter.yaml` 4500 字门与 volume/batch 工具。
+- 行为差异优先 YAML（`script.yaml` / `pipeline-script.yaml` / intents），保持题材中立。

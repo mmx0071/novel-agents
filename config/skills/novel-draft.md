@@ -17,6 +17,7 @@ description: >-
 | expected_volumes | 可选预计卷数；不强制 |
 | genre | 题材标签；无法判断则「未定」 |
 | mode | `outline_only`（仅大纲）或 `full`（大纲+正文） |
+| project_mode | `longform`（默认超长篇）或 `short_drama`（AI 漫剧短篇剧本） |
 | through_chapter | mode=full 时**先写**到第几章（默认 1）；不是全书目标章数 |
 
 **不要**再向用户追问全书规划章数 `target_chapters`。大纲按卷推进，正文章号随写作递增。CLI `init --chapters` 仅为 state 软上限/占位，不驱动流水线。
@@ -27,3 +28,5 @@ description: >-
 - 用户指定新书名 → `project_id` 跟书名，勿沿用左侧旧项目
 - 「三卷左右」→ expected_volumes；「仅大纲」→ outline_only；「先写三章」→ through_chapter=3
 - 工具顺序：`create_novel` / `init_novel` → `lock_brief` → 总纲/卷纲 → Bible → `confirm_setup`
+- **短剧**（`project_mode=short_drama`）：`lock_brief` → `design_master_outline`（系列大纲）→ Bible → `confirm_setup`（**不要求卷纲**）→ `design_plot`（beat）→ `continue_episode`
+- 短剧禁用：`continue_writing_batch` / `sync_volume` / `audit_volume` / `split_chapter`
