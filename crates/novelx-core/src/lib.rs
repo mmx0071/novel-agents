@@ -2,10 +2,13 @@
 
 mod agent;
 pub mod audit_decisions;
+pub mod decision_council;
+pub mod revise_plan;
 mod features;
 mod gates;
 mod intent;
 pub mod ops_journal;
+pub mod version_nodes;
 mod session;
 pub(crate) mod studio_next;
 mod studio_next_gates;
@@ -16,8 +19,8 @@ mod world_state;
 
 use audit_decisions::{
     audit_fail_prompt, build_fallback_audit_decisions, decisions_to_ui_options,
-    format_audit_issue_checklist, resolve_decision_pick, validate_offered_decisions,
-    AuditDecisionOption,
+    enrich_audit_decisions_with_revise_plan, format_audit_issue_checklist, resolve_decision_pick,
+    validate_offered_decisions, AuditDecisionOption,
 };
 use features::FeatureFlags;
 use gates::{GateCatalog, GateResolve};
@@ -27,8 +30,8 @@ use novelx_harness::{
     NamingRules, StudioPolicies,
 };
 use ui_sync::{
-    append_completion_ui_turn, attach_ui_approval, attach_ui_mutation_preview,
-    finish_stale_ui_turns, keep_only_ui_turn, mark_ui_turn_complete,
+    append_completion_ui_turn, append_ui_tool_output, attach_ui_approval,
+    attach_ui_mutation_preview, finish_stale_ui_turns, keep_only_ui_turn, mark_ui_turn_complete,
     sanitize_ui_turns_finish_audits, strip_ui_approvals, ui_turns_weaker_than,
     update_ui_turn_summary, upsert_ui_agent_message, upsert_ui_tool_call,
 };
@@ -42,13 +45,14 @@ use novelx_pipeline::{
     load_volume_bounds, mark_volume_sync_skipped, project_dir, read_chapter_draft,
     reopen_volume_act, resolve_arc_outline_volume, recover_false_volume_end,
     resolve_setup_next_step, resolve_setup_phase, resolve_volume_phase, scan_impact,
-    set_volume_phase, volume_has_open_plot_work, write_chapter_draft, ImpactHit, ImpactSource,
-    ImpactTargetKind, PhaseEnforceFlags, PlotWriteGate, RevisionOptions, RunMode, SetupNextStep,
-    SetupPhase, VolumePhase,
+    set_volume_phase, volume_has_open_plot_work, write_chapter_draft, ImpactHit, ImpactReport,
+    ImpactSource, ImpactTargetKind, PhaseEnforceFlags, PlotWriteGate, RevisionOptions, RunMode,
+    SetupNextStep, SetupPhase, VolumePhase,
 };
 use novelx_protocol::{
-    new_id, AgentLifecycle, EventMsg, ItemStatus, Op, OpsJournalKind, SessionSource, Submission,
-    ThreadId, ThreadSummary, TodoItem, TodoStatus, TurnItem, TurnId, UserInput, UserInputOption,
+    new_id, AgentLifecycle, AgentStatus, ComposerPhase, EventMsg, ItemStatus, Op, OpsJournalKind,
+    SessionSource, Submission, ThreadId, ThreadSummary, TodoItem, TodoStatus, TurnItem, TurnId,
+    UserInput, UserInputOption,
 };
 use novelx_skills::{
     build_skill_injections, collect_explicit_skill_mentions, default_skill_roots,
@@ -59,10 +63,10 @@ use world_state::{
     SystemPromptParts,
 };
 use novelx_tools::{
-    all_tools, clear_audit_queue, dispatch, load_audit_queue, tool_output_for_ui, tool_specs,
-    AuditQueueStatus,
-    ToolContext,
+    agent_label_zh, all_tools, clear_audit_queue, dispatch, load_audit_queue, tool_output_for_ui,
+    tool_specs, will_write_without_preview, AuditQueueStatus, ToolContext,
 };
+use version_nodes::is_mutating_tool;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use session::handlers::submission_loop;
@@ -179,12 +183,20 @@ pub(crate) struct PendingChapterNext {
     /// Published but plot_acceptor failed → show continue + revise.
     #[serde(default)]
     pub plot_accept_open: bool,
+    /// HardLong length block → also offer「拆成两章」(split_chapter).
+    #[serde(default)]
+    pub hard_long: bool,
     /// When set, this is a `draft_exists` clarify gate; value = suggested next chapter to write.
     #[serde(default)]
     pub suggest_next: Option<u32>,
     /// Concrete revise instructions for hard-rule / plot-exit gaps (overrides gate YAML default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revise_instructions: Option<String>,
+    /// From RevisePlan — force full chapter when hard gates need more than a local patch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revise_prefer_local: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revise_scope: Option<String>,
     /// Exact gate prompt first shown to the user. Reoffer / situational cards must reuse
     /// this so hard-rule detail is not replaced by a laundry-list fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -300,16 +312,62 @@ pub(crate) struct ThreadState {
     /// Post-apply impact cascade awaiting sync / skip.
     #[serde(default)]
     pub(crate) pending_impact: Option<PendingImpact>,
+    /// Decision Council auto-revise retry counter (content audit).
+    #[serde(default)]
+    pub(crate) council_retry_count: u32,
+    /// Last P0 types seen by Decision Council (for same-type thrash fuse).
+    #[serde(default)]
+    pub(crate) council_last_p0_types: Vec<String>,
+    /// Consecutive council looks with overlapping P0 types.
+    #[serde(default)]
+    pub(crate) council_same_type_streak: u32,
+    /// Queued steer_run args from Decision Council (same turn).
+    #[serde(default)]
+    pub(crate) council_auto_steer: Option<Value>,
+    /// After clean publish: auto continue_writing once (chapter_next_clean).
+    #[serde(default)]
+    pub(crate) council_auto_continue: Option<CouncilAutoContinue>,
+    /// While draining auto-continue, do not queue another (avoid unbounded chain).
+    #[serde(default)]
+    pub(crate) council_suppress_auto_continue: bool,
+    /// Chapter pass already sealed Studio history; skip duplicate clear on next write start.
+    #[serde(default)]
+    pub(crate) history_sealed_pending_write: bool,
     #[serde(default)]
     pub(crate) session_source: SessionSource,
     #[serde(default)]
     pub(crate) lifecycle: AgentLifecycle,
     #[serde(skip)]
     pub(crate) subagent_job: Option<SubagentJob>,
+    /// Last `SessionPhaseChanged` phase (dedupe WS). Not persisted.
+    #[serde(skip)]
+    pub(crate) last_composer_phase: Option<ComposerPhase>,
 }
 
 fn empty_json_array() -> serde_json::Value {
     serde_json::json!([])
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct CouncilAutoContinue {
+    pub project: String,
+    pub next_chapter: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CouncilReviseOutcome {
+    /// Opened a human gate (mutation / audit / chapter_next).
+    PauseHuman,
+    /// Finished without needing the outer loop to continue tool dispatch.
+    Handled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanPublishOutcome {
+    PauseHuman,
+    Handled,
+    /// Legacy agentic path: one narration round, then chapter_next.
+    DeferNarrate,
 }
 
 pub type EventTx = mpsc::UnboundedSender<EventMsg>;
@@ -326,6 +384,7 @@ fn event_thread_id(ev: &EventMsg) -> Option<&str> {
         | EventMsg::ReasoningContentDelta { thread_id, .. }
         | EventMsg::ToolCallOutputDelta { thread_id, .. }
         | EventMsg::RequestUserInput { thread_id, .. }
+        | EventMsg::SessionPhaseChanged { thread_id, .. }
         | EventMsg::TodoUpdated { thread_id, .. }
         | EventMsg::ChatHistoryReset { thread_id, .. } => Some(thread_id.as_str()),
         EventMsg::AgentStatusChanged { status } => Some(status.thread_id.as_str()),
@@ -378,6 +437,7 @@ impl NovelxCore {
                     config_root,
                     llm,
                     progress: None,
+                    todos: None,
                     agent_runtime: Some(agent_runtime),
                     caller_thread_id: None,
                     skipped_expected_ids: Vec::new(),
@@ -416,6 +476,13 @@ impl NovelxCore {
     }
 
     pub async fn emit_global(&self, ev: EventMsg) {
+        self.broadcast_event(ev.clone()).await;
+        self.maybe_journal_from_event(&ev).await;
+        self.maybe_refresh_session_phase_from_event(&ev).await;
+    }
+
+    /// Fan-out to bus + local sinks (no phase refresh — avoids async recursion).
+    async fn broadcast_event(&self, ev: EventMsg) {
         let _ = self.event_bus.send(ev.clone());
         // Clone senders then release the lock before awaiting — holding the mutex
         // across a full channel send deadlocks other emitters (and can strand tools).
@@ -429,7 +496,88 @@ impl NovelxCore {
         for tx in sinks {
             let _ = tx.send(ev.clone());
         }
-        self.maybe_journal_from_event(&ev).await;
+    }
+
+    /// Recompute composer phase after turn / gate / agent-lifecycle transitions.
+    async fn maybe_refresh_session_phase_from_event(&self, ev: &EventMsg) {
+        match ev {
+            EventMsg::TurnStarted { thread_id, .. }
+            | EventMsg::TurnComplete { thread_id, .. }
+            | EventMsg::TurnAborted { thread_id, .. }
+            | EventMsg::RequestUserInput { thread_id, .. }
+            | EventMsg::ChatHistoryReset { thread_id, .. } => {
+                self.publish_session_phase(thread_id).await;
+            }
+            EventMsg::AgentStatusChanged { status } => {
+                self.publish_session_phase(&status.thread_id).await;
+                if let Some(parent) = status.parent_thread_id.as_deref() {
+                    self.publish_session_phase(parent).await;
+                }
+            }
+            // Do not recurse on SessionPhaseChanged.
+            _ => {}
+        }
+    }
+
+    /// Authoritative composer phase for the dialogue box.
+    pub async fn session_composer_phase(&self, thread_id: &str) -> ComposerPhase {
+        if self.thread_awaiting_human(thread_id).await {
+            return ComposerPhase::AwaitingHuman;
+        }
+        if self.active_turn_id(thread_id).await.is_some() {
+            return ComposerPhase::Working;
+        }
+        if self.any_descendant_agent_running(thread_id).await {
+            return ComposerPhase::Working;
+        }
+        ComposerPhase::Idle
+    }
+
+    async fn any_descendant_agent_running(&self, thread_id: &str) -> bool {
+        let kids = self.hub.children_of(thread_id).await;
+        for cid in kids {
+            let life = self.agent_lifecycle(&cid).await;
+            if matches!(
+                life,
+                AgentLifecycle::Spawned | AgentLifecycle::Running
+            ) {
+                return true;
+            }
+            if Box::pin(self.any_descendant_agent_running(&cid)).await {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Emit `SessionPhaseChanged` when the phase (or active turn) changes.
+    pub async fn publish_session_phase(&self, thread_id: &str) {
+        if !self.threads.read().await.contains_key(thread_id) {
+            return;
+        }
+        let phase = self.session_composer_phase(thread_id).await;
+        let active_turn_id = self.active_turn_id(thread_id).await;
+        let changed = {
+            let mut guard = self.threads.write().await;
+            let Some(t) = guard.get_mut(thread_id) else {
+                return;
+            };
+            if t.last_composer_phase.as_ref() == Some(&phase) {
+                return;
+            }
+            t.last_composer_phase = Some(phase.clone());
+            true
+        };
+        if !changed {
+            return;
+        }
+        // Broadcast only — do not re-enter maybe_refresh_session_phase_from_event.
+        self.broadcast_event(EventMsg::SessionPhaseChanged {
+            thread_id: thread_id.to_string(),
+            phase,
+            active_turn_id,
+        })
+        .await;
     }
 
     pub async fn emit_to_thread(&self, thread_id: &str, ev: EventMsg) {
@@ -726,6 +874,57 @@ impl NovelxCore {
         }
     }
 
+    /// Mark a SubAgent thread interrupted so waiters/UI stop treating it as running.
+    /// Root Studio threads keep their lifecycle (abort alone ends the turn).
+    pub async fn mark_subagent_interrupted(&self, thread_id: &str) {
+        let status = {
+            let mut guard = self.threads.write().await;
+            let Some(t) = guard.get_mut(thread_id) else {
+                return;
+            };
+            if t.session_source.is_root() {
+                return;
+            }
+            if !matches!(
+                t.lifecycle,
+                AgentLifecycle::Spawned | AgentLifecycle::Running
+            ) {
+                return;
+            }
+            t.lifecycle = AgentLifecycle::Interrupted;
+            t.subagent_job = None;
+            let src = t.session_source.clone();
+            Some(AgentStatus {
+                thread_id: thread_id.to_string(),
+                agent_path: src.agent_path(),
+                role: src.role().map(|r| r.to_string()),
+                parent_thread_id: src.parent_thread_id().map(|p| p.to_string()),
+                lifecycle: AgentLifecycle::Interrupted,
+                summary: Some("interrupted".into()),
+            })
+        };
+        let Some(status) = status else {
+            return;
+        };
+        self.hub
+            .publish_result(
+                thread_id,
+                "interrupted".into(),
+                json!({ "interrupted": true }),
+            )
+            .await;
+        self.emit_global(EventMsg::AgentStatusChanged { status })
+            .await;
+        if let Some(parent) = self
+            .get_session_source(thread_id)
+            .await
+            .and_then(|s| s.parent_thread_id().map(|p| p.to_string()))
+        {
+            self.publish_session_phase(&parent).await;
+        }
+        self.publish_session_phase(thread_id).await;
+    }
+
     /// Inject mid-turn steer text into conversation history (Codex pending_input drain).
     async fn drain_pending_steer_into_history(&self, thread_id: &str, turn_id: &str) {
         let queue = {
@@ -874,6 +1073,51 @@ impl NovelxCore {
             t.subagent_job = Some(job);
             t.lifecycle = AgentLifecycle::Running;
         }
+    }
+
+    /// Child SubAgents registered under `parent_thread_id` (for Studio hydrate).
+    pub async fn list_child_agents(&self, parent_thread_id: &str) -> Vec<serde_json::Value> {
+        let children = self.hub.children_of(parent_thread_id).await;
+        let mut out = Vec::with_capacity(children.len());
+        for cid in children {
+            let (role, agent_path, parent_id, lifecycle, task) = {
+                let guard = self.threads.read().await;
+                let Some(t) = guard.get(&cid) else {
+                    continue;
+                };
+                (
+                    t.session_source
+                        .role()
+                        .unwrap_or("")
+                        .to_string(),
+                    t.session_source.agent_path().to_string(),
+                    t.session_source
+                        .parent_thread_id()
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| parent_thread_id.to_string()),
+                    t.lifecycle.clone(),
+                    t.subagent_job.as_ref().map(|j| j.task.clone()),
+                )
+            };
+            let wait_summary = self.hub.result_summary(&cid).await;
+            let summary = wait_summary.or(task);
+            let life = match lifecycle {
+                AgentLifecycle::Spawned => "spawned",
+                AgentLifecycle::Running => "running",
+                AgentLifecycle::Completed => "completed",
+                AgentLifecycle::Failed => "failed",
+                AgentLifecycle::Interrupted => "interrupted",
+            };
+            out.push(serde_json::json!({
+                "threadId": cid,
+                "role": role,
+                "agentPath": agent_path,
+                "parentThreadId": parent_id,
+                "lifecycle": life,
+                "summary": summary,
+            }));
+        }
+        out
     }
 
     pub async fn submit(&self, thread_id: &str, op: Op) -> Result<String> {
@@ -1064,9 +1308,17 @@ impl NovelxCore {
                             awaiting_studio_next: None,
                             outline_rewrite_active: false,
                             pending_impact: None,
+                            council_retry_count: 0,
+                            council_last_p0_types: Vec::new(),
+                            council_same_type_streak: 0,
+                            council_auto_steer: None,
+                            council_auto_continue: None,
+                            council_suppress_auto_continue: false,
+                            history_sealed_pending_write: false,
                             session_source: SessionSource::Root,
                             lifecycle: AgentLifecycle::Running,
                             subagent_job: None,
+                            last_composer_phase: None,
                         },
                     );
                     let _ = self.start_runtime(&thread_id);
@@ -1310,39 +1562,65 @@ impl NovelxCore {
             }),
         )
         .await;
-        // Unblock wait_agent first — never await parent I/O before this.
-        self.hub
-            .publish_result(thread_id, summary.clone(), data)
-            .await;
-        if let Some(parent) = self
-            .get_session_source(thread_id)
+        let interrupted = self
+            .threads
+            .read()
             .await
-            .and_then(|s| s.parent_thread_id().map(|p| p.to_string()))
-        {
-            // Fire-and-forget: awaiting parent submit while parent is inside wait_agent
-            // previously stranded the child after publish on a full/slow channel.
-            let mail = result_mail(thread_id, &parent, &summary);
-            let core = self.arc_self().ok();
-            if let Some(core) = core {
-                tokio::spawn(async move {
-                    let _ = core
-                        .submit(
-                            &parent,
-                            Op::InterAgentCommunication {
-                                communication: mail,
-                            },
-                        )
-                        .await;
-                });
+            .get(thread_id)
+            .map(|t| t.abort || matches!(t.lifecycle, AgentLifecycle::Interrupted))
+            .unwrap_or(false);
+        // Unblock wait_agent first — never await parent I/O before this.
+        // If interrupt already published, do not overwrite with step success/fail.
+        if interrupted {
+            self.hub
+                .publish_result(
+                    thread_id,
+                    "interrupted".into(),
+                    json!({ "interrupted": true }),
+                )
+                .await;
+        } else {
+            self.hub
+                .publish_result(thread_id, summary.clone(), data)
+                .await;
+        }
+        if !interrupted {
+            if let Some(parent) = self
+                .get_session_source(thread_id)
+                .await
+                .and_then(|s| s.parent_thread_id().map(|p| p.to_string()))
+            {
+                // Fire-and-forget: awaiting parent submit while parent is inside wait_agent
+                // previously stranded the child after publish on a full/slow channel.
+                let mail = result_mail(thread_id, &parent, &summary);
+                let core = self.arc_self().ok();
+                if let Some(core) = core {
+                    tokio::spawn(async move {
+                        let _ = core
+                            .submit(
+                                &parent,
+                                Op::InterAgentCommunication {
+                                    communication: mail,
+                                },
+                            )
+                            .await;
+                    });
+                }
             }
         }
         let ok = step_result.is_ok();
+        let lifecycle = if interrupted {
+            AgentLifecycle::Interrupted
+        } else if ok {
+            AgentLifecycle::Completed
+        } else {
+            AgentLifecycle::Failed
+        };
         if let Some(t) = self.threads.write().await.get_mut(thread_id) {
-            t.lifecycle = if ok {
-                AgentLifecycle::Completed
-            } else {
-                AgentLifecycle::Failed
-            };
+            // Preserve Interrupted if interrupt won the race with step completion.
+            if !matches!(t.lifecycle, AgentLifecycle::Interrupted) {
+                t.lifecycle = lifecycle.clone();
+            }
             t.subagent_job = None;
             t.messages.push(ChatMessage {
                 role: "assistant".into(),
@@ -1352,6 +1630,7 @@ impl NovelxCore {
                     ..Default::default()
                 });
         }
+        let final_life = self.agent_lifecycle(thread_id).await;
         self.emit_to_thread(
             thread_id,
             EventMsg::ItemCompleted {
@@ -1360,7 +1639,9 @@ impl NovelxCore {
                 item: TurnItem::AgentMessage {
                     id: new_id("item"),
                     text: summary.clone(),
-                    status: if ok {
+                    status: if matches!(final_life, AgentLifecycle::Interrupted) {
+                        ItemStatus::Cancelled
+                    } else if ok {
                         ItemStatus::Completed
                     } else {
                         ItemStatus::Failed
@@ -1384,11 +1665,7 @@ impl NovelxCore {
                     agent_path: src.agent_path(),
                     role: src.role().map(|r| r.to_string()),
                     parent_thread_id: src.parent_thread_id().map(|p| p.to_string()),
-                    lifecycle: if ok {
-                        AgentLifecycle::Completed
-                    } else {
-                        AgentLifecycle::Failed
-                    },
+                    lifecycle: final_life,
                     summary: Some(summary),
                 },
             })
@@ -1650,63 +1927,86 @@ impl NovelxCore {
                         // Tool card already shows write result; bubble keeps ack + reaudit status.
                         let mut body = mutation_apply_agent_summary(&intro, &output, &data);
                         if !project.is_empty() && chapter > 0 {
+                            let has_queue = load_audit_queue(
+                                &self.roots.projects_root,
+                                &project,
+                            )
+                            .is_some();
                             self.emit_to_thread(
                                 &thread_id,
                                 EventMsg::AgentMessageContentDelta {
                                     thread_id: thread_id.clone(),
                                     turn_id: turn_id.clone(),
                                     item_id: agent_item_id.clone(),
-                                    delta: format!("\n\n修订已落盘，正在复审第{chapter}章…"),
+                                    delta: if has_queue {
+                                        "\n\n修订已落盘，正在接续审阅队列…".into()
+                                    } else {
+                                        format!("\n\n修订已落盘，正在复审第{chapter}章…")
+                                    },
                                 },
                             )
                             .await;
-                            let audit_args = json!({
-                                "project": project,
-                                "chapter": chapter,
-                                "verify_previous": true,
-                            });
-                            let (_audit_out, audit_data) = self
-                                .run_one_tool_mirrored(
+                            let (audit_tool, audit_args, audit_data) = self
+                                .reaudit_after_revise(
                                     &thread_id,
                                     &turn_id,
-                                    "audit_chapter",
-                                    &audit_args.to_string(),
+                                    &project,
+                                    chapter,
                                     Some(&agent_item_id),
+                                    None,
                                 )
                                 .await?;
+                            let queue_finished = audit_data
+                                .get("queue_finished")
+                                .and_then(|v| v.as_bool())
+                                == Some(true);
+                            let queue_in_progress = !queue_finished
+                                && (audit_data
+                                    .get("queue_active")
+                                    .and_then(|v| v.as_bool())
+                                    == Some(true)
+                                    || load_audit_queue(
+                                        &self.roots.projects_root,
+                                        &project,
+                                    )
+                                    .is_some());
                             let asked = self
                                 .maybe_offer_audit_fix(
                                     &thread_id,
                                     &turn_id,
-                                    "audit_chapter",
+                                    &audit_tool,
                                     &audit_args,
                                     &audit_data,
                                 )
                                 .await?;
                             if asked {
                                 body.push_str("\n\n复审未通过，请按下方选项继续。");
+                            } else if queue_finished {
+                                body.push_str("\n\n审阅队列已全部完成。");
                             } else if audit_data
                                 .get("consistency_passed")
                                 .and_then(|v| v.as_bool())
                                 == Some(true)
                             {
-                                // Pass must open the next human gate (继续创作 / 卷同步…),
-                                // not dead-end with「本轮已正常结束」.
-                                let offered = self
-                                    .maybe_offer_after_audit_pass(
-                                        &thread_id,
-                                        &turn_id,
-                                        "audit_chapter",
-                                        &audit_args,
-                                        &audit_data,
-                                    )
-                                    .await?;
-                                if offered {
-                                    body.push_str("\n\n复审通过，请选择下一步。");
+                                if queue_in_progress {
+                                    // Queue continue already advanced; avoid「继续创作」.
                                 } else {
-                                    body.push_str(
-                                        "\n\n复审通过。可说「继续创作」写下一章。",
-                                    );
+                                    let offered = self
+                                        .maybe_offer_after_audit_pass(
+                                            &thread_id,
+                                            &turn_id,
+                                            &audit_tool,
+                                            &audit_args,
+                                            &audit_data,
+                                        )
+                                        .await?;
+                                    if offered {
+                                        body.push_str("\n\n复审通过，请选择下一步。");
+                                    } else {
+                                        body.push_str(
+                                            "\n\n复审通过。可说「继续创作」写下一章。",
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1841,8 +2141,11 @@ impl NovelxCore {
                         .get(&thread_id)
                         .and_then(|t| t.pending_chapter_next.clone())
                 } {
-                    let options = self
-                        .chapter_next_options(pending.published, pending.plot_accept_open);
+                    let options = self.chapter_next_options(
+                        pending.published,
+                        pending.plot_accept_open,
+                        pending.hard_long,
+                    );
                     let prompt = pending_chapter_next_prompt(&pending);
                     if let Some(t) = self.threads.write().await.get_mut(&thread_id) {
                         t.ui_turns = attach_ui_approval(
@@ -2325,6 +2628,7 @@ impl NovelxCore {
             }
             // Gate already confirmed intent — skip a second mutation card for continue/batch.
             let args = if tool_name == "continue_writing"
+                || tool_name == "continue_episode"
                 || tool_name == "continue_writing_batch"
             {
                 novelx_tools::with_confirm_skip(args)
@@ -2540,8 +2844,8 @@ impl NovelxCore {
                 t.pending_chapter_next = None;
                 t.ui_turns = strip_ui_approvals(std::mem::take(&mut t.ui_turns));
             }
-            // 「继续创作」但 next_chapter 已有未发布草稿 → 弹选项，勿空跑 continue_writing。
-            if tool_name == "continue_writing"
+            // 「继续创作」但 next_chapter 已有未发布草稿 → 恢复批写（先审校发布该草稿）。
+            let (tool_name, args) = if tool_name == "continue_writing"
                 && args.get("chapter").and_then(|v| v.as_u64()).is_none()
             {
                 let project = args
@@ -2550,80 +2854,29 @@ impl NovelxCore {
                     .unwrap_or_else(|| bound_project.as_deref().unwrap_or(""))
                     .to_string();
                 if !project.is_empty()
-                    && self.next_chapter_draft_chars(&project) >= self.with_policies(|p| p.draft_min_chars())
+                    && self.next_chapter_draft_chars(&project)
+                        >= self.with_policies(|p| p.draft_min_chars())
                 {
-                    let agent_item_id = new_id("item");
-                    let (chapter, chars, suggest) = self.draft_exists_meta(&project);
-                    let summary = format!(
-                        "第{chapter}章已有正文（约 {chars} 字），但尚未发布（next_chapter={chapter}）。\n\
-                         「继续创作」有歧义，请选择下一步。"
+                    let (chapter, chars, _) = self.draft_exists_meta(&project);
+                    tracing::info!(
+                        %project,
+                        chapter,
+                        chars,
+                        "chapter_next continue with draft → resume batch"
                     );
-                    self.emit_to_thread(
-                        &thread_id,
-                        EventMsg::ItemStarted {
-                            thread_id: thread_id.clone(),
-                            turn_id: turn_id.clone(),
-                            item: TurnItem::AgentMessage {
-                                id: agent_item_id.clone(),
-                                text: String::new(),
-                                status: ItemStatus::InProgress,
-                            },
-                        },
+                    (
+                        "continue_writing_batch".to_string(),
+                        novelx_tools::with_confirm_skip(json!({
+                            "project": project,
+                            "confirm_skip_expected": true,
+                        })),
                     )
-                    .await;
-                    self.emit_to_thread(
-                        &thread_id,
-                        EventMsg::AgentMessageContentDelta {
-                            thread_id: thread_id.clone(),
-                            turn_id: turn_id.clone(),
-                            item_id: agent_item_id.clone(),
-                            delta: summary.clone(),
-                        },
-                    )
-                    .await;
-                    if let Some(t) = self.threads.write().await.get_mut(&thread_id) {
-                        t.messages.push(ChatMessage {
-                            role: "assistant".into(),
-                            content: summary.clone(),
-                            tool_call_id: None,
-                            tool_calls: None,
-                            ..Default::default()
-                        });
-                        t.ui_turns = upsert_ui_agent_message(
-                            std::mem::take(&mut t.ui_turns),
-                            &turn_id,
-                            &agent_item_id,
-                            &summary,
-                        );
-                    }
-                    self.emit_to_thread(
-                        &thread_id,
-                        EventMsg::ItemCompleted {
-                            thread_id: thread_id.clone(),
-                            turn_id: turn_id.clone(),
-                            item: TurnItem::AgentMessage {
-                                id: agent_item_id,
-                                text: summary,
-                                status: ItemStatus::Completed,
-                            },
-                        },
-                    )
-                    .await;
-                    let _ = self
-                        .offer_draft_exists_gate(&thread_id, &turn_id, &project, chapter, suggest)
-                        .await?;
-                    let _ = self.persist_thread(&thread_id).await;
-                    self.emit_to_thread(
-                        &thread_id,
-                        EventMsg::TurnComplete {
-                            thread_id: thread_id.clone(),
-                            turn_id: turn_id.clone(),
-                        },
-                    )
-                    .await;
-                    return Ok(());
+                } else {
+                    (tool_name, args)
                 }
-            }
+            } else {
+                (tool_name, args)
+            };
             // Re-enter the same intent path by synthesizing a direct tool turn below —
             // fall through using the same pattern as setup: run tool + optional next gate.
             let agent_item_id = new_id("item");
@@ -2668,6 +2921,7 @@ impl NovelxCore {
             // continue/batch: intent already confirmed.
             // revise keeps diff preview →「应用修改」(Cursor-style before/after).
             let args = if tool_name == "continue_writing"
+                || tool_name == "continue_episode"
                 || tool_name == "continue_writing_batch"
             {
                 novelx_tools::with_confirm_skip(args)
@@ -2919,12 +3173,18 @@ impl NovelxCore {
                     .get("plot_title")
                     .and_then(|v| v.as_str())
                     .unwrap_or("剧情卡");
-                summary = if data.get("reason").and_then(|v| v.as_str())
-                    == Some("need_design_plot")
-                {
-                    "⛔ 写章已拦截：需要先设计并激活剧情卡。请在下方选择下一步。".into()
-                } else {
-                    format!("⛔ 写章已拦截：剧情卡「{title}」尚未激活。请在下方选择下一步。")
+                summary = match data.get("reason").and_then(|v| v.as_str()) {
+                    Some("need_design_plot") => {
+                        "⛔ 写章已拦截：需要先设计并激活剧情卡。请在下方选择下一步。".into()
+                    }
+                    Some("missing_exit") => {
+                        format!(
+                            "⛔ 写章已拦截：剧情卡「{title}」缺少可检验的收束条件。请在下方选择下一步。"
+                        )
+                    }
+                    _ => {
+                        format!("⛔ 写章已拦截：剧情卡「{title}」尚未激活。请在下方选择下一步。")
+                    }
                 };
             } else if asked_setup {
                 let hint = self
@@ -3530,6 +3790,91 @@ impl NovelxCore {
                 summary.push_str(
                     "\n\n下一步：design_plot → update_plot(in_progress) → continue_writing。",
                 );
+            }
+            // Schema / hard block on setup tools: restore pending_setup and re-offer next step
+            // (e.g. short_drama master outline rejected → user still sees「生成总纲」).
+            let setup_blocked = data.get("blocked").and_then(|v| v.as_bool()) == Some(true)
+                && matches!(
+                    tool_name.as_str(),
+                    "design_master_outline"
+                        | "design_arc_outline"
+                        | "upsert_setting"
+                        | "supplement_setting"
+                        | "lock_brief"
+                );
+            if setup_blocked {
+                let err = data
+                    .get("schema_error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(output.as_str());
+                let err_short: String = err.chars().take(240).collect();
+                summary = format!(
+                    "{intro}\n\n未成功：{err_short}\n\n定稿未完成，请按下方选项重试。"
+                );
+                if let Some(pending) = pending_snap.clone() {
+                    if let Some(t) = self.threads.write().await.get_mut(&thread_id) {
+                        t.pending_setup = Some(pending);
+                    }
+                }
+                let asked = self
+                    .maybe_offer_setup_confirm(&thread_id, &turn_id, &tool_name, &args, &data)
+                    .await?;
+                if !asked {
+                    // Ensure a setup card even if confirm helper skipped (e.g. no disk change).
+                    let project = args
+                        .get("project")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if !project.is_empty() {
+                        let _ = self
+                            .maybe_offer_setup_confirm(
+                                &thread_id,
+                                &turn_id,
+                                "get_project_status",
+                                &serde_json::json!({ "project": project }),
+                                &serde_json::json!({}),
+                            )
+                            .await?;
+                    }
+                }
+                if let Some(t) = self.threads.write().await.get_mut(&thread_id) {
+                    t.messages.push(ChatMessage {
+                        role: "assistant".into(),
+                        content: summary.clone(),
+                        tool_call_id: None,
+                        tool_calls: None,
+                        ..Default::default()
+                    });
+                    t.ui_turns = update_ui_turn_summary(
+                        std::mem::take(&mut t.ui_turns),
+                        &turn_id,
+                        &summary,
+                    );
+                }
+                self.emit_to_thread(
+                    &thread_id,
+                    EventMsg::ItemCompleted {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                        item: TurnItem::AgentMessage {
+                            id: agent_item_id,
+                            text: summary,
+                            status: ItemStatus::Completed,
+                        },
+                    },
+                )
+                .await;
+                let _ = self.persist_thread(&thread_id).await;
+                self.emit_to_thread(
+                    &thread_id,
+                    EventMsg::TurnComplete {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                    },
+                )
+                .await;
+                return Ok(());
             }
             // Direct apply (confirm off / confirm_skip): impact before setup resume.
             let asked_impact = self
@@ -4249,59 +4594,65 @@ impl NovelxCore {
                         .unwrap_or(1) as u32;
                     let has_queue =
                         load_audit_queue(&self.roots.projects_root, project).is_some();
-                    if has_queue {
+                    if has_queue || self.features.auto_reaudit_after_steer() {
                         self.emit_to_thread(
                             &thread_id,
                             EventMsg::AgentMessageContentDelta {
                                 thread_id: thread_id.clone(),
                                 turn_id: turn_id.clone(),
                                 item_id: agent_item_id.clone(),
-                                delta: "\n\n正在接续审阅队列…".into(),
+                                delta: if has_queue {
+                                    "\n\n正在接续审阅队列…".into()
+                                } else {
+                                    format!("\n\n正在复审第{chapter}章…")
+                                },
                             },
                         )
                         .await;
-                        let cont = json!({
-                            "project": project,
-                            "action": "continue"
-                        });
+                        let (tool, _a, data2) = self
+                            .reaudit_after_revise(
+                                &thread_id,
+                                &turn_id,
+                                project,
+                                chapter,
+                                Some(&agent_item_id),
+                                None,
+                            )
+                            .await?;
+                        data = data2;
+                        gate_tool = if tool == "audit_chapters" {
+                            "audit_chapters"
+                        } else {
+                            "audit_chapter"
+                        };
+                    }
+                }
+            } else if steer_accepted {
+                // Accept current chapter issues; if a multi-chapter queue is active, skip ahead.
+                if let Some(project) = args.get("project").and_then(|v| v.as_str()) {
+                    if load_audit_queue(&self.roots.projects_root, project).is_some() {
+                        self.emit_to_thread(
+                            &thread_id,
+                            EventMsg::AgentMessageContentDelta {
+                                thread_id: thread_id.clone(),
+                                turn_id: turn_id.clone(),
+                                item_id: agent_item_id.clone(),
+                                delta: "\n\n已接受，正在审下一章…".into(),
+                            },
+                        )
+                        .await;
+                        let next = json!({ "project": project, "action": "next" });
                         let (_out2, data2) = self
                             .run_one_tool_mirrored(
                                 &thread_id,
                                 &turn_id,
                                 "audit_chapters",
-                                &cont.to_string(),
+                                &next.to_string(),
                                 Some(&agent_item_id),
                             )
                             .await?;
                         data = data2;
                         gate_tool = "audit_chapters";
-                    } else if self.features.auto_reaudit_after_steer() {
-                        self.emit_to_thread(
-                            &thread_id,
-                            EventMsg::AgentMessageContentDelta {
-                                thread_id: thread_id.clone(),
-                                turn_id: turn_id.clone(),
-                                item_id: agent_item_id.clone(),
-                                delta: format!("\n\n正在复审第{chapter}章…"),
-                            },
-                        )
-                        .await;
-                        let audit_args = json!({
-                            "project": project,
-                            "chapter": chapter,
-                            "verify_previous": true,
-                        });
-                        let (_out2, data2) = self
-                            .run_one_tool_mirrored(
-                                &thread_id,
-                                &turn_id,
-                                "audit_chapter",
-                                &audit_args.to_string(),
-                                Some(&agent_item_id),
-                            )
-                            .await?;
-                        data = data2;
-                        gate_tool = "audit_chapter";
                     }
                 }
             }
@@ -4317,6 +4668,22 @@ impl NovelxCore {
             }
             let mut asked = if asked_mutation {
                 true
+            } else if steer_accepted && gate_tool == "audit_chapters" {
+                // Accept advanced the queue — open gate if the next chapter fails.
+                self.dismiss_audit_gate(
+                    &thread_id,
+                    &turn_id,
+                    "已接受问题，正在审下一章…",
+                )
+                .await;
+                self.maybe_offer_audit_fix(
+                    &thread_id,
+                    &turn_id,
+                    gate_tool,
+                    &args,
+                    &data,
+                )
+                .await?
             } else if steer_accepted {
                 // Keep gate closed; strip leftover approval cards.
                 self.dismiss_audit_gate(
@@ -4348,11 +4715,31 @@ impl NovelxCore {
                     .maybe_reoffer_queue_gate(&thread_id, &turn_id)
                     .await?;
             }
+            let queue_finished =
+                data.get("queue_finished").and_then(|v| v.as_bool()) == Some(true);
+            let queue_in_progress = !queue_finished
+                && (data.get("queue_active").and_then(|v| v.as_bool()) == Some(true)
+                    || args
+                        .get("project")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| data.get("project").and_then(|v| v.as_str()))
+                        .is_some_and(|p| {
+                            load_audit_queue(&self.roots.projects_root, p).is_some()
+                        }));
+            let hard_publish_block = data
+                .get("content_rule_blocked")
+                .and_then(|v| v.as_bool())
+                == Some(true)
+                || is_length_publish_blocked(&data);
             let mut offered_after_pass = false;
+            // While a multi-chapter audit queue is still running, do not open
+            // chapter_next「继续创作」— that looks like the whole audit finished.
+            // Exception: hard content-rule / length blocks still need「修正本章」.
             if !asked
                 && !asked_mutation
                 && !steer_accepted
                 && reaudit_passed
+                && (!queue_in_progress || hard_publish_block)
                 && matches!(gate_tool, "audit_chapter" | "audit_chapters")
             {
                 offered_after_pass = self
@@ -4371,10 +4758,23 @@ impl NovelxCore {
                 // Report is a separate bubble from emit_audit_report_before_gate —
                 // keep this intro short so update_ui_turn_summary cannot clobber it.
                 ""
+            } else if steer_accepted && gate_tool == "audit_chapters" {
+                if queue_finished {
+                    "\n\n已接受问题；审阅队列已全部完成。"
+                } else if asked {
+                    ""
+                } else {
+                    "\n\n已接受问题，已推进审阅队列。"
+                }
             } else if steer_accepted {
                 "\n\n已接受问题，审校门控已关闭。可说「继续」写下一章，或手动 audit_chapter 复审。"
+            } else if queue_finished && reaudit_passed {
+                "\n\n审阅队列已全部完成。"
             } else if offered_after_pass {
                 "\n\n复审通过，请选择下一步。"
+            } else if queue_in_progress && reaudit_passed {
+                // Continue already advanced or parked on a real fail gate above.
+                ""
             } else if (gate_tool == "audit_chapter" || gate_tool == "audit_chapters")
                 && reaudit_passed
             {
@@ -4501,81 +4901,8 @@ impl NovelxCore {
             }
         }
 
-        // Bare「继续」while next_chapter already has a draft: ask before tools / LLM.
-        if let Some(project) = bound_project.as_deref() {
-            if let Some(clarify) = self.clarify_bare_continue(project, &text) {
-                tracing::info!(%project, "bare continue with existing draft — clarify without tools");
-                let agent_item_id = new_id("item");
-                let (chapter, _chars, suggest) = self.draft_exists_meta(project);
-                self.emit_to_thread(
-                    &thread_id,
-                    EventMsg::ItemStarted {
-                        thread_id: thread_id.clone(),
-                        turn_id: turn_id.clone(),
-                        item: TurnItem::AgentMessage {
-                            id: agent_item_id.clone(),
-                            text: String::new(),
-                            status: ItemStatus::InProgress,
-                        },
-                    },
-                )
-                .await;
-                self.emit_to_thread(
-                    &thread_id,
-                    EventMsg::AgentMessageContentDelta {
-                        thread_id: thread_id.clone(),
-                        turn_id: turn_id.clone(),
-                        item_id: agent_item_id.clone(),
-                        delta: clarify.clone(),
-                    },
-                )
-                .await;
-                if let Some(t) = self.threads.write().await.get_mut(&thread_id) {
-                    t.messages.push(ChatMessage {
-                        role: "assistant".into(),
-                        content: clarify.clone(),
-                        tool_call_id: None,
-                        tool_calls: None,
-                        ..Default::default()
-                    });
-                    t.ui_turns = append_completion_ui_turn(
-                        std::mem::take(&mut t.ui_turns),
-                        &turn_id,
-                        &clarify,
-                        false,
-                    );
-                }
-                self.emit_to_thread(
-                    &thread_id,
-                    EventMsg::ItemCompleted {
-                        thread_id: thread_id.clone(),
-                        turn_id: turn_id.clone(),
-                        item: TurnItem::AgentMessage {
-                            id: agent_item_id,
-                            text: clarify,
-                            status: ItemStatus::Completed,
-                        },
-                    },
-                )
-                .await;
-                let _ = self
-                    .offer_draft_exists_gate(&thread_id, &turn_id, project, chapter, suggest)
-                    .await?;
-                let _ = self.persist_thread(&thread_id).await;
-                self.emit_to_thread(
-                    &thread_id,
-                    EventMsg::TurnComplete {
-                        thread_id: thread_id.clone(),
-                        turn_id: turn_id.clone(),
-                    },
-                )
-                .await;
-                return Ok(());
-            }
-        }
-
         // Deterministic intents from config/intents.yaml (Codex-style data-driven routing).
-        // Bare「继续」+ next_chapter 无实质草稿 → 直接续写（勿落入 LLM 只查状态就结束）。
+        // Bare「继续」+ 有未发布草稿 → 恢复批写；无草稿 → 续写下一章。
         let block_bare_for_outline = self.outline_rewrite_blocks_bare_continue(&thread_id).await;
         if self.features.deterministic_intents() {
         if let Some(intent) = self
@@ -4585,7 +4912,10 @@ impl NovelxCore {
                 if block_bare_for_outline {
                     None
                 } else {
-                    self.bare_continue_write_intent(bound_project.as_deref(), &text)
+                    self.bare_continue_batch_resume_intent(bound_project.as_deref(), &text)
+                        .or_else(|| {
+                            self.bare_continue_write_intent(bound_project.as_deref(), &text)
+                        })
                 }
             })
         {
@@ -4635,7 +4965,7 @@ impl NovelxCore {
                         bound_project.as_deref().unwrap_or("?")
                     )
                 }
-            } else if tool_name == "continue_writing" {
+            } else if tool_name == "continue_writing" || tool_name == "continue_episode" {
                 let ch = args.get("chapter").and_then(|v| v.as_u64());
                 if let Some(n) = ch {
                     format!(
@@ -4649,10 +4979,19 @@ impl NovelxCore {
                     )
                 }
             } else if tool_name == "continue_writing_batch" {
-                format!(
-                    "好的，开始连写《{}》，遇到硬门控会停下来。",
-                    bound_project.as_deref().unwrap_or("?")
-                )
+                let project = args
+                    .get("project")
+                    .and_then(|v| v.as_str())
+                    .or(bound_project.as_deref())
+                    .unwrap_or("?");
+                let (ch, chars, _) = self.draft_exists_meta(project);
+                if chars >= self.with_policies(|p| p.draft_min_chars()) {
+                    format!(
+                        "第{ch}章已有未发布正文（约 {chars} 字），先审校发布后继续连写《{project}》。"
+                    )
+                } else {
+                    format!("好的，开始连写《{project}》，遇到硬门控会停下来。")
+                }
             } else if tool_name == "revise_chapter" {
                 let ch = args.get("chapter").and_then(|v| v.as_u64()).unwrap_or(0);
                 format!(
@@ -4700,8 +5039,46 @@ impl NovelxCore {
                     .await;
                 }
             }
-            // Escaping into write/revise must drop stale audit gates (zombie pending_audit).
-            if tool_name == "continue_writing" || tool_name == "revise_chapter" {
+            if tool_name == "continue_writing_batch"
+                && (self.features.seal_on_chapter_pass()
+                    || self.features.clear_history_on_new_chapter())
+            {
+                let project = args
+                    .get("project")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_else(|| bound_project.as_deref().unwrap_or(""))
+                    .to_string();
+                if !project.is_empty() {
+                    let cfg = decision_council::DecisionCouncilConfig::load(
+                        &self.roots.config_root,
+                    );
+                    if cfg.seal_batch_per_chapter() || self.features.seal_on_chapter_pass() {
+                        let ch = novelx_pipeline::load_project_state(&project_dir(
+                            &self.roots.projects_root,
+                            &project,
+                        ))
+                        .map(|s| s.next_chapter.max(1))
+                        .unwrap_or(1);
+                        self.seal_chapter_context(
+                            &thread_id,
+                            &turn_id,
+                            &project,
+                            ch.saturating_sub(1).max(1),
+                            &text,
+                            &format!(
+                                "批写开始：已密封先前对话（《{project}》）。各章生成仅用落盘 Canon。"
+                            ),
+                            false,
+                        )
+                        .await;
+                    }
+                }
+            }
+            // Escaping into write/revise/batch must drop stale audit gates (zombie pending_audit).
+            if matches!(
+                tool_name.as_str(),
+                "continue_writing" | "continue_episode" | "continue_writing_batch" | "revise_chapter" | "revise_episode"
+            ) {
                 if let Some(t) = self.threads.write().await.get_mut(&thread_id) {
                     t.pending_audit = None;
                     t.ui_turns = strip_ui_approvals(std::mem::take(&mut t.ui_turns));
@@ -4715,6 +5092,7 @@ impl NovelxCore {
                     &args.to_string()
                 )
                 .await?;
+            let gate_data = chapter_gate_data_from_tool(&tool_name, &data);
             // Optional follow-up tools (e.g. plot_status → list_plots + get_project_status).
             let mut output = output;
             for extra in &intent.also_tools {
@@ -4774,13 +5152,13 @@ impl NovelxCore {
             let asked_order = if asked_mutation || asked_impact {
                 false
             } else {
-                self.maybe_offer_chapter_order(&thread_id, &turn_id, &tool_name, &args, &data)
+                self.maybe_offer_chapter_order(&thread_id, &turn_id, &tool_name, &args, &gate_data)
                     .await?
             };
             let asked_plot = if asked_mutation || asked_impact || asked_order {
                 false
             } else {
-                self.maybe_offer_plot_write(&thread_id, &turn_id, &tool_name, &args, &data)
+                self.maybe_offer_plot_write(&thread_id, &turn_id, &tool_name, &args, &gate_data)
                     .await?
             };
             let asked_expected =
@@ -4788,7 +5166,7 @@ impl NovelxCore {
                     false
                 } else {
                     self.maybe_offer_expected_event(
-                        &thread_id, &turn_id, &tool_name, &args, &data,
+                        &thread_id, &turn_id, &tool_name, &args, &gate_data,
                     )
                     .await?
                 };
@@ -4812,7 +5190,7 @@ impl NovelxCore {
             {
                 false
             } else {
-                self.maybe_offer_draft_exists(&thread_id, &turn_id, &tool_name, &args, &data)
+                self.maybe_offer_draft_exists(&thread_id, &turn_id, &tool_name, &args, &gate_data)
                     .await?
             };
             let asked_volume = if asked_mutation
@@ -4825,7 +5203,7 @@ impl NovelxCore {
             {
                 false
             } else {
-                self.maybe_offer_volume_sync(&thread_id, &turn_id, &tool_name, &args, &data)
+                self.maybe_offer_volume_sync(&thread_id, &turn_id, &tool_name, &args, &gate_data)
                     .await?
             };
             let asked_handoff = if asked_mutation
@@ -4839,7 +5217,7 @@ impl NovelxCore {
             {
                 false
             } else {
-                self.maybe_offer_volume_handoff(&thread_id, &turn_id, &tool_name, &args, &data)
+                self.maybe_offer_volume_handoff(&thread_id, &turn_id, &tool_name, &args, &gate_data)
                     .await?
             };
             let asked_vol_audit = if asked_mutation
@@ -4854,8 +5232,14 @@ impl NovelxCore {
             {
                 false
             } else {
-                self.maybe_offer_volume_audit(&thread_id, &turn_id, &tool_name, &args, &data)
-                    .await?
+                self.maybe_offer_volume_audit(
+                    &thread_id,
+                    &turn_id,
+                    &tool_name,
+                    &args,
+                    &gate_data,
+                )
+                .await?
             };
             let asked_audit = if asked_mutation
                 || asked_impact
@@ -4870,8 +5254,14 @@ impl NovelxCore {
             {
                 false
             } else {
-                self.maybe_offer_audit_fix(&thread_id, &turn_id, &tool_name, &args, &data)
-                    .await?
+                self.maybe_offer_audit_fix(
+                    &thread_id,
+                    &turn_id,
+                    &tool_name,
+                    &args,
+                    &gate_data,
+                )
+                .await?
             };
             let asked_setting = if asked_mutation
                 || asked_impact
@@ -4887,8 +5277,14 @@ impl NovelxCore {
             {
                 false
             } else {
-                self.maybe_offer_setting_blocker(&thread_id, &turn_id, &tool_name, &args, &data)
-                    .await?
+                self.maybe_offer_setting_blocker(
+                    &thread_id,
+                    &turn_id,
+                    &tool_name,
+                    &args,
+                    &gate_data,
+                )
+                .await?
             };
             // Intent path skips the LLM loop — still narrate clean publish before
             // 「继续创作」, matching studio.pause_after_clean_write=false.
@@ -4905,7 +5301,7 @@ impl NovelxCore {
                 || asked_audit
                 || asked_setting;
             if !gates_before_next
-                && write_result_is_clean_publish(&tool_name, &data)
+                && write_result_is_clean_publish(&tool_name, &gate_data)
                 && !self.features.pause_after_clean_write()
             {
                 match self
@@ -4914,7 +5310,7 @@ impl NovelxCore {
                         &turn_id,
                         &agent_item_id,
                         &tool_name,
-                        &data,
+                        &gate_data,
                         &output,
                     )
                     .await
@@ -4931,8 +5327,14 @@ impl NovelxCore {
             let asked_next = if gates_before_next {
                 false
             } else {
-                self.maybe_offer_chapter_next(&thread_id, &turn_id, &tool_name, &args, &data)
-                    .await?
+                self.maybe_offer_chapter_next(
+                    &thread_id,
+                    &turn_id,
+                    &tool_name,
+                    &args,
+                    &gate_data,
+                )
+                .await?
             };
             let asked_followup = if asked_mutation
                 || asked_impact
@@ -4983,12 +5385,18 @@ impl NovelxCore {
                     .get("plot_title")
                     .and_then(|v| v.as_str())
                     .unwrap_or("剧情卡");
-                summary = if data.get("reason").and_then(|v| v.as_str())
-                    == Some("need_design_plot")
-                {
-                    "⛔ 写章已拦截：需要先设计并激活剧情卡。请在下方选择下一步。".into()
-                } else {
-                    format!("⛔ 写章已拦截：剧情卡「{title}」尚未激活。请在下方选择下一步。")
+                summary = match data.get("reason").and_then(|v| v.as_str()) {
+                    Some("need_design_plot") => {
+                        "⛔ 写章已拦截：需要先设计并激活剧情卡。请在下方选择下一步。".into()
+                    }
+                    Some("missing_exit") => {
+                        format!(
+                            "⛔ 写章已拦截：剧情卡「{title}」缺少可检验的收束条件。请在下方选择下一步。"
+                        )
+                    }
+                    _ => {
+                        format!("⛔ 写章已拦截：剧情卡「{title}」尚未激活。请在下方选择下一步。")
+                    }
                 };
             } else if asked_setup {
                 let hint = self
@@ -5047,7 +5455,7 @@ impl NovelxCore {
                     tool_calls: None,
                     ..Default::default()
                 });
-                if tool_name == "continue_writing" || tool_name == "revise_chapter" {
+                if tool_name == "continue_writing" || tool_name == "continue_episode" || tool_name == "revise_chapter" || tool_name == "revise_episode" {
                     t.ui_turns = update_ui_turn_summary(
                         std::mem::take(&mut t.ui_turns),
                         &turn_id,
@@ -5717,23 +6125,24 @@ impl NovelxCore {
                         }).await;
                 }
 
-                let completed = TurnItem::ToolCall {
-                    id: item_id,
-                    name: tc.name.clone(),
-                    arguments: args_val.clone(),
-                    output: Some(ui_output),
-                    status,
-                    duration_ms: Some(duration_ms),
-                };
-                self.emit_to_thread(&thread_id, EventMsg::ItemCompleted {
-                        thread_id: thread_id.clone(),
-                        turn_id: turn_id.clone(),
-                        item: completed,
-                    }).await;
-
                 let mut tool_content = output;
+                let mut item_already_completed = false;
                 // Studio decision tool: open per-issue gate from offered options.
                 if tc.name == "offer_decisions" {
+                    let completed = TurnItem::ToolCall {
+                        id: item_id.clone(),
+                        name: tc.name.clone(),
+                        arguments: args_val.clone(),
+                        output: Some(ui_output.clone()),
+                        status: status.clone(),
+                        duration_ms: Some(duration_ms),
+                    };
+                    self.emit_to_thread(&thread_id, EventMsg::ItemCompleted {
+                            thread_id: thread_id.clone(),
+                            turn_id: turn_id.clone(),
+                            item: completed,
+                        }).await;
+                    item_already_completed = true;
                     match self
                         .apply_offer_decisions(&thread_id, &turn_id, &args_val, &data)
                         .await?
@@ -5763,35 +6172,52 @@ impl NovelxCore {
                     }
                 }
                 // Content audit fail → checklist + decision card.
-                // `continue_writing`: open deterministic card immediately (waiting for
+                // Write/revise/batch: open deterministic card immediately (waiting for
                 // Studio `offer_decisions` left zombie gates when the turn aborted).
                 // `audit_chapter(s)`: still allow one Studio offer round, then fallback.
+                let gate_data = chapter_gate_data_from_tool(&tc.name, &data);
                 let audit_fail = matches!(
                     tc.name.as_str(),
-                    "audit_chapter" | "audit_chapters" | "continue_writing"
-                ) && data.get("consistency_passed").and_then(|v| v.as_bool())
+                    "audit_chapter"
+                        | "audit_chapters"
+                        | "continue_writing"
+                        | "continue_writing_batch"
+                        | "revise_chapter"
+                ) && gate_data.get("consistency_passed").and_then(|v| v.as_bool())
                     == Some(false)
-                    && !audit_failure_is_meta_only(&data)
-                    && data.get("volume_ended").and_then(|v| v.as_u64()).is_none();
+                    && !audit_failure_is_meta_only(&gate_data)
+                    && gate_data.get("volume_ended").and_then(|v| v.as_u64()).is_none();
                 let mut opened_immediate_audit_gate = false;
+                let mut council_took_audit = false;
                 if audit_fail {
-                    let project = data
+                    let project = gate_data
                         .get("project")
                         .and_then(|v| v.as_str())
                         .or_else(|| args_val.get("project").and_then(|v| v.as_str()))
                         .unwrap_or("");
-                    let chapter = data
+                    let chapter = gate_data
                         .get("chapter")
                         .and_then(|v| v.as_u64())
                         .or_else(|| args_val.get("chapter").and_then(|v| v.as_u64()))
                         .unwrap_or(1) as u32;
                     if !project.is_empty() {
+                        if self
+                            .try_decision_council_audit(
+                                &thread_id, &turn_id, project, chapter, &gate_data,
+                            )
+                            .await?
+                        {
+                            council_took_audit = true;
+                            tool_content.push_str(
+                                "\n\n【评审团】已自动选择修订阻断项，正在执行局部修订…",
+                            );
+                        } else {
                         self.prepare_audit_fail_for_studio(
                             &thread_id,
                             &turn_id,
                             project,
                             chapter,
-                            &data,
+                            &gate_data,
                         )
                         .await?;
                         let prefer_studio_offer =
@@ -5810,22 +6236,68 @@ impl NovelxCore {
                                 &turn_id,
                                 project,
                                 chapter,
-                                &data,
+                                &gate_data,
                                 queue_active,
                                 None,
                                 false,
                             )
                             .await?;
                             if queue_active {
-                                self.emit_todos_from_data(&thread_id, &data).await;
+                                self.emit_todos_from_data(&thread_id, &gate_data).await;
                             }
                             tool_content.push_str(
                                 "\n\n【决策】一致性未通过：请在下方审批卡选择修订项或接受。",
                             );
                             opened_immediate_audit_gate = true;
                         }
+                        }
                     }
                 }
+
+                // Defer ItemCompleted while Decision Council nests steer/reaudit into this card.
+                let defer_complete = !item_already_completed
+                    && should_defer_audit_item_completed(
+                        &tc.name,
+                        council_took_audit,
+                        matches!(status, ItemStatus::Completed),
+                    );
+                if !item_already_completed && !defer_complete {
+                    let completed = TurnItem::ToolCall {
+                        id: item_id.clone(),
+                        name: tc.name.clone(),
+                        arguments: args_val.clone(),
+                        output: Some(ui_output.clone()),
+                        status: status.clone(),
+                        duration_ms: Some(duration_ms),
+                    };
+                    self.emit_to_thread(&thread_id, EventMsg::ItemCompleted {
+                            thread_id: thread_id.clone(),
+                            turn_id: turn_id.clone(),
+                            item: completed,
+                        }).await;
+                } else if defer_complete {
+                    let note = "\n\n【评审团】已自动选择修订阻断项，正在执行局部修订…";
+                    self.emit_to_thread(
+                        &thread_id,
+                        EventMsg::ToolCallOutputDelta {
+                            thread_id: thread_id.clone(),
+                            turn_id: turn_id.clone(),
+                            item_id: item_id.clone(),
+                            delta: note.into(),
+                        },
+                    )
+                    .await;
+                    if let Some(t) = self.threads.write().await.get_mut(&thread_id) {
+                        t.ui_turns = append_ui_tool_output(
+                            std::mem::take(&mut t.ui_turns),
+                            &turn_id,
+                            &item_id,
+                            note,
+                            Some("in_progress"),
+                        );
+                    }
+                }
+
                 if let Some(t) = self.threads.write().await.get_mut(&thread_id) {
                     t.messages.push(ChatMessage {
                         role: "tool".into(),
@@ -5836,6 +6308,60 @@ impl NovelxCore {
                 });
                 }
                 answered_ids.push(tc.id.clone());
+
+                // Decision Council auto-revise loop (steer → reaudit → retry/gate/continue).
+                if council_took_audit {
+                    let council_outcome = self
+                        .execute_council_auto_revise_loop(
+                            &thread_id,
+                            &turn_id,
+                            if defer_complete {
+                                Some(item_id.as_str())
+                            } else {
+                                None
+                            },
+                        )
+                        .await?;
+                    if defer_complete {
+                        let duration_ms = start.elapsed().as_millis() as u64;
+                        let completed = TurnItem::ToolCall {
+                            id: item_id.clone(),
+                            name: tc.name.clone(),
+                            arguments: args_val.clone(),
+                            output: Some(ui_output),
+                            status: ItemStatus::Completed,
+                            duration_ms: Some(duration_ms),
+                        };
+                        self.emit_to_thread(
+                            &thread_id,
+                            EventMsg::ItemCompleted {
+                                thread_id: thread_id.clone(),
+                                turn_id: turn_id.clone(),
+                                item: completed,
+                            },
+                        )
+                        .await;
+                        if let Some(t) = self.threads.write().await.get_mut(&thread_id) {
+                            t.ui_turns = upsert_ui_tool_call(
+                                std::mem::take(&mut t.ui_turns),
+                                &turn_id,
+                                &item_id,
+                                &tc.name,
+                                &args_val,
+                                None,
+                                "completed",
+                                Some(duration_ms),
+                            );
+                        }
+                    }
+                    match council_outcome {
+                        CouncilReviseOutcome::PauseHuman => {
+                            pause_for_human = true;
+                            break;
+                        }
+                        CouncilReviseOutcome::Handled => break,
+                    }
+                }
 
                 // Mutation confirm / chapter order / setup / volume / audit → stop.
                 // Audit tools defer static gate for one Studio offer round; write tools
@@ -5850,7 +6376,7 @@ impl NovelxCore {
                         &turn_id,
                         &tc.name,
                         &args_val,
-                        &data,
+                        &gate_data,
                     )
                     .await?
                 };
@@ -5878,7 +6404,7 @@ impl NovelxCore {
                             &turn_id,
                             &tc.name,
                             &args_val,
-                            &data,
+                            &gate_data,
                         )
                         .await?
                     || self
@@ -5887,7 +6413,7 @@ impl NovelxCore {
                             &turn_id,
                             &tc.name,
                             &args_val,
-                            &data,
+                            &gate_data,
                         )
                         .await?
                     || self
@@ -5896,7 +6422,7 @@ impl NovelxCore {
                             &turn_id,
                             &tc.name,
                             &args_val,
-                            &data,
+                            &gate_data,
                         )
                         .await?
                     || self
@@ -5914,7 +6440,7 @@ impl NovelxCore {
                             &turn_id,
                             &tc.name,
                             &args_val,
-                            &data,
+                            &gate_data,
                         )
                         .await?
                     || self
@@ -5923,7 +6449,7 @@ impl NovelxCore {
                             &turn_id,
                             &tc.name,
                             &args_val,
-                            &data,
+                            &gate_data,
                         )
                         .await?
                     || self
@@ -5932,7 +6458,7 @@ impl NovelxCore {
                             &turn_id,
                             &tc.name,
                             &args_val,
-                            &data,
+                            &gate_data,
                         )
                         .await?
                     || self
@@ -5941,7 +6467,7 @@ impl NovelxCore {
                             &turn_id,
                             &tc.name,
                             &args_val,
-                            &data,
+                            &gate_data,
                         )
                         .await?
                     || self
@@ -5961,14 +6487,18 @@ impl NovelxCore {
                 // Draft-exists clarify / write path — hard gates pause; clean publish
                 // may allow one narration follow-up (studio.pause_after_clean_write=false).
                 // Offer「继续创作」only after narration (or immediately on hard block).
-                if tc.name == "continue_writing" || tc.name == "revise_chapter" {
+                // Batch uses flattened last-chapter payload so stop reasons open the same gates.
+                if matches!(
+                    tc.name.as_str(),
+                    "continue_writing" | "continue_episode" | "continue_writing_batch" | "revise_chapter" | "revise_episode"
+                ) {
                     if self
                         .maybe_offer_draft_exists(
                             &thread_id,
                             &turn_id,
                             &tc.name,
                             &args_val,
-                            &data,
+                            &gate_data,
                         )
                         .await?
                     {
@@ -5986,12 +6516,20 @@ impl NovelxCore {
                         break;
                     }
                     let published =
-                        data.get("published").and_then(|v| v.as_bool()) == Some(true);
-                    let hard_block = data.get("blocked").and_then(|v| v.as_bool()) == Some(true)
-                        || data.get("content_rule_blocked").and_then(|v| v.as_bool())
+                        gate_data.get("published").and_then(|v| v.as_bool()) == Some(true);
+                    let hard_block = gate_data.get("blocked").and_then(|v| v.as_bool())
+                        == Some(true)
+                        || gate_data
+                            .get("content_rule_blocked")
+                            .and_then(|v| v.as_bool())
                             == Some(true)
-                        || data.get("needs_user_choice").and_then(|v| v.as_bool()) == Some(true)
-                        || data.get("consistency_passed").and_then(|v| v.as_bool())
+                        || gate_data
+                            .get("needs_user_choice")
+                            .and_then(|v| v.as_bool())
+                            == Some(true)
+                        || gate_data
+                            .get("consistency_passed")
+                            .and_then(|v| v.as_bool())
                             == Some(false)
                         || !published;
                     if hard_block || write_followup_done {
@@ -6010,31 +6548,58 @@ impl NovelxCore {
                                     &turn_id,
                                     &tc.name,
                                     &args_val,
-                                    &data,
+                                    &gate_data,
                                 )
                                 .await?;
+                        }
+                        if self
+                            .drain_council_auto_continue(&thread_id, &turn_id)
+                            .await?
+                        {
+                            break;
                         }
                         pause_for_human = true;
                         break;
                     }
-                    if self.features.pause_after_clean_write() {
+                    // Clean publish: one consolidated follow-up (auto-continue / gate / narrate).
+                    // Batch: only when the stop chapter itself clean-published (not max_chapters alone).
+                    if tc.name != "continue_writing_batch" {
+                        match self
+                            .handle_after_clean_publish(
+                                &thread_id,
+                                &turn_id,
+                                &tc.name,
+                                &args_val,
+                                &gate_data,
+                            )
+                            .await?
+                        {
+                            CleanPublishOutcome::PauseHuman => {
+                                pause_for_human = true;
+                                break;
+                            }
+                            CleanPublishOutcome::Handled => break,
+                            CleanPublishOutcome::DeferNarrate => {
+                                deferred_chapter_next =
+                                    Some((tc.name.clone(), args_val.clone(), gate_data.clone()));
+                                write_followup_pending = true;
+                                break;
+                            }
+                        }
+                    } else if published {
+                        // Successful batch chapter(s): open chapter_next so user can resume.
                         let _ = self
                             .maybe_offer_chapter_next(
                                 &thread_id,
                                 &turn_id,
                                 &tc.name,
                                 &args_val,
-                                &data,
+                                &gate_data,
                             )
                             .await?;
                         pause_for_human = true;
                         break;
                     }
-                    // Clean publish: narrate first, then offer chapter_next.
-                    deferred_chapter_next =
-                        Some((tc.name.clone(), args_val.clone(), data.clone()));
-                    write_followup_pending = true;
-                    break;
                 }
                 // Audit-only hard-rule block: open「修正本章」(not consistency decision card).
                 if matches!(tc.name.as_str(), "audit_chapter" | "audit_chapters")
@@ -6350,9 +6915,17 @@ impl NovelxCore {
                 awaiting_studio_next: None,
                 outline_rewrite_active: false,
                 pending_impact: None,
+                council_retry_count: 0,
+                council_last_p0_types: Vec::new(),
+                council_same_type_streak: 0,
+                council_auto_steer: None,
+                council_auto_continue: None,
+                council_suppress_auto_continue: false,
+                history_sealed_pending_write: false,
                 session_source: source,
                 lifecycle: AgentLifecycle::Running,
                 subagent_job: None,
+                last_composer_phase: None,
             },
         );
         self.start_runtime(&id)?;
@@ -6367,7 +6940,7 @@ impl NovelxCore {
         name: &str,
         arguments: &str,
     ) -> Result<(String, Value)> {
-        self.run_one_tool_mirrored(thread_id, turn_id, name, arguments, None)
+        self.run_one_tool_ui(thread_id, turn_id, name, arguments, None, None)
             .await
     }
 
@@ -6381,47 +6954,102 @@ impl NovelxCore {
         arguments: &str,
         mirror_agent_item: Option<&str>,
     ) -> Result<(String, Value)> {
-        let item_id = new_id("item");
-        let args_val: Value = serde_json::from_str(arguments).unwrap_or(json!({}));
-        self.emit_to_thread(
+        self.run_one_tool_ui(
             thread_id,
-            EventMsg::ItemStarted {
-                thread_id: thread_id.to_string(),
-                turn_id: turn_id.to_string(),
-                item: TurnItem::ToolCall {
-                    id: item_id.clone(),
-                    name: name.to_string(),
-                    arguments: args_val.clone(),
-                    output: None,
-                    status: ItemStatus::InProgress,
-                    duration_ms: None,
-                },
-            },
+            turn_id,
+            name,
+            arguments,
+            mirror_agent_item,
+            None,
         )
-        .await;
-        // Persist tool card into ui_turns (WS clients already see ItemStarted; HTTP restore needs this).
-        if let Some(t) = self.threads.write().await.get_mut(thread_id) {
-            t.ui_turns = upsert_ui_tool_call(
-                std::mem::take(&mut t.ui_turns),
-                turn_id,
-                &item_id,
-                name,
-                &args_val,
-                None,
-                "in_progress",
-                None,
-            );
+        .await
+    }
+
+    /// Run a tool while streaming progress into an existing parent tool card (no new ItemStarted).
+    /// Used by Decision Council so steer/reaudit stay nested under `audit_chapters`.
+    async fn run_one_tool_nested(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        name: &str,
+        arguments: &str,
+        parent_item_id: &str,
+    ) -> Result<(String, Value)> {
+        self.run_one_tool_ui(
+            thread_id,
+            turn_id,
+            name,
+            arguments,
+            None,
+            Some(parent_item_id),
+        )
+        .await
+    }
+
+    /// Core tool runner with optional agent-bubble mirror and/or nesting into a parent item.
+    async fn run_one_tool_ui(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        name: &str,
+        arguments: &str,
+        mirror_agent_item: Option<&str>,
+        nest_into_item: Option<&str>,
+    ) -> Result<(String, Value)> {
+        let nested = nest_into_item.is_some();
+        let item_id = nest_into_item
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| new_id("item"));
+        let args_val: Value = serde_json::from_str(arguments).unwrap_or(json!({}));
+        if !nested {
+            self.emit_to_thread(
+                thread_id,
+                EventMsg::ItemStarted {
+                    thread_id: thread_id.to_string(),
+                    turn_id: turn_id.to_string(),
+                    item: TurnItem::ToolCall {
+                        id: item_id.clone(),
+                        name: name.to_string(),
+                        arguments: args_val.clone(),
+                        output: None,
+                        status: ItemStatus::InProgress,
+                        duration_ms: None,
+                    },
+                },
+            )
+            .await;
+            // Persist tool card into ui_turns (WS clients already see ItemStarted; HTTP restore needs this).
+            if let Some(t) = self.threads.write().await.get_mut(thread_id) {
+                t.ui_turns = upsert_ui_tool_call(
+                    std::mem::take(&mut t.ui_turns),
+                    turn_id,
+                    &item_id,
+                    name,
+                    &args_val,
+                    None,
+                    "in_progress",
+                    None,
+                );
+            }
         }
 
         let start = std::time::Instant::now();
         let (prog_tx, mut prog_rx) = mpsc::unbounded_channel::<String>();
+        let (todo_tx, mut todo_rx) =
+            mpsc::unbounded_channel::<Vec<novelx_protocol::TodoItem>>();
         let mut tool_ctx = self.tool_ctx(thread_id);
         tool_ctx.progress = Some(prog_tx);
+        tool_ctx.todos = Some(todo_tx);
         let core_prog = self.clone();
         let thread_prog = thread_id.to_string();
         let turn_prog = turn_id.to_string();
         let item_prog = item_id.clone();
-        let mirror_prog = mirror_agent_item.map(|s| s.to_string());
+        // Nested council work must not dual-write into a NovelX agent bubble.
+        let mirror_prog = if nested {
+            None
+        } else {
+            mirror_agent_item.map(|s| s.to_string())
+        };
         let mut forward = tokio::spawn(async move {
             coalesce_tool_progress(
                 &mut prog_rx,
@@ -6433,9 +7061,92 @@ impl NovelxCore {
             )
             .await
         });
+        let core_todo = self.clone();
+        let thread_todo = thread_id.to_string();
+        let mut todo_forward = tokio::spawn(async move {
+            while let Some(todos) = todo_rx.recv().await {
+                core_todo
+                    .emit_to_thread(
+                        &thread_todo,
+                        EventMsg::TodoUpdated {
+                            thread_id: thread_todo.clone(),
+                            todos,
+                        },
+                    )
+                    .await;
+            }
+        });
+
+        // Shadow-git pre-mutation node when this call will write disk.
+        if self.version_nodes_enabled()
+            && is_mutating_tool(name)
+            && will_write_without_preview(&self.roots.config_root, name, &args_val)
+        {
+            let project = args_val
+                .get("project")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !project.is_empty() {
+                let mid = args_val
+                    .get("mutation_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let label = if mid.is_empty() {
+                    format!("pre/{name}")
+                } else {
+                    format!("pre/{mid}")
+                };
+                let chapter = args_val
+                    .get("chapter")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32);
+                let _ = self
+                    .checkpoint_version_node(
+                        project,
+                        &label,
+                        &format!("before {name}"),
+                        chapter,
+                        if mid.is_empty() { None } else { Some(mid) },
+                        Some(json!({ "tool": name })),
+                        Some(thread_id),
+                        Some(turn_id),
+                    )
+                    .await;
+            }
+        }
+        // Volume sync has no mutation-preview path — every non-blocked call writes.
+        if self.version_nodes_enabled() && name == "sync_volume" {
+            let project = args_val
+                .get("project")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let vol = args_val
+                .get("volume")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            if !project.is_empty() {
+                let label = if vol > 0 {
+                    format!("volume/{vol}/pre-sync")
+                } else {
+                    "volume/pre-sync".into()
+                };
+                let _ = self
+                    .checkpoint_version_node(
+                        project,
+                        &label,
+                        "before sync_volume",
+                        None,
+                        None,
+                        Some(json!({ "tool": "sync_volume", "volume": vol })),
+                        Some(thread_id),
+                        Some(turn_id),
+                    )
+                    .await;
+            }
+        }
 
         let tool_result = dispatch(&self.tools, &tool_ctx, name, arguments).await;
-        drop(tool_ctx);
+        drop(tool_ctx); // closes progress + todos senders
         let streamed = match tokio::time::timeout(std::time::Duration::from_secs(2), &mut forward)
             .await
         {
@@ -6447,6 +7158,13 @@ impl NovelxCore {
                 String::new()
             }
         };
+        match tokio::time::timeout(std::time::Duration::from_secs(2), &mut todo_forward).await {
+            Ok(_) => {}
+            Err(_) => {
+                tracing::warn!(%name, "todo flusher timed out; aborting");
+                todo_forward.abort();
+            }
+        }
         let duration_ms = start.elapsed().as_millis() as u64;
         let (output, status, data) = match tool_result {
             Ok(r) => (r.output, ItemStatus::Completed, r.data),
@@ -6467,44 +7185,72 @@ impl NovelxCore {
             ItemStatus::Cancelled => "cancelled",
             ItemStatus::InProgress => "in_progress",
         };
+        let tool_ok = matches!(status, ItemStatus::Completed);
 
-        // Only emit a trailing delta when the final coda wasn't already streamed / restated.
-        if !final_out.is_empty()
-            && !streamed.contains(final_out.trim())
-            && !tool_ui_looks_like_restated_report(&streamed, &final_out)
-        {
+        // Nested: prefix a short Chinese step label so the parent card stays readable.
+        let nest_prefix = if nested {
+            let label = agent_label_zh(&name);
+            format!("\n——\n▶ {label}\n")
+        } else {
+            String::new()
+        };
+        if nested && !nest_prefix.is_empty() {
             self.emit_to_thread(
                 thread_id,
                 EventMsg::ToolCallOutputDelta {
                     thread_id: thread_id.to_string(),
                     turn_id: turn_id.to_string(),
                     item_id: item_id.clone(),
-                    delta: if streamed.is_empty() {
-                        final_out.clone()
-                    } else {
-                        format!("\n{final_out}")
-                    },
+                    delta: nest_prefix.clone(),
                 },
             )
             .await;
         }
 
-        self.emit_to_thread(
-            thread_id,
-            EventMsg::ItemCompleted {
-                thread_id: thread_id.to_string(),
-                turn_id: turn_id.to_string(),
-                item: TurnItem::ToolCall {
-                    id: item_id.clone(),
-                    name: name.to_string(),
-                    arguments: args_val.clone(),
-                    output: Some(ui_output.clone()),
-                    status,
-                    duration_ms: Some(duration_ms),
+        // Only emit a trailing delta when the final coda wasn't already streamed / restated.
+        let trailing = if !final_out.is_empty()
+            && !streamed.contains(final_out.trim())
+            && !tool_ui_looks_like_restated_report(&streamed, &final_out)
+        {
+            if streamed.is_empty() && !nested {
+                final_out.clone()
+            } else {
+                format!("\n{final_out}")
+            }
+        } else {
+            String::new()
+        };
+        if !trailing.is_empty() {
+            self.emit_to_thread(
+                thread_id,
+                EventMsg::ToolCallOutputDelta {
+                    thread_id: thread_id.to_string(),
+                    turn_id: turn_id.to_string(),
+                    item_id: item_id.clone(),
+                    delta: trailing.clone(),
                 },
-            },
-        )
-        .await;
+            )
+            .await;
+        }
+
+        if !nested {
+            self.emit_to_thread(
+                thread_id,
+                EventMsg::ItemCompleted {
+                    thread_id: thread_id.to_string(),
+                    turn_id: turn_id.to_string(),
+                    item: TurnItem::ToolCall {
+                        id: item_id.clone(),
+                        name: name.to_string(),
+                        arguments: args_val.clone(),
+                        output: Some(ui_output.clone()),
+                        status,
+                        duration_ms: Some(duration_ms),
+                    },
+                },
+            )
+            .await;
+        }
 
         let chapter = ops_journal::chapter_from_value(&args_val)
             .or_else(|| ops_journal::chapter_from_value(&data));
@@ -6512,6 +7258,35 @@ impl NovelxCore {
             .get("project")
             .and_then(|v| v.as_str())
             .or_else(|| data.get("project").and_then(|v| v.as_str()));
+        if tool_ok
+            && data.get("blocked").and_then(|v| v.as_bool()) != Some(true)
+            && name == "update_plot"
+            && args_val.get("status").and_then(|v| v.as_str()) == Some("completed")
+        {
+            if let Some(proj) = project {
+                let title = args_val
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("plot");
+                let slug = title
+                    .chars()
+                    .map(|c| if c.is_whitespace() { '-' } else { c })
+                    .take(48)
+                    .collect::<String>();
+                let _ = self
+                    .checkpoint_version_node(
+                        proj,
+                        &format!("plot/{slug}"),
+                        &format!("plot marked completed: {title}"),
+                        chapter,
+                        None,
+                        Some(json!({ "plot_title": title })),
+                        Some(thread_id),
+                        Some(turn_id),
+                    )
+                    .await;
+            }
+        }
         if data.get("blocked").and_then(|v| v.as_bool()) == Some(true)
             || data.get("content_rule_blocked").and_then(|v| v.as_bool()) == Some(true)
         {
@@ -6556,16 +7331,27 @@ impl NovelxCore {
         }
 
         if let Some(t) = self.threads.write().await.get_mut(thread_id) {
-            t.ui_turns = upsert_ui_tool_call(
-                std::mem::take(&mut t.ui_turns),
-                turn_id,
-                &item_id,
-                name,
-                &args_val,
-                Some(&ui_output),
-                status_str,
-                Some(duration_ms),
-            );
+            if nested {
+                let append = format!("{nest_prefix}{trailing}");
+                t.ui_turns = append_ui_tool_output(
+                    std::mem::take(&mut t.ui_turns),
+                    turn_id,
+                    &item_id,
+                    &append,
+                    Some("in_progress"),
+                );
+            } else {
+                t.ui_turns = upsert_ui_tool_call(
+                    std::mem::take(&mut t.ui_turns),
+                    turn_id,
+                    &item_id,
+                    name,
+                    &args_val,
+                    Some(&ui_output),
+                    status_str,
+                    Some(duration_ms),
+                );
+            }
             t.messages.push(ChatMessage {
                 role: "assistant".into(),
                 content: String::new(),
@@ -6584,6 +7370,27 @@ impl NovelxCore {
                 tool_calls: None,
                     ..Default::default()
                 });
+        }
+        if name == "restore_version_node"
+            && tool_ok
+            && data.get("restored").and_then(|v| v.as_bool()) == Some(true)
+        {
+            let project = args_val
+                .get("project")
+                .and_then(|v| v.as_str())
+                .or_else(|| data.get("project").and_then(|v| v.as_str()))
+                .unwrap_or("");
+            if !project.is_empty() {
+                self.after_restore_version_tool(thread_id, turn_id, project, &data)
+                    .await;
+            }
+        }
+        // Final todo sync (live channel already streamed mid-queue check-offs).
+        if data.get("todos").and_then(|v| v.as_array()).is_some()
+            || data.get("queue_finished").and_then(|v| v.as_bool()) == Some(true)
+            || data.get("queue_active").and_then(|v| v.as_bool()) == Some(true)
+        {
+            self.emit_todos_from_data(thread_id, &data).await;
         }
         Ok((output, data))
     }
@@ -6721,10 +7528,11 @@ impl NovelxCore {
             return false;
         }
         // Preview-only continue_writing must not wipe chat / pending gates.
-        // Gate-sourced `confirm_skip` means the write is real — allow clear.
+        // Gate-sourced `confirm_skip`, explicit apply, or routine self-confirm → real write.
         if self.features.require_mutation_confirm()
             && args.get("apply").and_then(|v| v.as_bool()) != Some(true)
             && !novelx_tools::confirm_skipped(args)
+            && !novelx_tools::is_routine_self_confirm(&self.roots.config_root, "continue_writing")
         {
             return false;
         }
@@ -6765,6 +7573,46 @@ impl NovelxCore {
             .count()
     }
 
+    /// Bare「继续」+ next_chapter 已有未发布草稿 → 恢复批写（先审校该草稿再连写）。
+    fn bare_continue_batch_resume_intent(
+        &self,
+        project: Option<&str>,
+        user_text: &str,
+    ) -> Option<IntentMatch> {
+        let project = project.filter(|p| !p.is_empty() && *p != "_")?;
+        if !self.with_policies(|p| p.is_continue_write_intent(user_text)) {
+            return None;
+        }
+        let chars = self.next_chapter_draft_chars(project);
+        if chars < self.with_policies(|p| p.draft_min_chars()) {
+            return None;
+        }
+        let (chapter, _, _) = self.draft_exists_meta(project);
+        tracing::info!(
+            %project,
+            chapter,
+            chars,
+            "bare continue with draft → continue_writing_batch resume"
+        );
+        let max_chapters = novelx_harness::LongformConfig::load_from_config_root(
+            &self.roots.config_root,
+        )
+        .batch_max_chapters
+        .max(1)
+        .min(100);
+        Some(IntentMatch {
+            id: "bare_continue_batch_resume".into(),
+            tool: "continue_writing_batch".into(),
+            args: novelx_tools::with_confirm_skip(json!({
+                "project": project,
+                "max_chapters": max_chapters,
+                "confirm_skip_expected": true,
+            })),
+            clear_history: ClearHistory::Never,
+            also_tools: Vec::new(),
+        })
+    }
+
     /// Bare「继续」/「继续创作」+ next_chapter 无实质草稿 → deterministic continue_writing.
     fn bare_continue_write_intent(
         &self,
@@ -6775,7 +7623,7 @@ impl NovelxCore {
         if !self.with_policies(|p| p.is_continue_write_intent(user_text)) {
             return None;
         }
-        // Ambiguous: next chapter already has a draft (handled by clarify_bare_continue).
+        // Draft present → bare_continue_batch_resume_intent handles resume.
         if self.next_chapter_draft_chars(project) >= self.with_policies(|p| p.draft_min_chars()) {
             return None;
         }
@@ -6823,7 +7671,8 @@ impl NovelxCore {
         false
     }
 
-    /// When user says「继续」/「继续创作」and next_chapter already has a draft, clarify.
+    /// Legacy helper: draft-exists messaging (batch resume is preferred for bare continue).
+    #[allow(dead_code)]
     fn clarify_bare_continue(&self, project: &str, user_text: &str) -> Option<String> {
         if !self.with_policies(|p| p.is_continue_write_intent(user_text)) {
             return None;
@@ -6834,7 +7683,7 @@ impl NovelxCore {
         }
         Some(format!(
             "第{chapter}章已有正文（约 {chars} 字），尚未发布（next_chapter={chapter}）。\n\
-             「继续」有歧义，请选择：审校本章 / 修订本章 / 写第{suggest}章。"
+             可审校本章并继续连写，或修订本章 / 跳过草稿写第{suggest}章。"
         ))
     }
 
@@ -6882,7 +7731,7 @@ impl NovelxCore {
         _args: &Value,
         data: &Value,
     ) -> Result<bool> {
-        if tool_name != "continue_writing" {
+        if tool_name != "continue_writing" && tool_name != "continue_writing_batch" {
             return Ok(false);
         }
         if data.get("blocked").and_then(|v| v.as_bool()) != Some(true) {
@@ -6914,6 +7763,7 @@ impl NovelxCore {
 
     /// At the start of a new-chapter write: drop prior chat noise, keep the current turn.
     /// Project files are untouched. Does not wipe the in-flight write UI.
+    /// Skips if chapter-pass seal already ran for this transition (`history_sealed_pending_write`).
     async fn begin_new_chapter_history(
         &self,
         thread_id: &str,
@@ -6922,17 +7772,63 @@ impl NovelxCore {
         chapter: u32,
         user_text: &str,
     ) {
-        let summary = format!(
-            "已清理先前对话，正在撰写第{chapter}章（《{project}》）。\
-             进度见下方「继续创作」工具卡；设定与正文以项目文件为准。"
-        );
+        let already_sealed = {
+            let mut guard = self.threads.write().await;
+            if let Some(t) = guard.get_mut(thread_id) {
+                if t.history_sealed_pending_write {
+                    t.history_sealed_pending_write = false;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if already_sealed {
+            tracing::info!(
+                %project,
+                chapter,
+                "skip duplicate history clear (already sealed at chapter pass)"
+            );
+            return;
+        }
+        self.seal_chapter_context(
+            thread_id,
+            turn_id,
+            project,
+            chapter.saturating_sub(1).max(1),
+            user_text,
+            &format!(
+                "已清理先前对话，正在撰写第{chapter}章（《{project}》）。\
+                 进度见下方「继续创作」工具卡；设定与正文以项目文件为准。"
+            ),
+            false,
+        )
+        .await;
+        tracing::info!(%project, chapter, "cleared prior chat history for new chapter write");
+    }
+
+    /// Chapter-boundary seal: keep only generation-necessary Studio context.
+    /// Drops chapter-N creation-process messages; project files untouched.
+    /// When `mark_pending_write` is true, the next `begin_new_chapter_history` is a no-op.
+    async fn seal_chapter_context(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        project: &str,
+        completed_chapter: u32,
+        seed_user: &str,
+        summary: &str,
+        mark_pending_write: bool,
+    ) {
         {
             let mut guard = self.threads.write().await;
             let Some(t) = guard.get_mut(thread_id) else {
                 return;
             };
             let mut msgs = Vec::new();
-            let user = user_text.trim();
+            let user = seed_user.trim();
             if !user.is_empty() {
                 msgs.push(ChatMessage {
                     role: "user".into(),
@@ -6952,18 +7848,766 @@ impl NovelxCore {
             t.awaiting_studio_next = None;
             t.outline_rewrite_active = false;
             t.pending_impact = None;
+            t.council_retry_count = 0;
+            t.council_last_p0_types.clear();
+            t.council_same_type_streak = 0;
+            t.council_auto_steer = None;
+            if mark_pending_write {
+                t.history_sealed_pending_write = true;
+            }
         }
         self.emit_to_thread(
             thread_id,
             EventMsg::ChatHistoryReset {
                 thread_id: thread_id.to_string(),
-                summary,
+                summary: summary.to_string(),
                 keep_turn_id: Some(turn_id.to_string()),
             },
         )
         .await;
+        self.journal_ops(
+            Some(project),
+            Some(thread_id),
+            Some(turn_id),
+            Some(completed_chapter),
+            None,
+            OpsJournalKind::HistoryReset,
+            format!("chapter_boundary_seal after ch{completed_chapter}"),
+            json!({
+                "council_kind": "chapter_boundary_seal",
+                "completed_chapter": completed_chapter,
+            }),
+        )
+        .await;
         let _ = self.persist_thread(thread_id).await;
-        tracing::info!(%project, chapter, "cleared prior chat history for new chapter write");
+        tracing::info!(
+            %project,
+            completed_chapter,
+            "sealed chapter boundary context"
+        );
+    }
+
+    /// Run queued `chapter_next_clean` continue_writing once. Returns true if handled.
+    async fn drain_council_auto_continue(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<bool> {
+        let pending = {
+            let mut guard = self.threads.write().await;
+            guard
+                .get_mut(thread_id)
+                .and_then(|t| t.council_auto_continue.take())
+        };
+        let Some(cont) = pending else {
+            return Ok(false);
+        };
+        if let Some(t) = self.threads.write().await.get_mut(thread_id) {
+            t.council_suppress_auto_continue = true;
+        }
+        // Same disk-backed policy as batch (`UnattendedPolicy::soft_skip_enabled`),
+        // not the process-cached FeatureFlags — so hot-edited features.yaml stays consistent.
+        // foreshadow skip is batch-only; single-chapter continue_writing never hard-blocks pressure_high.
+        let (skip_vol, skip_exp, _skip_fsh) = {
+            let policy =
+                novelx_harness::UnattendedPolicy::load_from_config_root(&self.roots.config_root);
+            policy.resolve_council_skips(&self.roots.config_root)
+        };
+        let args = json!({
+            "project": cont.project,
+            "chapter": cont.next_chapter,
+            "confirm_skip": true,
+            "confirm_skip_volume_audit": skip_vol,
+            "confirm_skip_expected": skip_exp,
+        });
+        let agent_item_id = new_id("council");
+        self.emit_to_thread(
+            thread_id,
+            EventMsg::AgentMessageContentDelta {
+                thread_id: thread_id.to_string(),
+                turn_id: turn_id.to_string(),
+                item_id: agent_item_id.clone(),
+                delta: format!("评审团：自动继续写第{}章…", cont.next_chapter),
+            },
+        )
+        .await;
+        let (_out, data) = self
+            .run_one_tool_mirrored(
+                thread_id,
+                turn_id,
+                "continue_writing",
+                &args.to_string(),
+                Some(&agent_item_id),
+            )
+            .await?;
+
+        // Mirror agent-loop post-write gates so N+1 FAIL never ends without a human card.
+        let project = data
+            .get("project")
+            .and_then(|v| v.as_str())
+            .or(Some(cont.project.as_str()))
+            .unwrap_or("");
+        let chapter = data
+            .get("chapter")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(cont.next_chapter as u64) as u32;
+        let audit_fail = data.get("consistency_passed").and_then(|v| v.as_bool())
+            == Some(false)
+            && !audit_failure_is_meta_only(&data)
+            && data.get("volume_ended").and_then(|v| v.as_u64()).is_none();
+        if audit_fail && !project.is_empty() && chapter > 0 {
+            // Always surface a human gate after auto-continue FAIL.
+            // Skip council AutoRevise here to avoid async recursion with
+            // execute_council_auto_revise_loop → drain_council_auto_continue.
+            let queue_active =
+                load_audit_queue(&self.roots.projects_root, project).is_some();
+            self.open_content_audit_gate(
+                thread_id,
+                turn_id,
+                project,
+                chapter,
+                &data,
+                queue_active,
+                None,
+                false,
+            )
+            .await?;
+        } else {
+            let _ = self
+                .maybe_offer_plot_write(thread_id, turn_id, "continue_writing", &args, &data)
+                .await?;
+            let _ = self
+                .maybe_offer_setting_blocker(
+                    thread_id,
+                    turn_id,
+                    "continue_writing",
+                    &args,
+                    &data,
+                )
+                .await?;
+            let _ = self
+                .maybe_offer_draft_exists(thread_id, turn_id, "continue_writing", &args, &data)
+                .await?;
+            let _ = self
+                .maybe_offer_chapter_next(thread_id, turn_id, "continue_writing", &args, &data)
+                .await?;
+        }
+
+        if let Some(t) = self.threads.write().await.get_mut(thread_id) {
+            t.council_suppress_auto_continue = false;
+            t.council_auto_continue = None;
+        }
+        Ok(true)
+    }
+
+    /// After revise: re-audit via `audit_chapters continue` when a queue is active,
+    /// otherwise single-chapter `audit_chapter`. Returns `(tool_name, args, output_data)`.
+    ///
+    /// When `nest_into_item` is set, progress streams into that parent tool card (council path).
+    async fn reaudit_after_revise(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        project: &str,
+        chapter: u32,
+        agent_item_id: Option<&str>,
+        nest_into_item: Option<&str>,
+    ) -> Result<(String, Value, Value)> {
+        let has_queue = load_audit_queue(&self.roots.projects_root, project).is_some();
+        let tool = reaudit_tool_name(has_queue);
+        let args = if tool == "audit_chapters" {
+            json!({ "project": project, "action": "continue" })
+        } else {
+            json!({
+                "project": project,
+                "chapter": chapter,
+                "verify_previous": true,
+            })
+        };
+        let (_out, data) = if let Some(parent) = nest_into_item {
+            self.run_one_tool_nested(thread_id, turn_id, tool, &args.to_string(), parent)
+                .await?
+        } else {
+            self.run_one_tool_mirrored(
+                thread_id,
+                turn_id,
+                tool,
+                &args.to_string(),
+                agent_item_id,
+            )
+            .await?
+        };
+        Ok((tool.into(), args, data))
+    }
+
+    /// Run queued council steers: each round is steer → audit → decide.
+    /// Always re-audits after council steer (even if `auto_reaudit_after_steer` is off),
+    /// so we never leave a FAIL without a gate.
+    ///
+    /// With an active `audit_chapters` queue, re-audit uses `action=continue` so a pass
+    /// advances to the next chapter instead of dead-ending on chapter_next「继续创作」.
+    ///
+    /// When `parent_item_id` is set, steer/reaudit nest into that audit tool card (no sibling
+    /// 门控续作 cards, no NovelX agent-bubble mirror).
+    async fn execute_council_auto_revise_loop(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        parent_item_id: Option<&str>,
+    ) -> Result<CouncilReviseOutcome> {
+        let max_rounds = decision_council::DecisionCouncilConfig::load(&self.roots.config_root)
+            .audit_kind()
+            .max_auto_retries
+            .saturating_add(1)
+            .max(1);
+        let mut last_fail_audit: Option<(String, u32, Value)> = None;
+
+        for round in 0..max_rounds {
+            let steer_args = {
+                let mut guard = self.threads.write().await;
+                guard
+                    .get_mut(thread_id)
+                    .and_then(|t| t.council_auto_steer.take())
+            };
+            let Some(steer_args) = steer_args else {
+                break;
+            };
+            let project = steer_args
+                .get("project")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let chapter = steer_args
+                .get("chapter")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as u32;
+            if project.is_empty() {
+                break;
+            }
+
+            let plan_summary = steer_args
+                .get("revise_plan")
+                .and_then(|p| {
+                    let scope = p.get("scope").and_then(|v| v.as_str()).unwrap_or("");
+                    let rationale = p.get("rationale").and_then(|v| v.as_str()).unwrap_or("");
+                    let n = p
+                        .get("issue_ids")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0);
+                    if scope.is_empty() && rationale.is_empty() {
+                        None
+                    } else {
+                        let gear = match scope {
+                            "full" => "整章",
+                            "local" => "局部",
+                            _ => scope,
+                        };
+                        Some(if rationale.is_empty() {
+                            format!("{gear} · {n} 条 issue")
+                        } else {
+                            format!("{gear} · {rationale}")
+                        })
+                    }
+                })
+                .or_else(|| {
+                    steer_args
+                        .get("revise_scope")
+                        .and_then(|v| v.as_str())
+                        .map(|s| match s {
+                            "full" => "整章修订".into(),
+                            "local" => "局部修订".into(),
+                            other => other.to_string(),
+                        })
+                });
+            let status = match plan_summary {
+                Some(s) => format!("\n评审团自动修订中…（第{}轮 · {s}）", round + 1),
+                None => format!("\n评审团自动修订中…（第{}轮）", round + 1),
+            };
+            if let Some(parent) = parent_item_id {
+                self.emit_to_thread(
+                    thread_id,
+                    EventMsg::ToolCallOutputDelta {
+                        thread_id: thread_id.to_string(),
+                        turn_id: turn_id.to_string(),
+                        item_id: parent.to_string(),
+                        delta: status.clone(),
+                    },
+                )
+                .await;
+                if let Some(t) = self.threads.write().await.get_mut(thread_id) {
+                    t.ui_turns = append_ui_tool_output(
+                        std::mem::take(&mut t.ui_turns),
+                        turn_id,
+                        parent,
+                        &status,
+                        Some("in_progress"),
+                    );
+                }
+            }
+
+            let (_out, data_steer) = if let Some(parent) = parent_item_id {
+                self.run_one_tool_nested(
+                    thread_id,
+                    turn_id,
+                    "steer_run",
+                    &steer_args.to_string(),
+                    parent,
+                )
+                .await?
+            } else {
+                self.run_one_tool(thread_id, turn_id, "steer_run", &steer_args.to_string())
+                    .await?
+            };
+
+            if data_steer.get("needs_confirm").and_then(|v| v.as_bool()) == Some(true) {
+                let _ = self
+                    .maybe_offer_mutation_confirm(
+                        thread_id,
+                        turn_id,
+                        "steer_run",
+                        &steer_args,
+                        &data_steer,
+                    )
+                    .await?;
+                return Ok(CouncilReviseOutcome::PauseHuman);
+            }
+
+            // Prefer queue continue so AutoRevise on ch1 does not abandon chapters 2…N.
+            let reaudit_note = if load_audit_queue(&self.roots.projects_root, &project).is_some() {
+                "\n正在接续审阅队列…".to_string()
+            } else {
+                format!("\n正在复审第{chapter}章…")
+            };
+            if let Some(parent) = parent_item_id {
+                self.emit_to_thread(
+                    thread_id,
+                    EventMsg::ToolCallOutputDelta {
+                        thread_id: thread_id.to_string(),
+                        turn_id: turn_id.to_string(),
+                        item_id: parent.to_string(),
+                        delta: reaudit_note.clone(),
+                    },
+                )
+                .await;
+                if let Some(t) = self.threads.write().await.get_mut(thread_id) {
+                    t.ui_turns = append_ui_tool_output(
+                        std::mem::take(&mut t.ui_turns),
+                        turn_id,
+                        parent,
+                        &reaudit_note,
+                        Some("in_progress"),
+                    );
+                }
+            }
+            let (audit_tool, audit_args, data_audit) = self
+                .reaudit_after_revise(
+                    thread_id,
+                    turn_id,
+                    &project,
+                    chapter,
+                    None,
+                    parent_item_id,
+                )
+                .await?;
+
+            let fail_chapter = data_audit
+                .get("chapter")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(chapter as u64) as u32;
+            let still_fail = data_audit
+                .get("consistency_passed")
+                .and_then(|v| v.as_bool())
+                == Some(false)
+                && !audit_failure_is_meta_only(&data_audit);
+            let queue_finished =
+                data_audit.get("queue_finished").and_then(|v| v.as_bool()) == Some(true);
+            let queue_in_progress = !queue_finished
+                && (data_audit.get("queue_active").and_then(|v| v.as_bool()) == Some(true)
+                    || load_audit_queue(&self.roots.projects_root, &project).is_some());
+            let passed = data_audit
+                .get("consistency_passed")
+                .and_then(|v| v.as_bool())
+                == Some(true)
+                || data_audit.get("published").and_then(|v| v.as_bool()) == Some(true)
+                || queue_finished;
+
+            if still_fail {
+                last_fail_audit = Some((project.clone(), fail_chapter, data_audit.clone()));
+                if self
+                    .try_decision_council_audit(
+                        thread_id,
+                        turn_id,
+                        &project,
+                        fail_chapter,
+                        &data_audit,
+                    )
+                    .await?
+                {
+                    // Another AutoRevise queued — continue loop.
+                    continue;
+                }
+                let queue_active =
+                    load_audit_queue(&self.roots.projects_root, &project).is_some();
+                self.open_content_audit_gate(
+                    thread_id,
+                    turn_id,
+                    &project,
+                    fail_chapter,
+                    &data_audit,
+                    queue_active,
+                    None,
+                    true,
+                )
+                .await?;
+                return Ok(CouncilReviseOutcome::PauseHuman);
+            }
+
+            if passed {
+                // Multi-chapter audit must keep going — never open「继续创作」mid-queue,
+                // and never auto-write the next chapter via council continue.
+                if queue_in_progress {
+                    let hard = data_audit
+                        .get("content_rule_blocked")
+                        .and_then(|v| v.as_bool())
+                        == Some(true)
+                        || is_length_publish_blocked(&data_audit);
+                    if hard {
+                        let _ = self
+                            .maybe_offer_chapter_next(
+                                thread_id,
+                                turn_id,
+                                &audit_tool,
+                                &audit_args,
+                                &data_audit,
+                            )
+                            .await?;
+                        return Ok(CouncilReviseOutcome::PauseHuman);
+                    }
+                    let asked = self
+                        .maybe_offer_audit_fix(
+                            thread_id,
+                            turn_id,
+                            &audit_tool,
+                            &audit_args,
+                            &data_audit,
+                        )
+                        .await?;
+                    if asked || self.thread_awaiting_human(thread_id).await {
+                        return Ok(CouncilReviseOutcome::PauseHuman);
+                    }
+                    return Ok(CouncilReviseOutcome::Handled);
+                }
+
+                if queue_finished {
+                    // Finished the audit queue — do not start writing chapter N+1.
+                    self.dismiss_audit_gate(
+                        thread_id,
+                        turn_id,
+                        "审阅队列已全部完成。",
+                    )
+                    .await;
+                    return Ok(CouncilReviseOutcome::Handled);
+                }
+
+                let _ = self
+                    .maybe_offer_chapter_next(
+                        thread_id,
+                        turn_id,
+                        &audit_tool,
+                        &audit_args,
+                        &data_audit,
+                    )
+                    .await?;
+                if self
+                    .drain_council_auto_continue(thread_id, turn_id)
+                    .await?
+                {
+                    let has_gate = self.thread_awaiting_human(thread_id).await;
+                    return Ok(if has_gate {
+                        CouncilReviseOutcome::PauseHuman
+                    } else {
+                        CouncilReviseOutcome::Handled
+                    });
+                }
+                if self
+                    .threads
+                    .read()
+                    .await
+                    .get(thread_id)
+                    .and_then(|t| t.pending_chapter_next.clone())
+                    .is_some()
+                {
+                    return Ok(CouncilReviseOutcome::PauseHuman);
+                }
+                return Ok(CouncilReviseOutcome::Handled);
+            }
+
+            // Reaudit returned neither clear pass nor content FAIL (infra / meta).
+            let queue_active = load_audit_queue(&self.roots.projects_root, &project).is_some();
+            self.open_content_audit_gate(
+                thread_id,
+                turn_id,
+                &project,
+                fail_chapter,
+                &data_audit,
+                queue_active,
+                None,
+                true,
+            )
+            .await?;
+            return Ok(CouncilReviseOutcome::PauseHuman);
+        }
+
+        // Drop leftover AutoRevise without another LLM audit — reuse last FAIL payload.
+        if let Some(t) = self.threads.write().await.get_mut(thread_id) {
+            t.council_auto_steer = None;
+        }
+        if let Some((project, chapter, data_audit)) = last_fail_audit {
+            let queue_active = load_audit_queue(&self.roots.projects_root, &project).is_some();
+            self.open_content_audit_gate(
+                thread_id,
+                turn_id,
+                &project,
+                chapter,
+                &data_audit,
+                queue_active,
+                None,
+                true,
+            )
+            .await?;
+            return Ok(CouncilReviseOutcome::PauseHuman);
+        }
+        Ok(CouncilReviseOutcome::Handled)
+    }
+
+    /// Single exit for clean publish: seal/auto-continue / chapter_next / narrate.
+    async fn handle_after_clean_publish(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        tool_name: &str,
+        args: &Value,
+        data: &Value,
+    ) -> Result<CleanPublishOutcome> {
+        let project = data
+            .get("project")
+            .and_then(|v| v.as_str())
+            .or_else(|| args.get("project").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        let chapter = data
+            .get("chapter")
+            .and_then(|v| v.as_u64())
+            .or_else(|| args.get("chapter").and_then(|v| v.as_u64()))
+            .unwrap_or(0) as u32;
+        if !project.is_empty() && chapter > 0 {
+            let _ = self
+                .checkpoint_version_node(
+                    project,
+                    &format!("chapter/{chapter}"),
+                    &format!("clean publish ch{chapter} via {tool_name}"),
+                    Some(chapter),
+                    None,
+                    Some(json!({ "tool": tool_name })),
+                    Some(thread_id),
+                    Some(turn_id),
+                )
+                .await;
+            if data.get("plot_accept_passed").and_then(|v| v.as_bool()) == Some(true) {
+                let plot_title = data
+                    .get("plot_title")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| data.get("completed_plot").and_then(|v| v.as_str()))
+                    .unwrap_or("plot");
+                let slug = plot_title
+                    .chars()
+                    .map(|c| if c.is_whitespace() { '-' } else { c })
+                    .take(48)
+                    .collect::<String>();
+                let _ = self
+                    .checkpoint_version_node(
+                        project,
+                        &format!("plot/{slug}"),
+                        &format!("plot completed after ch{chapter}"),
+                        Some(chapter),
+                        None,
+                        Some(json!({ "plot_title": plot_title })),
+                        Some(thread_id),
+                        Some(turn_id),
+                    )
+                    .await;
+            }
+        }
+
+        let cfg = decision_council::DecisionCouncilConfig::load(&self.roots.config_root);
+        let auto_continue = self.features.decision_council()
+            && cfg.kind_enabled("chapter_next_clean");
+
+        if auto_continue {
+            let _ = self
+                .maybe_offer_chapter_next(thread_id, turn_id, tool_name, args, data)
+                .await?;
+            if self
+                .drain_council_auto_continue(thread_id, turn_id)
+                .await?
+            {
+                return Ok(if self.thread_awaiting_human(thread_id).await {
+                    CleanPublishOutcome::PauseHuman
+                } else {
+                    CleanPublishOutcome::Handled
+                });
+            }
+            if self
+                .threads
+                .read()
+                .await
+                .get(thread_id)
+                .and_then(|t| t.pending_chapter_next.clone())
+                .is_some()
+            {
+                return Ok(CleanPublishOutcome::PauseHuman);
+            }
+        }
+
+        if self.features.pause_after_clean_write() {
+            let _ = self
+                .maybe_offer_chapter_next(thread_id, turn_id, tool_name, args, data)
+                .await?;
+            let _ = self.drain_council_auto_continue(thread_id, turn_id).await?;
+            return Ok(CleanPublishOutcome::PauseHuman);
+        }
+
+        // Seal before narration so the summary round does not carry chapter tool-chain.
+        if self.features.seal_on_chapter_pass() {
+            let project = data
+                .get("project")
+                .and_then(|v| v.as_str())
+                .or_else(|| args.get("project").and_then(|v| v.as_str()))
+                .unwrap_or("");
+            let chapter = data
+                .get("chapter")
+                .and_then(|v| v.as_u64())
+                .or_else(|| args.get("chapter").and_then(|v| v.as_u64()))
+                .unwrap_or(0) as u32;
+            if !project.is_empty() && chapter > 0 {
+                let seed = format!("第{chapter}章已通过。请用两三句总结结果。");
+                self.seal_chapter_context(
+                    thread_id,
+                    turn_id,
+                    project,
+                    chapter,
+                    &seed,
+                    &format!(
+                        "第{chapter}章已通过并密封对话上下文（《{project}》）。下一章只使用落盘 Canon。"
+                    ),
+                    true,
+                )
+                .await;
+            }
+        }
+
+        // Default agentic: narrate once, then offer chapter_next on the follow-up round.
+        Ok(CleanPublishOutcome::DeferNarrate)
+    }
+
+    /// Try Decision Council on content-audit FAIL. Returns true if gate should be skipped
+    /// (auto-steer queued or handled).
+    async fn try_decision_council_audit(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        project: &str,
+        chapter: u32,
+        data: &Value,
+    ) -> Result<bool> {
+        if !self.features.decision_council() {
+            return Ok(false);
+        }
+        let cfg = decision_council::DecisionCouncilConfig::load(&self.roots.config_root);
+        if !cfg.kind_enabled("audit_content") {
+            return Ok(false);
+        }
+        let retry = self
+            .threads
+            .read()
+            .await
+            .get(thread_id)
+            .map(|t| t.council_retry_count)
+            .unwrap_or(0);
+        let issues = self.extract_audit_issues(data, project, chapter);
+        let types = decision_council::p0_issue_types(&issues);
+        let (prev_types, prev_streak) = {
+            let guard = self.threads.read().await;
+            let t = guard.get(thread_id);
+            (
+                t.map(|x| x.council_last_p0_types.clone())
+                    .unwrap_or_default(),
+                t.map(|x| x.council_same_type_streak).unwrap_or(0),
+            )
+        };
+        let same_type_streak =
+            decision_council::next_same_type_streak(&prev_types, &types, prev_streak);
+        let verdict = decision_council::evaluate_audit_content(
+            &self.roots.config_root,
+            project,
+            chapter,
+            data,
+            &issues,
+            retry,
+            same_type_streak,
+            self.features.revise_plan(),
+        );
+        self.journal_ops(
+            Some(project),
+            Some(thread_id),
+            Some(turn_id),
+            Some(chapter),
+            None,
+            OpsJournalKind::AuditReport,
+            format!("decision_council: {:?}", verdict.action),
+            decision_council::verdict_journal_data(&verdict),
+        )
+        .await;
+        let dir = project_dir(&self.roots.projects_root, project);
+        revise_plan::persist_revise_context(&dir, chapter, same_type_streak, &types);
+        match verdict.action {
+            decision_council::CouncilAction::AutoRevise => {
+                if let Some(t) = self.threads.write().await.get_mut(thread_id) {
+                    t.pending_audit = None;
+                    t.council_retry_count = retry.saturating_add(1);
+                    t.council_last_p0_types = types;
+                    t.council_same_type_streak = same_type_streak;
+                    t.council_auto_steer = Some(verdict.args.clone());
+                    t.ui_turns = strip_ui_approvals(std::mem::take(&mut t.ui_turns));
+                }
+                let _ = self.persist_thread(thread_id).await;
+                Ok(true)
+            }
+            decision_council::CouncilAction::FetchMaterial => {
+                let _ = novelx_pipeline::set_drought_flag(&dir, "council_fetch_material", chapter);
+                let _ = novelx_pipeline::set_inspiration_flag(&dir, chapter);
+                Ok(false)
+            }
+            decision_council::CouncilAction::EscalateHuman => {
+                if let Some(t) = self.threads.write().await.get_mut(thread_id) {
+                    t.council_last_p0_types = types;
+                    t.council_same_type_streak = same_type_streak;
+                }
+                // Deadlock / near-score / max-retry / same-type: surface inspiration for Studio.
+                let r = verdict.rationale.to_ascii_lowercase();
+                if r.contains("死锁")
+                    || r.contains("近分")
+                    || r.contains("分差")
+                    || r.contains("上限")
+                    || r.contains("ε")
+                    || r.contains("同类")
+                {
+                    let _ = novelx_pipeline::set_inspiration_flag(&dir, chapter);
+                }
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
     }
 
     /// Attach the open human gate onto `ui_turns` (HTTP restore) and optionally re-emit WS.
@@ -7075,7 +8719,8 @@ impl NovelxCore {
                 // Legacy draft_exists pending — cleared; situational cards use studio_next.
                 return;
             }
-            let options = self.chapter_next_options(c.published, c.plot_accept_open);
+            let options =
+                self.chapter_next_options(c.published, c.plot_accept_open, c.hard_long);
             let prompt = pending_chapter_next_prompt(&c);
             (prompt, options)
         } else {
@@ -8088,11 +9733,35 @@ impl NovelxCore {
         emit_brief: bool,
     ) -> Result<()> {
         let issues = self.extract_audit_issues(data, project, chapter);
-        let decisions = if let Some(o) = offered.filter(|v| !v.is_empty()) {
+        let mut decisions = if let Some(o) = offered.filter(|v| !v.is_empty()) {
             o
         } else {
             build_fallback_audit_decisions(project, chapter, &issues, queue_active)
         };
+        if self.features.revise_plan() {
+            let streak = self
+                .threads
+                .read()
+                .await
+                .get(thread_id)
+                .map(|t| t.council_same_type_streak)
+                .unwrap_or_else(|| {
+                    let dir = project_dir(&self.roots.projects_root, project);
+                    revise_plan::load_revise_streak(&dir, chapter)
+                });
+            let violations = data
+                .get("content_rule_violations")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            enrich_audit_decisions_with_revise_plan(
+                &self.roots.config_root,
+                &mut decisions,
+                &issues,
+                &violations,
+                streak,
+            );
+        }
         let options = decisions_to_ui_options(&decisions);
         let prompt = audit_fail_prompt(chapter, &issues, queue_active);
         if emit_brief {
@@ -8243,10 +9912,14 @@ impl NovelxCore {
         args: &Value,
         data: &Value,
     ) -> Result<bool> {
-        if tool_name != "audit_chapter"
-            && tool_name != "audit_chapters"
-            && tool_name != "continue_writing"
-        {
+        if !matches!(
+            tool_name,
+            "audit_chapter"
+                | "audit_chapters"
+                | "continue_writing"
+                | "continue_writing_batch"
+                | "revise_chapter"
+        ) {
             return Ok(false);
         }
         // Volume-end prompt takes precedence over audit options.
@@ -8261,7 +9934,8 @@ impl NovelxCore {
             self.emit_todos_from_data(thread_id, data).await;
             return Ok(false);
         }
-        // Passed audit wins over stale needs_user_choice / leftover approval cards.
+        // Passed consistency wins over stale needs_user_choice / leftover approval cards.
+        // Hard content-rule / length blocks are owned by chapter_next（修正本章）, not P0 cards.
         let passed = data.get("consistency_passed").and_then(|v| v.as_bool()) == Some(true);
         if passed {
             self.dismiss_audit_gate(thread_id, turn_id, "复审通过，本轮已正常结束。")
@@ -8584,6 +10258,8 @@ impl NovelxCore {
                 let _ = self.persist_thread(thread_id).await;
             }
         }
+        let active_turn_id = self.active_turn_id(thread_id).await;
+        let composer_phase = self.session_composer_phase(thread_id).await;
         let guard = self.threads.read().await;
         let t = guard.get(thread_id)?;
         let project = t.summary.project.clone();
@@ -8613,6 +10289,8 @@ impl NovelxCore {
             "pending_impact": t.pending_impact,
             "pending_audit_queue": queue,
             "turn_active": turn_active,
+            "active_turn_id": active_turn_id,
+            "composer_phase": composer_phase,
             // Prefer this over client-side hardcoded buttons (gates.yaml is source of truth).
             "open_gate": open_gate,
         }))
@@ -8746,9 +10424,11 @@ impl NovelxCore {
             if c.suggest_next.is_some() {
                 return None;
             }
-            let options = self
-                .gates
-                .chapter_next_options(c.published, c.plot_accept_open);
+            let options = self.gates.chapter_next_options(
+                c.published,
+                c.plot_accept_open,
+                c.hard_long,
+            );
             let prompt = pending_chapter_next_prompt(c);
             return Some(json!({
                 "kind": "chapter_next",
@@ -8825,8 +10505,10 @@ impl NovelxCore {
         &self,
         published: bool,
         plot_accept_open: bool,
+        hard_long: bool,
     ) -> Vec<UserInputOption> {
-        self.gates.chapter_next_options(published, plot_accept_open)
+        self.gates
+            .chapter_next_options(published, plot_accept_open, hard_long)
     }
 
     /// After a passed audit/reaudit: volume gates first, then「继续创作」/「修正本章」.
@@ -8974,10 +10656,7 @@ impl NovelxCore {
         args: &Value,
         data: &Value,
     ) -> Result<bool> {
-        if !matches!(
-            tool_name,
-            "continue_writing" | "revise_chapter" | "audit_chapter" | "audit_chapters"
-        ) {
+        if !is_chapter_gate_tool(tool_name) {
             return Ok(false);
         }
         if data.get("blocked").and_then(|v| v.as_bool()) == Some(true) {
@@ -9019,6 +10698,7 @@ impl NovelxCore {
         let content_blocked =
             data.get("content_rule_blocked").and_then(|v| v.as_bool()) == Some(true);
         let length_blocked = is_length_publish_blocked(data);
+        let hard_long = is_hard_long_length(data);
         let plot_accept_failed =
             data.get("plot_accept_passed").and_then(|v| v.as_bool()) == Some(false);
         // Legacy: published but accept still open. New: accept fail blocks publish.
@@ -9030,7 +10710,91 @@ impl NovelxCore {
         if !published && !content_blocked && !length_blocked && !plot_accept_blocked {
             return Ok(false);
         }
-        let options = self.chapter_next_options(published, plot_accept_open || plot_accept_blocked);
+        // Plot cannot close → suggest material_researcher (inspiration_needed).
+        if plot_accept_blocked {
+            let dir = project_dir(&self.roots.projects_root, &project);
+            let _ = novelx_pipeline::set_inspiration_flag(&dir, chapter);
+        }
+
+        // Clean publish: seal Studio history once per transition, then auto-continue or card.
+        if published && !plot_accept_open {
+            let council_cfg =
+                decision_council::DecisionCouncilConfig::load(&self.roots.config_root);
+            let already_sealed = self
+                .threads
+                .read()
+                .await
+                .get(thread_id)
+                .map(|t| t.history_sealed_pending_write)
+                .unwrap_or(false);
+            if !already_sealed
+                && (self.features.seal_on_chapter_pass()
+                    || (self.features.decision_council()
+                        && council_cfg.kind_enabled("chapter_boundary_seal")))
+            {
+                let seed = format!("第{chapter}章已通过。继续写下一章。");
+                self.seal_chapter_context(
+                    thread_id,
+                    turn_id,
+                    &project,
+                    chapter,
+                    &seed,
+                    &format!(
+                        "第{chapter}章已通过并密封对话上下文（《{project}》）。下一章只使用落盘 Canon。"
+                    ),
+                    true,
+                )
+                .await;
+            }
+            let suppress = self
+                .threads
+                .read()
+                .await
+                .get(thread_id)
+                .map(|t| t.council_suppress_auto_continue)
+                .unwrap_or(false);
+            if self.features.decision_council()
+                && council_cfg.kind_enabled("chapter_next_clean")
+                && !suppress
+            {
+                let next_chapter = {
+                    let dir = project_dir(&self.roots.projects_root, &project);
+                    novelx_pipeline::load_project_state(&dir)
+                        .map(|s| s.next_chapter.max(1))
+                        .unwrap_or(chapter.saturating_add(1))
+                };
+                if let Some(t) = self.threads.write().await.get_mut(thread_id) {
+                    t.council_auto_continue = Some(CouncilAutoContinue {
+                        project: project.clone(),
+                        next_chapter,
+                    });
+                    t.pending_chapter_next = None;
+                }
+                let _ = self.persist_thread(thread_id).await;
+                self.journal_ops(
+                    Some(&project),
+                    Some(thread_id),
+                    Some(turn_id),
+                    Some(chapter),
+                    None,
+                    OpsJournalKind::PublishResult,
+                    format!("chapter_next_clean → auto continue ch{next_chapter}"),
+                    json!({
+                        "council_kind": "chapter_next_clean",
+                        "next_chapter": next_chapter,
+                    }),
+                )
+                .await;
+                // Do not open human chapter_next; caller may drain council_auto_continue.
+                return Ok(false);
+            }
+        }
+
+        let options = self.chapter_next_options(
+            published,
+            plot_accept_open || plot_accept_blocked,
+            hard_long,
+        );
         if options.is_empty() {
             return Ok(false);
         }
@@ -9039,10 +10803,14 @@ impl NovelxCore {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let report = data.get("report").and_then(|v| v.as_str()).unwrap_or("");
+        let length_status = data
+            .get("length_status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let prompt = if published {
             chapter_next_published_prompt(chapter, plot_accept_open)
         } else if length_blocked {
-            chapter_next_length_prompt(chapter, detail)
+            chapter_next_length_prompt(chapter, detail, hard_long)
         } else if plot_accept_blocked {
             format!(
                 "第{chapter}章剧情收束未通过，未发布。请选择：修正本章；也可点「其他」说明要求。"
@@ -9058,10 +10826,16 @@ impl NovelxCore {
                 data,
             )
         };
+        let mut revise_prefer_local: Option<bool> = None;
+        let mut revise_scope: Option<String> = None;
         let revise_instructions = if length_blocked {
-            Some(length_revise_instructions(&self.roots.config_root, detail))
+            Some(length_revise_instructions(
+                &self.roots.config_root,
+                detail,
+                length_status,
+            ))
         } else if content_blocked {
-            Some(hard_rule_revise_instructions_with_data(
+            let spec = hard_rule_revise_spec_with_data(
                 &self.roots.projects_root,
                 &self.roots.config_root,
                 &project,
@@ -9069,7 +10843,10 @@ impl NovelxCore {
                 detail,
                 report,
                 data,
-            ))
+            );
+            revise_prefer_local = Some(spec.prefer_local_patch);
+            revise_scope = Some(spec.revise_scope);
+            Some(spec.instructions)
         } else if plot_accept_open || plot_accept_blocked {
             let rationale = data
                 .get("plot_accept_rationale")
@@ -9094,8 +10871,11 @@ impl NovelxCore {
                 chapter,
                 published,
                 plot_accept_open: plot_accept_flag,
+                hard_long,
                 suggest_next: None,
                 revise_instructions,
+                revise_prefer_local,
+                revise_scope,
                 gate_prompt: Some(prompt.clone()),
             });
             t.ui_turns = attach_ui_approval(
@@ -9144,12 +10924,19 @@ impl NovelxCore {
             pending.chapter,
             pending.published,
             pending.plot_accept_open,
+            pending.hard_long,
         )? {
             GateResolve::Tool { name, mut args } => {
                 if name == "revise_chapter" {
-                    if let Some(instr) = pending.revise_instructions {
-                        if let Some(obj) = args.as_object_mut() {
+                    if let Some(obj) = args.as_object_mut() {
+                        if let Some(instr) = pending.revise_instructions {
                             obj.insert("instructions".into(), json!(instr));
+                        }
+                        if let Some(flag) = pending.revise_prefer_local {
+                            obj.insert("prefer_local_patch".into(), json!(flag));
+                        }
+                        if let Some(scope) = pending.revise_scope {
+                            obj.insert("revise_scope".into(), json!(scope));
                         }
                     }
                 }
@@ -9481,22 +11268,43 @@ impl NovelxCore {
         }
         let summary_markdown = report.summary_markdown(12);
         let hits: Vec<Value> = report.hits.iter().map(ImpactHit::to_json).collect();
+        let pending = PendingImpact {
+            project: project.clone(),
+            source: source.to_json(),
+            hits: hits.clone(),
+            summary_markdown: summary_markdown.clone(),
+            entity_gaps_count: report.entity_gaps_count,
+            resume_tool: tool_name.to_string(),
+            resume_args: args.clone(),
+            resume_data: data.clone(),
+        };
+        // 1C: low-risk impact auto-cascades without human card.
+        if impact_should_auto(&self.roots.config_root, &source, &report) {
+            tracing::info!(
+                %project,
+                hits = hits.len(),
+                "impact: auto-cascade (low risk)"
+            );
+            let summary = self.run_impact_cascade(thread_id, turn_id, &pending).await?;
+            if let Some(t) = self.threads.write().await.get_mut(thread_id) {
+                t.messages.push(ChatMessage {
+                    role: "assistant".into(),
+                    content: format!("已自动同步影响面：\n{summary}"),
+                    tool_call_id: None,
+                    tool_calls: None,
+                    ..Default::default()
+                });
+            }
+            // Do not open a human gate; allow chapter_next / studio_next to proceed.
+            return Ok(false);
+        }
         let prompt = format!(
             "「{tool_name}」已落盘。发现 {} 处可能受影响的依赖位点。是否自动同步修正？\n\n{summary_markdown}",
             hits.len()
         );
         let options = self.gates.impact_confirm_options();
         if let Some(t) = self.threads.write().await.get_mut(thread_id) {
-            t.pending_impact = Some(PendingImpact {
-                project: project.clone(),
-                source: source.to_json(),
-                hits: hits.clone(),
-                summary_markdown: summary_markdown.clone(),
-                entity_gaps_count: report.entity_gaps_count,
-                resume_tool: tool_name.to_string(),
-                resume_args: args.clone(),
-                resume_data: data.clone(),
-            });
+            t.pending_impact = Some(pending);
             // Impact owns the next choice; restore setup/handoff after sync/skip via resume_*.
             t.pending_setup = None;
             t.pending_chapter_next = None;
@@ -9740,7 +11548,7 @@ impl NovelxCore {
         args: &Value,
         data: &Value,
     ) -> Result<bool> {
-        if tool_name != "continue_writing" {
+        if tool_name != "continue_writing" && tool_name != "continue_writing_batch" {
             return Ok(false);
         }
         if data.get("blocked").and_then(|v| v.as_bool()) != Some(true) {
@@ -9965,15 +11773,17 @@ impl NovelxCore {
         args: &Value,
         data: &Value,
     ) -> Result<bool> {
-        let _ = turn_id;
-        if tool_name != "continue_writing" {
+        if tool_name != "continue_writing" && tool_name != "continue_writing_batch" {
             return Ok(false);
         }
         if data.get("blocked").and_then(|v| v.as_bool()) != Some(true) {
             return Ok(false);
         }
         let reason = data.get("reason").and_then(|v| v.as_str()).unwrap_or("");
-        if reason != "planned_inactive" && reason != "need_design_plot" {
+        if !matches!(
+            reason,
+            "planned_inactive" | "need_design_plot" | "missing_exit"
+        ) {
             return Ok(false);
         }
         let project = data
@@ -10000,23 +11810,33 @@ impl NovelxCore {
         } else {
             title
         };
-        let nudge_reason = if reason == "need_design_plot" {
-            "写章被拦：需要进行中的剧情卡".to_string()
-        } else {
-            format!("写章被拦：剧情卡「{title}」尚未激活")
+        let nudge_reason = match reason {
+            "need_design_plot" => "写章被拦：需要进行中的剧情卡".to_string(),
+            "missing_exit" => format!("写章被拦：剧情卡「{title}」缺少可检验的收束条件"),
+            _ => format!("写章被拦：剧情卡「{title}」尚未激活"),
         };
-        self.request_studio_next(
-            thread_id,
-            &project,
-            &nudge_reason,
-            studio_next::StudioNextContext::PlotWrite {
-                kind: reason.to_string(),
-                title,
-                volume,
-            },
-            false,
-        )
-        .await
+        let asked = self
+            .request_studio_next(
+                thread_id,
+                &project,
+                &nudge_reason,
+                studio_next::StudioNextContext::PlotWrite {
+                    kind: reason.to_string(),
+                    title,
+                    volume,
+                },
+                false,
+            )
+            .await?;
+        if asked {
+            // Write-blocking plot gates: surface deterministic options immediately.
+            // Intent path has no Studio loop; agent loop would otherwise pause before
+            // the soft fallback at turn end.
+            let _ = self
+                .maybe_offer_studio_next_fallback(thread_id, turn_id)
+                .await?;
+        }
+        Ok(asked)
     }
 
     /// After plot/chapter setting pass reports BLOCKER — Studio offers situational card.
@@ -10067,6 +11887,10 @@ impl NovelxCore {
         let content_blocked =
             data.get("content_rule_blocked").and_then(|v| v.as_bool()) == Some(true);
         let length_blocked = is_length_publish_blocked(data);
+        let length_status = data
+            .get("length_status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let plot_accept_failed =
             data.get("plot_accept_passed").and_then(|v| v.as_bool()) == Some(false);
         let plot_accept_open = published && plot_accept_failed;
@@ -10076,7 +11900,11 @@ impl NovelxCore {
             && (published || content_blocked || length_blocked || plot_accept_blocked);
         let detail_msg = data.get("message").and_then(|v| v.as_str()).unwrap_or("");
         let revise_instructions = if length_blocked {
-            Some(length_revise_instructions(&self.roots.config_root, detail_msg))
+            Some(length_revise_instructions(
+                &self.roots.config_root,
+                detail_msg,
+                length_status,
+            ))
         } else if content_blocked {
             let report = data.get("report").and_then(|v| v.as_str()).unwrap_or("");
             Some(hard_rule_revise_instructions_with_data(
@@ -10235,20 +12063,34 @@ impl NovelxCore {
                 }
             }
         }
-        let options = self.chapter_next_options(published, plot_accept_open);
+        let hard_long = revise_instructions.as_deref().is_some_and(|s| {
+            s.contains("压缩到") || s.contains("严重超长") || s.contains("拆成两章")
+        });
+        let options = self.chapter_next_options(published, plot_accept_open, hard_long);
         if options.is_empty() {
             return Ok(false);
         }
-        let length_revise = revise_instructions
-            .as_deref()
-            .is_some_and(|s| s.contains("扩写到") || s.contains("完整一章"));
+        let length_revise = revise_instructions.as_deref().is_some_and(|s| {
+            s.contains("扩写到")
+                || s.contains("完整一章")
+                || s.contains("压缩到")
+                || s.contains("严重超长")
+        });
         let plot_accept_revise = revise_instructions
             .as_deref()
             .is_some_and(|s| s.contains("剧情卡收束") || s.contains("收束条件"));
         let prompt = if published {
             chapter_next_published_prompt(chapter, plot_accept_open)
         } else if length_revise {
-            chapter_next_length_prompt(chapter, "正文字数未达发布门槛")
+            chapter_next_length_prompt(
+                chapter,
+                if hard_long {
+                    "正文字数严重超限"
+                } else {
+                    "正文字数未达发布门槛"
+                },
+                hard_long,
+            )
         } else if plot_accept_revise || plot_accept_open {
             format!(
                 "第{chapter}章剧情收束未通过，未发布。请选择：修正本章；也可点「其他」说明要求。"
@@ -10274,14 +12116,19 @@ impl NovelxCore {
                 &Value::Null,
             )
         };
+        let (revise_prefer_local, revise_scope) =
+            infer_revise_gear_from_instructions(revise_instructions.as_deref());
         if let Some(t) = self.threads.write().await.get_mut(thread_id) {
             t.pending_chapter_next = Some(PendingChapterNext {
                 project: project.to_string(),
                 chapter,
                 published,
                 plot_accept_open,
+                hard_long,
                 suggest_next: None,
                 revise_instructions,
+                revise_prefer_local,
+                revise_scope,
                 gate_prompt: Some(prompt.clone()),
             });
             t.ui_turns = attach_ui_approval(
@@ -10853,6 +12700,39 @@ fn resolve_entity_hit_name(project_dir: &std::path::Path, target_ref: &str) -> (
     (kind.into(), slug.to_string())
 }
 
+fn impact_should_auto(
+    config_root: &std::path::Path,
+    source: &ImpactSource,
+    report: &ImpactReport,
+) -> bool {
+    let severity_on = crate::features::FeatureFlags::load(config_root)
+        .map(|f| f.mutation_severity_policy())
+        .unwrap_or(true);
+    if !severity_on {
+        return false;
+    }
+    let policy = novelx_tools::cached_policy(config_root);
+    if !policy.severity_mode {
+        return false;
+    }
+    let src = source.kind.as_str().to_ascii_lowercase();
+    if policy.impact.never_auto_sources.contains(&src) {
+        return false;
+    }
+    if report.hits.len() > policy.impact.auto_max_hits {
+        return false;
+    }
+    if report.hits.iter().any(|h| {
+        let t = h.target_kind.as_str().to_ascii_lowercase();
+        policy.impact.never_auto_targets.contains(&t)
+            || (policy.impact.block_auto_on_draft_targets
+                && h.target_kind == ImpactTargetKind::Draft)
+    }) {
+        return false;
+    }
+    true
+}
+
 fn consolidate_impact_hits(hits: Vec<ImpactHit>) -> Vec<ImpactHit> {
     use std::collections::BTreeMap;
     let mut map: BTreeMap<String, ImpactHit> = BTreeMap::new();
@@ -11118,7 +12998,7 @@ fn focus_for_rule_hints(hints: &[&str]) -> &'static str {
     } else if hints.iter().any(|h| *h == "countdown") {
         "理顺倒计时/剩余时长：当前读数须单调不增；回忆初始值标明「最初/原先」。"
     } else if hints.iter().any(|h| *h == "body") {
-        "对齐身体状态板：伤势侧别/部位与能力载体不得无交代对调。"
+        "优先删除对侧点名或改为症状/动作限制句（颤抖、冷汗、握力发虚）；仅当分侧剧情需要时对齐状态板；能力载体禁止默默对调。"
     } else if hints.iter().any(|h| *h == "pipeline") {
         "删除章纲/大纲/设定对读与作者纠错释义，只保留场面叙述。"
     } else if hints.iter().any(|h| *h == "banned") {
@@ -11251,8 +13131,72 @@ fn collect_hard_rule_bullets_with_data(
     (bullets, rule_hints)
 }
 
+/// Collapse mutual-exclusive body-side locks (左X + 右X same site) into one actionable bullet.
+fn coalesce_bilateral_body_side_bullets(bullets: Vec<String>) -> Vec<String> {
+    const SITES: &[&str] = &[
+        "肩", "臂", "手", "掌", "腕", "腿", "膝", "踝", "指", "肋",
+    ];
+    let mut left_sites = std::collections::HashSet::<String>::new();
+    let mut right_sites = std::collections::HashSet::<String>::new();
+    for b in &bullets {
+        if !(b.contains("身体状态板锁定") || b.contains("身体侧别") || b.contains("[身体状态]")) {
+            continue;
+        }
+        for site in SITES {
+            let l = format!("「左{site}」");
+            let r = format!("「右{site}」");
+            if b.contains(&l) {
+                left_sites.insert((*site).to_string());
+            }
+            if b.contains(&r) {
+                right_sites.insert((*site).to_string());
+            }
+        }
+    }
+    let both: Vec<String> = left_sites.intersection(&right_sites).cloned().collect();
+    if both.is_empty() {
+        return bullets;
+    }
+    let mut out = Vec::new();
+    for b in bullets {
+        let mut drop = false;
+        if b.contains("身体状态板锁定") || b.contains("身体侧别") || b.contains("[身体状态]") {
+            for site in &both {
+                let l = format!("「左{site}」");
+                let r = format!("「右{site}」");
+                if b.contains(&l) || b.contains(&r) {
+                    drop = true;
+                    break;
+                }
+            }
+        }
+        if !drop {
+            out.push(b);
+        }
+    }
+    let mut sites_sorted = both;
+    sites_sorted.sort();
+    let sites_zh = sites_sorted.join("、");
+    out.insert(
+        0,
+        format!(
+            "· [身体侧别] 状态板双侧均有「{sites_zh}」记录：勿否认任一侧；无关动作改为症状/动作限制承接，勿为对齐而互斥点名左右。"
+        ),
+    );
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Concrete revise instructions for「修正本章」after a hard-rule block.
-fn hard_rule_revise_instructions_with_data(
+/// Hard-rule revise gear from RevisePlan + coalesced violation bullets.
+struct HardRuleReviseSpec {
+    instructions: String,
+    prefer_local_patch: bool,
+    revise_scope: String,
+}
+
+fn hard_rule_revise_spec_with_data(
     projects_root: &std::path::Path,
     config_root: &std::path::Path,
     project: &str,
@@ -11260,7 +13204,7 @@ fn hard_rule_revise_instructions_with_data(
     message: &str,
     report: &str,
     data: &Value,
-) -> String {
+) -> HardRuleReviseSpec {
     let (bullets, rule_hints) = collect_hard_rule_bullets_with_data(
         projects_root,
         config_root,
@@ -11270,13 +13214,109 @@ fn hard_rule_revise_instructions_with_data(
         report,
         data,
     );
+    let bullets = coalesce_bilateral_body_side_bullets(bullets);
     let focus = focus_for_rule_hints(&rule_hints);
-    let mut out = format!("硬规则阻断第{chapter}章发布。只改违规句，勿整章重写。{focus}");
+
+    let mut violations: Vec<Value> = data
+        .get("content_rule_violations")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if violations.is_empty() {
+        // Reconstruct rule ids from hints / live draft when structured data missing.
+        for h in &rule_hints {
+            let rule = match *h {
+                "body" => "body_state_side",
+                "daypart" => "timeline_daypart_regression",
+                "countdown" => "timeline_countdown_jump",
+                "meta" => "meta_chapter_ref",
+                "banned" => "banned_name",
+                _ => "",
+            };
+            if !rule.is_empty() {
+                violations.push(json!({"rule": rule, "message": focus, "blocking": true}));
+            }
+        }
+    }
+
+    let plan_cfg = revise_plan::RevisePlanConfig::load(config_root);
+    let plan = if FeatureFlags::load(config_root)
+        .map(|f| f.revise_plan())
+        .unwrap_or(true)
+    {
+        revise_plan::build_revise_plan(&plan_cfg, &[], &violations, 0)
+    } else {
+        revise_plan::RevisePlan {
+            scope: revise_plan::ReviseScope::Local,
+            issue_ids: vec![],
+            hard_gates: vec![],
+            instructions: String::new(),
+            rationale: String::new(),
+            prefer_local_patch: true,
+        }
+    };
+
+    let mut out = if plan.scope == revise_plan::ReviseScope::Full {
+        let mut s = if plan.instructions.is_empty() {
+            format!("硬规则阻断第{chapter}章发布。整章修订（非局部补丁）。{focus}")
+        } else {
+            format!("硬规则阻断第{chapter}章发布。\n{}", plan.instructions)
+        };
+        if !s.contains(focus) && !focus.is_empty() {
+            s.push('\n');
+            s.push_str(focus);
+        }
+        s
+    } else {
+        format!("硬规则阻断第{chapter}章发布。只改违规句，勿整章重写。{focus}")
+    };
     if !bullets.is_empty() {
         out.push_str("\n必须处理：\n");
         out.push_str(&bullets.join("\n"));
     }
-    out
+    let _ = projects_root;
+    let _ = project;
+    HardRuleReviseSpec {
+        instructions: out,
+        prefer_local_patch: plan.prefer_local_patch,
+        revise_scope: plan.scope.as_str().to_string(),
+    }
+}
+
+fn hard_rule_revise_instructions_with_data(
+    projects_root: &std::path::Path,
+    config_root: &std::path::Path,
+    project: &str,
+    chapter: u32,
+    message: &str,
+    report: &str,
+    data: &Value,
+) -> String {
+    hard_rule_revise_spec_with_data(
+        projects_root,
+        config_root,
+        project,
+        chapter,
+        message,
+        report,
+        data,
+    )
+    .instructions
+}
+
+fn infer_revise_gear_from_instructions(
+    instr: Option<&str>,
+) -> (Option<bool>, Option<String>) {
+    let Some(s) = instr else {
+        return (None, None);
+    };
+    if s.contains("整章修订") || s.contains("非局部补丁") {
+        (Some(false), Some("full".into()))
+    } else if s.contains("只改违规句") || s.contains("局部修订") {
+        (Some(true), Some("local".into()))
+    } else {
+        (None, None)
+    }
 }
 
 /// Prompt for content-rule block: include concrete violation lines from tool output when present.
@@ -11290,12 +13330,37 @@ fn chapter_next_published_prompt(chapter: u32, plot_accept_open: bool) -> String
     }
 }
 
-/// True when publish was blocked by chapter length hard gate / SoftShort streak escalate.
+/// True when publish was blocked by chapter length hard gate / SoftShort streak escalate / HardLong.
+/// Queue-aware re-audit tool after revise / council AutoRevise.
+fn reaudit_tool_name(has_audit_queue: bool) -> &'static str {
+    if has_audit_queue {
+        "audit_chapters"
+    } else {
+        "audit_chapter"
+    }
+}
+
+/// When Decision Council takes an audit fail, keep the parent audit tool card
+/// `in_progress` until steer/reaudit finish (nested into the same item).
+fn should_defer_audit_item_completed(
+    tool_name: &str,
+    council_took_audit: bool,
+    status_completed: bool,
+) -> bool {
+    council_took_audit
+        && status_completed
+        && matches!(tool_name, "audit_chapter" | "audit_chapters")
+}
+
 fn is_length_publish_blocked(data: &Value) -> bool {
     matches!(
         data.get("length_status").and_then(|v| v.as_str()).unwrap_or(""),
-        "hard_short" | "soft_short_escalated"
+        "hard_short" | "soft_short_escalated" | "hard_long"
     )
+}
+
+fn is_hard_long_length(data: &Value) -> bool {
+    data.get("length_status").and_then(|v| v.as_str()) == Some("hard_long")
 }
 
 /// Clean write/revise publish: eligible for narration-before-chapter_next.
@@ -11310,18 +13375,125 @@ fn write_result_is_clean_publish(tool_name: &str, data: &Value) -> bool {
         && data.get("consistency_passed").and_then(|v| v.as_bool()) != Some(false)
 }
 
-fn length_revise_instructions(config_root: &std::path::Path, detail: &str) -> String {
-    let budget = novelx_harness::ChapterBudget::load_from_config_root(config_root);
-    let mut msg = format!(
-        "扩写到{}字完整一章；保持情节与人物一致，补足场景与对话，勿注水、勿另起主线。",
-        budget.range_label()
+/// Tools whose stop/fail must surface a chapter human gate (audit / chapter_next / plot).
+fn is_chapter_gate_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "continue_writing" | "continue_episode" | "continue_writing_batch" | "revise_chapter" | "revise_episode"
+            | "audit_chapter" | "audit_chapters"
+    )
+}
+
+/// Flatten `continue_writing_batch` result into a single-chapter gate payload.
+/// Other tools: return `data` unchanged.
+fn chapter_gate_data_from_tool(tool_name: &str, data: &Value) -> Value {
+    if tool_name != "continue_writing_batch" {
+        return data.clone();
+    }
+    let project = data.get("project").cloned().unwrap_or(Value::Null);
+    let stopped = data
+        .get("stopped_reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let Some(results) = data.get("results").and_then(|v| v.as_array()) else {
+        return data.clone();
+    };
+    let last = results
+        .iter()
+        .rev()
+        .find(|r| {
+            r.get("published").and_then(|v| v.as_bool()) != Some(true)
+                || r.get("blocked").and_then(|v| v.as_bool()) == Some(true)
+        })
+        .or_else(|| results.last());
+    let Some(last) = last else {
+        return data.clone();
+    };
+    let mut out = last
+        .get("run")
+        .filter(|r| !r.is_null())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let Some(obj) = out.as_object_mut() else {
+        return data.clone();
+    };
+    obj.insert("project".into(), project);
+    if let Some(ch) = last.get("chapter") {
+        obj.insert("chapter".into(), ch.clone());
+    }
+    let reason = last
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            stopped
+                .strip_prefix("plot_gate:")
+                .map(|s| s.to_string())
+        });
+    if let Some(r) = reason {
+        obj.insert("reason".into(), json!(r));
+    }
+    obj.insert(
+        "blocked".into(),
+        json!(last.get("blocked").and_then(|v| v.as_bool()).unwrap_or(true)),
     );
+    obj.insert(
+        "published".into(),
+        json!(last
+            .get("published")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)),
+    );
+    obj.insert(
+        "needs_user_choice".into(),
+        json!(last
+            .get("needs_user_choice")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)),
+    );
+    if let Some(msg) = last.get("message") {
+        obj.insert("message".into(), msg.clone());
+    }
+    obj.insert("batch_stopped_reason".into(), json!(stopped));
+    obj.insert(
+        "batch_published".into(),
+        data.get("chapters_published")
+            .cloned()
+            .unwrap_or(json!(0)),
+    );
+    obj.insert(
+        "batch_attempted".into(),
+        data.get("chapters_attempted")
+            .cloned()
+            .unwrap_or(json!(0)),
+    );
+    out
+}
+
+fn length_revise_instructions(
+    config_root: &std::path::Path,
+    detail: &str,
+    length_status: &str,
+) -> String {
+    let budget = novelx_harness::ChapterBudget::load_from_config_root(config_root);
+    let mut msg = if length_status == "hard_long" {
+        budget.compress_revise_instructions()
+    } else {
+        format!(
+            "扩写到{}字完整一章；保持情节与人物一致，补足场景与对话，勿注水、勿另起主线。",
+            budget.range_label()
+        )
+    };
     let hint: String = detail
         .lines()
         .map(str::trim)
         .filter(|l| {
             !l.is_empty()
-                && (l.contains("字数") || l.contains("偏短") || l.contains("硬门控"))
+                && (l.contains("字数")
+                    || l.contains("偏短")
+                    || l.contains("偏长")
+                    || l.contains("超限")
+                    || l.contains("硬门控"))
         })
         .take(3)
         .collect::<Vec<_>>()
@@ -11333,15 +13505,31 @@ fn length_revise_instructions(config_root: &std::path::Path, detail: &str) -> St
     msg
 }
 
-fn chapter_next_length_prompt(chapter: u32, tool_message: &str) -> String {
+fn chapter_next_length_prompt(chapter: u32, tool_message: &str, hard_long: bool) -> String {
     let hint = tool_message
         .lines()
         .map(str::trim)
-        .find(|l| l.contains("字数") || l.contains("偏短") || l.contains("硬门控"))
-        .unwrap_or("正文字数未达发布门槛");
-    format!(
-        "第{chapter}章因字数未发布（{hint}）。请选择：修正本章（扩写）；也可点「其他」说明要求。"
-    )
+        .find(|l| {
+            l.contains("字数")
+                || l.contains("偏短")
+                || l.contains("偏长")
+                || l.contains("超限")
+                || l.contains("硬门控")
+        })
+        .unwrap_or(if hard_long {
+            "正文字数严重超限"
+        } else {
+            "正文字数未达发布门槛"
+        });
+    if hard_long {
+        format!(
+            "第{chapter}章因字数严重超限未发布（{hint}）。请选择：拆成两章，或修正本章（压缩）；也可点「其他」说明要求。"
+        )
+    } else {
+        format!(
+            "第{chapter}章因字数未发布（{hint}）。请选择：修正本章（扩写）；也可点「其他」说明要求。"
+        )
+    }
 }
 
 fn chapter_next_hard_rule_prompt(chapter: u32, tool_message: &str) -> String {
@@ -11402,6 +13590,7 @@ fn chapter_next_hard_rule_prompt_rich_with_data(
         report,
         data,
     );
+    let bullets = coalesce_bilateral_body_side_bullets(bullets);
     if !bullets.is_empty() {
         return format!(
             "第{chapter}章因硬规则未发布：\n{}\n\n请选择：修正本章；也可点「其他」说明要求。",
@@ -11437,8 +13626,12 @@ fn pending_chapter_next_prompt(pending: &PendingChapterNext) -> String {
         return chapter_next_published_prompt(pending.chapter, pending.plot_accept_open);
     }
     if let Some(instr) = pending.revise_instructions.as_deref() {
-        if instr.contains("扩写到") || instr.contains("完整一章") {
-            return chapter_next_length_prompt(pending.chapter, instr);
+        if instr.contains("扩写到")
+            || instr.contains("完整一章")
+            || instr.contains("压缩到")
+            || pending.hard_long
+        {
+            return chapter_next_length_prompt(pending.chapter, instr, pending.hard_long);
         }
         if instr.contains("收束") {
             return format!(
@@ -11509,9 +13702,37 @@ mod tests {
         assert!(is_length_publish_blocked(
             &json!({"length_status": "soft_short_escalated"})
         ));
+        assert!(is_length_publish_blocked(&json!({"length_status": "hard_long"})));
+        assert!(is_hard_long_length(&json!({"length_status": "hard_long"})));
         assert!(!is_length_publish_blocked(&json!({"length_status": "soft_short"})));
+        assert!(!is_length_publish_blocked(&json!({"length_status": "soft_long"})));
         assert!(!is_length_publish_blocked(&json!({"length_status": "ok"})));
         assert!(!is_length_publish_blocked(&json!({})));
+    }
+
+    #[test]
+    fn defer_audit_item_completed_only_for_council_on_audit_tools() {
+        assert!(should_defer_audit_item_completed(
+            "audit_chapters",
+            true,
+            true
+        ));
+        assert!(should_defer_audit_item_completed("audit_chapter", true, true));
+        assert!(!should_defer_audit_item_completed(
+            "audit_chapters",
+            false,
+            true
+        ));
+        assert!(!should_defer_audit_item_completed(
+            "continue_writing",
+            true,
+            true
+        ));
+        assert!(!should_defer_audit_item_completed(
+            "audit_chapters",
+            true,
+            false
+        ));
     }
 
     #[test]
@@ -11540,11 +13761,161 @@ mod tests {
     }
 
     #[test]
+    fn batch_gate_data_flattens_last_unpublished_run() {
+        let batch = json!({
+            "project": "sample-novel",
+            "chapters_attempted": 2,
+            "chapters_published": 1,
+            "stopped_reason": "consistency_fail",
+            "results": [
+                {
+                    "chapter": 1,
+                    "published": true,
+                    "blocked": false,
+                    "needs_user_choice": false,
+                    "run": {
+                        "published": true,
+                        "consistency_passed": true
+                    }
+                },
+                {
+                    "chapter": 2,
+                    "published": false,
+                    "blocked": false,
+                    "needs_user_choice": true,
+                    "reason": "consistency_fail",
+                    "message": "一致性未通过",
+                    "run": {
+                        "published": false,
+                        "consistency_passed": false,
+                        "content_rule_blocked": false,
+                        "issues": [{"id": "i1", "severity": true}]
+                    }
+                }
+            ]
+        });
+        let gate = chapter_gate_data_from_tool("continue_writing_batch", &batch);
+        assert_eq!(gate.get("project").and_then(|v| v.as_str()), Some("sample-novel"));
+        assert_eq!(gate.get("chapter").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(
+            gate.get("consistency_passed").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(gate.get("published").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            gate.get("needs_user_choice").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            gate.get("batch_stopped_reason").and_then(|v| v.as_str()),
+            Some("consistency_fail")
+        );
+        assert_eq!(gate.get("batch_published").and_then(|v| v.as_u64()), Some(1));
+        assert!(gate.get("issues").and_then(|v| v.as_array()).is_some());
+
+        // Non-batch tools pass through unchanged.
+        let single = json!({"chapter": 3, "consistency_passed": false});
+        assert_eq!(
+            chapter_gate_data_from_tool("revise_chapter", &single),
+            single
+        );
+    }
+
+    #[test]
+    fn batch_gate_data_prefers_plot_gate_over_published_tail() {
+        let batch = json!({
+            "project": "sample-novel",
+            "chapters_attempted": 1,
+            "chapters_published": 0,
+            "stopped_reason": "plot_gate:planned_inactive",
+            "results": [{
+                "chapter": 14,
+                "published": false,
+                "blocked": true,
+                "reason": "planned_inactive",
+                "message": "剧情卡未激活",
+                "run": null
+            }]
+        });
+        let gate = chapter_gate_data_from_tool("continue_writing_batch", &batch);
+        assert_eq!(gate.get("blocked").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            gate.get("reason").and_then(|v| v.as_str()),
+            Some("planned_inactive")
+        );
+        assert_eq!(gate.get("chapter").and_then(|v| v.as_u64()), Some(14));
+    }
+
+    #[test]
     fn length_prompt_mentions_expand() {
-        let p = chapter_next_length_prompt(3, "正文字数 4200，低于硬门控 4500");
+        let p = chapter_next_length_prompt(3, "正文字数 4200，低于硬门控 4500", false);
         assert!(p.contains("第3章"));
         assert!(p.contains("字数"));
         assert!(p.contains("修正本章"));
+    }
+
+    #[test]
+    fn bilateral_body_side_bullets_coalesce_for_revise() {
+        let data = json!({
+            "content_rule_violations": [
+                {
+                    "rule": "body_state_side",
+                    "message": "身体状态板锁定「左手」（依据：左手伤），正文却出现「右手」且未见转移/愈合交代。",
+                    "blocking": true
+                },
+                {
+                    "rule": "body_state_side",
+                    "message": "身体状态板锁定「右手」（依据：右手伤），正文却出现「左手」且未见转移/愈合交代。",
+                    "blocking": true
+                }
+            ]
+        });
+        let instr = hard_rule_revise_instructions_with_data(
+            std::path::Path::new("/tmp"),
+            std::path::Path::new("config"),
+            "sample-novel",
+            14,
+            "完成，但有硬规则阻断",
+            "",
+            &data,
+        );
+        assert!(
+            instr.contains("双侧均有") && instr.contains("症状"),
+            "expected coalesced bilateral guidance, got: {instr}"
+        );
+        assert!(
+            !instr.contains("锁定「左手」") || !instr.contains("锁定「右手」"),
+            "must not keep mutual-exclusive lock pair: {instr}"
+        );
+        assert!(
+            instr.contains("整章修订") || instr.contains("非局部补丁") || instr.contains("状态板"),
+            "body_state must force full revise plan: {instr}"
+        );
+        let spec = hard_rule_revise_spec_with_data(
+            std::path::Path::new("/tmp"),
+            std::path::Path::new("config"),
+            "sample-novel",
+            14,
+            "完成，但有硬规则阻断",
+            "",
+            &data,
+        );
+        assert!(!spec.prefer_local_patch, "body_state → full");
+        assert_eq!(spec.revise_scope, "full");
+        let gate = chapter_next_hard_rule_prompt_rich_with_data(
+            std::path::Path::new("/tmp"),
+            std::path::Path::new("config"),
+            "sample-novel",
+            14,
+            "完成，但有硬规则阻断",
+            "",
+            &data,
+        );
+        assert!(gate.contains("双侧均有"), "gate prompt: {gate}");
+        assert!(
+            !(gate.contains("锁定「左手」") && gate.contains("锁定「右手」")),
+            "gate must not list exclusive pair: {gate}"
+        );
     }
 
     #[test]
@@ -11598,12 +13969,15 @@ mod tests {
             chapter: 5,
             published: false,
             plot_accept_open: false,
+            hard_long: false,
             suggest_next: None,
             revise_instructions: Some(
                 "硬规则阻断第5章发布。只改违规句。\n必须处理：\n\
 · 章内时段叙述回跳：约第5行已到「夜晚」，约第9行又写「凌晨」。"
                     .into(),
             ),
+            revise_prefer_local: Some(true),
+            revise_scope: Some("local".into()),
             gate_prompt: Some(
                 "第5章因硬规则未发布。请选择：修正本章；也可点「其他」说明要求。".into(),
             ),
@@ -11628,8 +14002,11 @@ mod tests {
             chapter: 4,
             published: false,
             plot_accept_open: false,
+            hard_long: false,
             suggest_next: None,
             revise_instructions: None,
+            revise_prefer_local: None,
+            revise_scope: None,
             gate_prompt: Some(
                 "第4章因硬规则未发布：\n· 章内时段叙述回跳：夜晚→凌晨\n\n请选择：修正本章；也可点「其他」说明要求。"
                     .into(),
@@ -11703,6 +14080,12 @@ mod tests {
             "## 第17章审校未通过\n\n### 问题清单\n1. `p0` "
         ));
         assert!(!is_audit_checklist_text("复审通过，本轮已正常结束。"));
+    }
+
+    #[test]
+    fn reaudit_after_revise_prefers_queue_continue() {
+        assert_eq!(reaudit_tool_name(true), "audit_chapters");
+        assert_eq!(reaudit_tool_name(false), "audit_chapter");
     }
 
     #[test]

@@ -326,6 +326,15 @@ mod tests {
     }
 
     #[test]
+    fn best_effort_prefixes_bare_h1_title() {
+        // Specialists sometimes drop「第N章」and leave `# 标题`.
+        let text = format!("# 夹层之下\n\n{}\n", long_body());
+        let (out, issues) = normalize_draft_best_effort(5, &text);
+        assert!(issues.is_empty(), "{issues:?}");
+        assert!(out.starts_with("# 第5章 夹层之下"), "{out}");
+    }
+
+    #[test]
     fn best_effort_strips_markdown_fence() {
         let text = format!("```markdown\n# 第1章 门\n\n{}\n```", long_body());
         let (out, issues) = normalize_draft_best_effort(1, &text);

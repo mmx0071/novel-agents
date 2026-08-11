@@ -19,16 +19,21 @@ pub mod run;
 pub mod schemas;
 pub mod setting_audit;
 pub mod setting_pass;
+pub mod split_chapter;
 pub mod volume;
 pub mod volume_audit;
 pub mod volume_drift;
 pub mod volume_pack;
 pub mod volume_sync;
 pub mod lore_index;
+pub mod materials;
 pub mod cold_archive;
 pub mod cost_log;
+pub mod version_nodes;
 pub mod volume_audit_gate;
 pub mod volume_checklist;
+pub mod volume_qa;
+pub mod foreshadow_phase;
 
 pub use cards::{
     collect_entity_gaps, detect_location_parent, entity_names_equivalent, entity_status_is_active,
@@ -37,7 +42,8 @@ pub use cards::{
     resolve_entity_card_path, resolve_location_write_target, MarkdownCard,
 };
 pub use batch::{
-    run_continue_batch, BatchChapterResult, BatchContinueOpts, BatchContinueResult,
+    apply_unattended_batch_policy, run_continue_batch, BatchChapterResult, BatchContinueOpts,
+    BatchContinueResult,
 };
 pub use body_state::{
     check_body_state_conflicts, check_body_state_locus_conflicts, check_body_state_side_conflicts,
@@ -57,8 +63,9 @@ pub use expected_events::{
     ExpectedConditions, ExpectedEvent, ExpectedEventStore, ExpectedReview,
 };
 pub use foreshadow::{
-    format_dangling_for_context, format_dangling_for_tracker, load_foreshadow_index,
-    rebuild_foreshadow_index, ForeshadowIndex,
+    classify_foreshadow_debt, format_dangling_for_context, format_dangling_for_tracker,
+    foreshadow_debt_breakdown, load_foreshadow_index, normalize_foreshadow_horizon,
+    rebuild_foreshadow_index, ForeshadowDebtBreakdown, ForeshadowDebtClass, ForeshadowIndex,
 };
 pub use activation_hints::{
     collect_studio_activation_hints, format_studio_activation_hints_block,
@@ -83,7 +90,8 @@ pub use plots::{
     accept_verdict_is_pass, accept_verdict_is_pass_against, active_plot_exit_context,
     advance_plots_for_published_chapter, check_plot_write_gate, check_plot_write_gate_with,
     complete_active_plot_on_accept, complete_bridging_plots_after_publish,
-    in_progress_plot_missing_exit, ensure_bridge_plot_active, ensure_plot_card_lifecycle_frontmatter,
+    in_progress_plot_missing_exit, ensure_bridge_plot_active, ensure_next_plot_card,
+    ensure_plot_card_lifecycle_frontmatter,
     extract_plot_exit_condition, format_plot_progress_report, format_plot_progress_report_for,
     list_plots_summary,
     load_plot_cards_by_progress, load_plot_index, volume_has_open_plot_work,
@@ -102,21 +110,23 @@ pub use phases::{
 };
 pub use project::{
     chapter_dir, chapter_memory_artifact_matches_draft, delete_chapter, draft_fingerprint,
-    init_project, list_chapter_numbers, list_projects, load_project_state, project_dir,
-    read_chapter_draft, read_chapter_outline, refresh_meta_flags, save_project_state,
-    sync_records_novel_json, update_target_chapters, write_chapter_draft,
-    write_chapter_memory_artifact, write_chapter_outline, DeleteChapterResult, ProjectState,
+    init_project, init_project_with_mode, is_short_drama, list_chapter_numbers, list_projects,
+    load_project_state, project_dir, read_chapter_draft, read_chapter_outline, refresh_meta_flags,
+    resolve_project_mode, save_project_state, sync_records_novel_json, unit_body_filename,
+    update_target_chapters, write_chapter_draft, write_chapter_memory_artifact, write_chapter_outline,
+    write_chapter_outline_budget, DeleteChapterResult, ProjectMode, ProjectState,
 };
 pub use schemas::{
     display_arc_outline, display_bible, display_chapter_outline, display_draft, display_entity_card,
-    display_entity_gaps, display_master_outline, display_plot_card_body, draft_body_chars,
-    migrate_project_reader_formats, outline_entity_roster, parse_chapter_outline_text,
-    validate_arc_outline, validate_bible,
+    display_entity_gaps, display_master_outline, display_plot_card_body, display_script,
+    draft_body_chars, migrate_project_reader_formats, normalize_script_best_effort,
+    outline_budget_repair_hint, outline_entity_roster, parse_chapter_outline_text,
+    parse_chapter_outline_text_budget, validate_arc_outline, validate_bible,
     normalize_draft_best_effort, normalize_plot_card_best_effort, validate_chapter_outline,
-    validate_draft, validate_entity_card, validate_master_outline, validate_plot_card,
-    ChapterOutline, EntityKind, MigrateReport,
-    OutlineEntityRoster,
-    SchemaError, MIN_DRAFT_BODY_CHARS,
+    validate_chapter_outline_budget, validate_draft, validate_entity_card, validate_master_outline,
+    validate_plot_card, validate_script, ChapterOutline, EntityKind, MigrateReport,
+    OutlineEntityRoster, OutlineValidateMode, SchemaError, MAX_KEY_EVENTS, MIN_DRAFT_BODY_CHARS,
+    MIN_SCRIPT_BODY_CHARS,
 };
 pub use run::{
     apply_cached_local_patches, execute_pipeline, execute_pipeline_with_steps,
@@ -138,8 +148,17 @@ pub use volume_audit::{
     run_volume_audit, volume_audit_report_path, volume_has_audit_report, VolumeAuditReport,
 };
 pub use volume_audit_gate::{
-    check_volume_audit_for_continue, check_volume_audit_for_sync, find_config_root,
-    mid_audit_threshold_resolved, thick_volume_threshold_resolved, VolumeAuditGateBlock,
+    check_volume_audit_for_continue, check_volume_audit_for_continue_ex,
+    check_volume_audit_for_sync, find_config_root, mid_audit_threshold_resolved,
+    thick_volume_threshold_resolved, VolumeAuditGateBlock,
+};
+pub use volume_qa::{
+    clear_volume_qa_mid_due, mark_volume_qa_mid_skipped, resolve_volume_qa_phase,
+    set_volume_qa_phase, VolumeQaPhase,
+};
+pub use foreshadow_phase::{
+    foreshadow_batch_block_message, foreshadow_phase_advice, resolve_foreshadow_phase,
+    set_foreshadow_phase, ForeshadowPhase, ForeshadowPhaseSnapshot,
 };
 pub use volume_checklist::{
     run_volume_memory_checklist, ChecklistItem, VolumeMemoryChecklist,
@@ -151,8 +170,15 @@ pub use volume_drift::{
 pub use volume_pack::{gather_volume_layered_pack, LayeredVolumePack, VOLUME_PACK_CHAR_CAP};
 pub use lore_index::{
     ensure_lore_index, list_chapters_from_index, query_entities_from_index,
-    query_open_foreshadow_from_index, remove_chapter_index_row, upsert_chapter_index_row,
-    upsert_entity_index_row, upsert_foreshadow_index_row, LoreIndex,
+    query_open_foreshadow_from_index, rebuild_lore_index_from_disk, remove_chapter_index_row,
+    upsert_chapter_index_row, upsert_entity_index_row, upsert_foreshadow_index_row, LoreIndex,
+};
+pub use materials::{
+    clear_drought_flag, clear_inspiration_flag, drought_flag_active,
+    format_material_hooks_for_context, inspiration_flag_active, load_material_runtime_config,
+    load_materials_index, material_cooldown_allows, material_research_prompt,
+    parse_material_cards_json, read_project_brief, save_material_cards, set_drought_flag,
+    set_inspiration_flag, MaterialCard, MaterialRuntimeConfig, MaterialsIndex,
 };
 pub use cold_archive::{
     maybe_cold_archive_volume, read_chapter_draft_resolved, ColdArchiveResult,
@@ -173,6 +199,12 @@ pub use setting_audit::{
 pub use setting_pass::{
     run_chapter_setting_pass, run_plot_setting_pass, ChapterSettingPassFlags,
     PlotSettingPassFlags, PlotSettingPassResult,
+};
+pub use split_chapter::{chapter_looks_overlong, split_chapter_draft, SplitChapterResult};
+pub use version_nodes::{
+    commit_node, ensure_repo as ensure_version_repo, git_available as version_git_available,
+    list_nodes as list_version_nodes, post_restore_disk_hooks,
+    restore_node as restore_version_node, VersionNode,
 };
 pub use volume_sync::{
     apply_volume_sync_json, run_chapter_sync, run_plot_sync, run_volume_sync, VolumeSyncReport,

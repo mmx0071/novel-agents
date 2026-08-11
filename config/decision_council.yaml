@@ -1,0 +1,68 @@
+# Decision Council — multi-agent scoring for auto-resolve; escalate only on deadlock / infra / max retries.
+# Strategies & thresholds live here; Rust loads and aggregates generically.
+version: 1
+
+kinds:
+  audit_content:
+    enabled: true
+    # One auto-revise round then escalate (was 2 — caused same-chapter thrash).
+    max_auto_retries: 1
+    # Same P0 types still open across this many council looks → stop auto-revise.
+    same_type_streak_limit: 2
+    min_score: 70
+    # Mutually exclusive preferred_action scores within this margin → human gate.
+    deadlock_epsilon: 8
+    # Engine hard-blocks auto-accept when true P0 issues remain.
+    allow_auto_accept_p0: false
+    members:
+      - role: consistency_auditor
+        weight: 2
+        veto: true
+      - role: pacing_reviewer
+        weight: 1
+        veto: false
+      - role: plot_acceptor
+        weight: 1
+        veto: false
+
+  # Clean publish auto-continues writing (1C self-confirm). Disable to force chapter_next card.
+  chapter_next_clean:
+    enabled: true
+
+  chapter_boundary_seal:
+    enabled: true
+    # When continue_writing_batch runs, seal Studio history at batch start/end.
+    batch_per_chapter: true
+
+material_researcher:
+  enabled: true
+  cooldown_chapters: 5
+  max_cards_per_call: 3
+  # Inject short hooks into these steps only (not writer by default).
+  inject_into:
+    - design_plot
+    - chapter_planner
+  motif_from:
+    - brief
+    - bible_themes
+  # Max chars of material hooks in CanonContext / design brief.
+  inject_chars: 900
+
+# Deterministic Plan → Execute before council/human steer_run revise.
+# Feature: studio.revise_plan. Does not auto-mutate body_state boards.
+revise_plan:
+  enabled: true
+  # P0 types that force full-chapter revise (uppercase).
+  full_scope_p0_types:
+    - TIMELINE
+    - INJURY
+    - CONTINUITY
+    - BODY
+    - ABILITY_LOC
+  full_scope_hard_rules:
+    - body_state_side
+    - body_state_locus
+    - timeline_daypart_regression
+    - timeline_countdown_jump
+  # Same-type streak ≥ this → promote local → full on the auto-revise round.
+  promote_to_full_after_streak: 1

@@ -30,6 +30,10 @@ pub struct ActivationSignals {
     pub bible_stale: bool,
     /// Volume phase is handoff / awaiting sync (long-range QA hint).
     pub volume_handoff: bool,
+    /// Plot drought flag (`.novelx/plot_drought.json`) — suggest material_researcher.
+    pub plot_drought: bool,
+    /// Inspiration needed flag (`.novelx/inspiration_needed.json`).
+    pub inspiration_needed: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,7 +45,14 @@ struct AgentsFile {
 #[derive(Debug, Deserialize)]
 struct AgentEntry {
     #[serde(default)]
+    tier: Option<String>,
+    #[serde(default)]
     activation: Vec<ActivationRule>,
+    /// Dead field — order comes from `pipeline.yaml`. Accepted only so stale YAML
+    /// still parses; never used for scheduling.
+    #[serde(default)]
+    #[allow(dead_code)]
+    depends_on: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,6 +73,9 @@ pub struct ActivationSuggestion {
 }
 
 /// Evaluate activation rules; any matching condition yields a suggestion.
+///
+/// Skips `tier: mvp` and agents listed in `pipeline.mvp` — those are always
+/// considered via [`resolve_pipeline_agents`], not activation suggestions.
 pub fn evaluate_activation(
     config_root: &Path,
     signals: &ActivationSignals,
@@ -73,9 +87,17 @@ pub fn evaluate_activation(
     let Ok(file) = serde_yaml::from_str::<AgentsFile>(&text) else {
         return Vec::new();
     };
+    let mvp: HashSet<String> = PipelineConfig::load(config_root)
+        .mvp()
+        .iter()
+        .cloned()
+        .collect();
 
     let mut out = Vec::new();
     for (id, entry) in file.agents {
+        if entry.tier.as_deref() == Some("mvp") || mvp.contains(&id) {
+            continue;
+        }
         for rule in &entry.activation {
             if condition_matches(rule, signals) {
                 out.push(ActivationSuggestion {
@@ -125,6 +147,8 @@ fn condition_matches(rule: &ActivationRule, s: &ActivationSignals) -> bool {
         "has_new_entity_hints" => s.has_new_entity_hints,
         "audit_fail_rate_gt" => s.audit_fail_rate > thr,
         "bible_stale" => s.bible_stale,
+        "plot_drought" => s.plot_drought,
+        "inspiration_needed" => s.inspiration_needed,
         "always_after_auditor" => true,
         _ => false,
     }
@@ -230,8 +254,13 @@ pub fn resolve_pipeline_agents_with_tier(
         if economy && !pinned.contains("literary_editor") {
             set.remove("literary_editor");
         }
-        if economy && !pinned.contains("nomenclature_curator") && sig.published_count >= 5 {
-            // After early chapters, skip nomenclature unless pinned.
+        // Nomenclature: skip when no new-entity signal (balanced+economy).
+        // economy also peels after early chapters even if hints are noisy.
+        let peel_nom = !pinned.contains("nomenclature_curator")
+            && !sig.has_new_entity_hints
+            && sig.published_count >= 5
+            && (economy || sig.has_nomenclature);
+        if peel_nom {
             set.remove("nomenclature_curator");
         }
     }
@@ -280,6 +309,8 @@ pub fn collect_signals(
     let has_new_entity_hints = detect_new_entity_hints(draft, &entity_names);
     let audit_fail_rate = recent_audit_fail_rate(project_dir, published_count);
     let bible_stale = is_bible_stale(project_dir);
+    let plot_drought = flag_json_active(project_dir, "plot_drought.json");
+    let inspiration_needed = flag_json_active(project_dir, "inspiration_needed.json");
 
     ActivationSignals {
         published_count,
@@ -299,7 +330,20 @@ pub fn collect_signals(
         audit_fail_rate,
         bible_stale,
         volume_handoff: false,
+        plot_drought,
+        inspiration_needed,
     }
+}
+
+fn flag_json_active(project_dir: &Path, name: &str) -> bool {
+    let path = project_dir.join(".novelx").join(name);
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| v.get("active").and_then(|x| x.as_bool()))
+        .unwrap_or(false)
 }
 
 fn find_latest_outline(project_dir: &Path, published_count: u32) -> String {
@@ -547,6 +591,29 @@ mod tests {
     }
 
     #[test]
+    fn plot_drought_and_inspiration_conditions() {
+        let drought = ActivationRule {
+            condition: "plot_drought".into(),
+            threshold: None,
+            tags: vec![],
+            reason: "drought".into(),
+        };
+        let insp = ActivationRule {
+            condition: "inspiration_needed".into(),
+            threshold: None,
+            tags: vec![],
+            reason: "insp".into(),
+        };
+        let mut s = ActivationSignals::default();
+        assert!(!condition_matches(&drought, &s));
+        assert!(!condition_matches(&insp, &s));
+        s.plot_drought = true;
+        s.inspiration_needed = true;
+        assert!(condition_matches(&drought, &s));
+        assert!(condition_matches(&insp, &s));
+    }
+
+    #[test]
     fn chapters_in_arc_uses_arc_field_not_published() {
         let rule = ActivationRule {
             condition: "chapters_in_arc_gt".into(),
@@ -665,5 +732,132 @@ mod tests {
         let got3 = resolve_pipeline_agents_filtered(&pinned, &pipe, &[], Some(&quiet));
         assert!(got3.iter().any(|a| a == "dialogue_specialist"));
         assert!(got3.iter().any(|a| a == "scene_specialist"));
+    }
+
+    #[test]
+    fn evaluate_skips_mvp_tier_and_pipeline_mvp() {
+        let root = std::env::temp_dir().join(format!(
+            "novelx-act-mvp-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_micros()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("agents.yaml"),
+            r#"
+agents:
+  pacing_reviewer:
+    tier: mvp
+    activation:
+      - condition: word_count_gt
+        threshold: 1
+        reason: should-skip
+  lore_librarian:
+    tier: mvp
+    activation:
+      - condition: entity_count_gt
+        threshold: 0
+        reason: should-skip
+  literary_editor:
+    tier: extended
+    activation:
+      - condition: audit_fail_rate_gt
+        threshold: 0.1
+        reason: keep
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("pipeline.yaml"),
+            r#"
+version: 1
+order: [writer, pacing_reviewer, literary_editor]
+mvp: [writer, pacing_reviewer]
+handlers: {}
+"#,
+        )
+        .unwrap();
+        let sig = ActivationSignals {
+            draft_chars: 9000,
+            entity_count: 50,
+            audit_fail_rate: 0.5,
+            ..Default::default()
+        };
+        let got = evaluate_activation(&root, &sig);
+        assert!(
+            !got.iter().any(|s| s.agent == "pacing_reviewer" || s.agent == "lore_librarian"),
+            "mvp must not emit activation suggestions: {got:?}"
+        );
+        assert!(
+            got.iter().any(|s| s.agent == "literary_editor"),
+            "extended activation should still fire: {got:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn repo_agents_yaml_has_no_depends_on() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config");
+        let path = root.join("agents.yaml");
+        if !path.exists() {
+            return;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let raw: serde_yaml::Value = serde_yaml::from_str(&text).expect("agents.yaml parse");
+        let agents = raw
+            .get("agents")
+            .and_then(|v| v.as_mapping())
+            .expect("agents map");
+        for (key, entry) in agents {
+            let id = key.as_str().unwrap_or("?");
+            if let Some(map) = entry.as_mapping() {
+                assert!(
+                    !map.contains_key(serde_yaml::Value::String("depends_on".into())),
+                    "agent {id} must not declare depends_on; order lives in pipeline.yaml"
+                );
+            }
+        }
+        let file: AgentsFile = serde_yaml::from_str(&text).expect("agents.yaml typed parse");
+        for (id, entry) in &file.agents {
+            if entry.tier.as_deref() == Some("mvp") {
+                assert!(
+                    entry.activation.is_empty(),
+                    "mvp agent {id} must not list activation rules"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lean_drops_nomenclature_without_new_entity_hints() {
+        let pipe = PipelineConfig::defaults();
+        let suggestions = vec![ActivationSuggestion {
+            agent: "nomenclature_curator".into(),
+            reason: "legacy has_bible".into(),
+        }];
+        let quiet = ActivationSignals {
+            published_count: 12,
+            chapter: 12,
+            has_nomenclature: true,
+            has_new_entity_hints: false,
+            ..Default::default()
+        };
+        let got = resolve_pipeline_agents_filtered(&[], &pipe, &suggestions, Some(&quiet));
+        assert!(
+            !got.iter().any(|a| a == "nomenclature_curator"),
+            "balanced lean must peel nomenclature when table exists and no new entities"
+        );
+        let with_hints = ActivationSignals {
+            published_count: 12,
+            chapter: 12,
+            has_nomenclature: true,
+            has_new_entity_hints: true,
+            ..Default::default()
+        };
+        let got2 = resolve_pipeline_agents_filtered(&[], &pipe, &suggestions, Some(&with_hints));
+        assert!(got2.iter().any(|a| a == "nomenclature_curator"));
     }
 }

@@ -45,19 +45,44 @@ description: 追踪伏笔埋设与回收状态，评估悬念递进与悬空风�
 ```json
 {
   "buried": [
-    {"id": "可选短id", "description": "埋设内容", "plant": "原文锚点或位置", "expected_payoff": "预期回收方向"}
+    {
+      "id": "可选短id",
+      "description": "埋设内容",
+      "plant": "原文锚点或位置",
+      "expected_payoff": "预期回收方向",
+      "horizon": "near|mid|far",
+      "urgency": "low|mid|high"
+    }
   ],
   "resolved": [
     {"id": "可选", "description": "兑现内容", "payoff": "如何兑现", "plant_ref": "对应旧伏笔"}
   ],
   "dangling": [
-    {"id": "可选", "description": "仍悬空", "planted_chapter": "若可知", "urgency": "low|mid|high", "note": "建议回收窗口"}
+    {
+      "id": "可选",
+      "description": "仍悬空",
+      "planted_chapter": "若可知",
+      "horizon": "near|mid|far",
+      "urgency": "low|mid|high",
+      "note": "建议回收窗口"
+    }
   ],
   "warnings": [
     "风险提示：如埋设过久、廉价回收、与设定冲突等"
   ]
 }
 ```
+
+### 回收距离（horizon）— 影响批写近债，不改总量统计
+
+| horizon | 含义 | 批写压力债 |
+|---------|------|------------|
+| `near` | 数章内应呼应/兑现（章末钩子、短悬念） | 过宽限期后计入 |
+| `mid` | 本卷中段前后可收 | 过宽限期后可计入 |
+| `far` | 跨卷/长线，近期不必收 | **永不计入**批写刹车 |
+| （省略） | 按埋章年龄自动分级 | 见 `config/longform.yaml` → `foreshadow_debt` |
+
+`urgency: low` 等价于倾向 `far`；`high` 倾向 `near`。长线母题、远景真相务必标 `horizon=far` 或 `urgency=low`，避免拖累近期连写。
 
 - 无新变化时数组可空，但不要省略字段
 - 只输出 JSON，不要 markdown

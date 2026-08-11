@@ -91,3 +91,7 @@ description: 检查节奏与信息密度，输出带正文定位的可执行修�
 
 - 不做文采润色清单（交给 Literary Editor）
 - 不做设定/时间线硬冲突判定（交给 Consistency Auditor）
+
+## 短剧模式（project_mode=short_drama）
+
+审读剧本时关注：开场冲突是否过慢、场次是否注水、对白密度、集末钩子是否泄力。定位用「场M」而非「第N段」亦可。节奏 P0 仍不阻断发布。

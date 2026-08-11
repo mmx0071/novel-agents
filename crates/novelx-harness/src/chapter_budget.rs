@@ -5,13 +5,17 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LengthAssessment {
-    /// Within or above soft target (`word_min`).
+    /// Within soft band [`word_min`, `word_max`].
     Ok,
     /// Below `word_min` but at/above `word_hard_min` — warn, do not block publish
     /// (unless soft-short streak forces escalate).
     SoftShort,
     /// Below `word_hard_min` — block publish.
     HardShort,
+    /// Above `word_max` but at/below `word_hard_max` — warn, do not block.
+    SoftLong,
+    /// Above `word_hard_max` — block publish (split or compress).
+    HardLong,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -22,6 +26,9 @@ pub struct ChapterBudget {
     pub word_max: u32,
     #[serde(default = "default_word_hard_min")]
     pub word_hard_min: u32,
+    /// Above this → HardLong (block). 0 = disable hard-long gate.
+    #[serde(default = "default_word_hard_max")]
+    pub word_hard_max: u32,
     /// When consecutive SoftShort reaches this, SoftShort escalates to block publish.
     /// 0 = never escalate. Overridden by `longform.yaml` when both set (longform wins if >0).
     #[serde(default = "default_soft_short_auto")]
@@ -37,6 +44,9 @@ fn default_word_max() -> u32 {
 fn default_word_hard_min() -> u32 {
     4500
 }
+fn default_word_hard_max() -> u32 {
+    11000
+}
 fn default_soft_short_auto() -> u32 {
     3
 }
@@ -47,6 +57,7 @@ impl Default for ChapterBudget {
             word_min: default_word_min(),
             word_max: default_word_max(),
             word_hard_min: default_word_hard_min(),
+            word_hard_max: default_word_hard_max(),
             soft_short_auto_revise_after: default_soft_short_auto(),
         }
     }
@@ -71,6 +82,10 @@ impl ChapterBudget {
                 if b.word_hard_min > b.word_min {
                     b.word_hard_min = b.word_min;
                 }
+                // 0 keeps hard-long disabled; otherwise ensure ≥ word_max.
+                if b.word_hard_max > 0 && b.word_hard_max < b.word_max {
+                    b.word_hard_max = b.word_max;
+                }
                 b
             }
             Err(e) => {
@@ -81,13 +96,39 @@ impl ChapterBudget {
     }
 
     pub fn load_from_config_root(config_root: &Path) -> Self {
-        let mut b = Self::load(&config_root.join("chapter.yaml"));
-        // longform.yaml may override streak threshold.
-        let lf = crate::longform::LongformConfig::load_from_config_root(config_root);
-        if lf.soft_short_auto_revise_after > 0 {
-            b.soft_short_auto_revise_after = lf.soft_short_auto_revise_after;
+        Self::load_for_mode(config_root, "longform")
+    }
+
+    /// Longform → `chapter.yaml`; short_drama → `script.yaml` (falls back to chapter.yaml).
+    pub fn load_for_mode(config_root: &Path, mode: &str) -> Self {
+        let path = match mode {
+            "short_drama" | "short-drama" | "script" => {
+                let script = config_root.join("script.yaml");
+                if script.exists() {
+                    script
+                } else {
+                    config_root.join("chapter.yaml")
+                }
+            }
+            _ => config_root.join("chapter.yaml"),
+        };
+        let mut b = Self::load(&path);
+        // longform.yaml may override streak threshold (longform only).
+        if !matches!(mode, "short_drama" | "short-drama" | "script") {
+            let lf = crate::longform::LongformConfig::load_from_config_root(config_root);
+            if lf.soft_short_auto_revise_after > 0 {
+                b.soft_short_auto_revise_after = lf.soft_short_auto_revise_after;
+            }
         }
         b
+    }
+
+    pub fn writer_target_line_for_mode(&self, mode: &str) -> String {
+        if matches!(mode, "short_drama" | "short-drama" | "script") {
+            format!("请撰写约 {} 字的漫剧剧本 Markdown（场次/画面/对白/钩子）。", self.range_label())
+        } else {
+            self.writer_target_line()
+        }
     }
 
     /// e.g. `5000–6000`
@@ -108,12 +149,18 @@ impl ChapterBudget {
 
     /// Assess body length (chars after title line).
     pub fn assess_body_chars(&self, body_chars: usize) -> LengthAssessment {
-        let hard = self.word_hard_min as usize;
-        let soft = self.word_min as usize;
-        if body_chars < hard {
+        let hard_min = self.word_hard_min as usize;
+        let soft_min = self.word_min as usize;
+        let soft_max = self.word_max as usize;
+        let hard_max = self.word_hard_max as usize;
+        if body_chars < hard_min {
             LengthAssessment::HardShort
-        } else if body_chars < soft {
+        } else if body_chars < soft_min {
             LengthAssessment::SoftShort
+        } else if hard_max > 0 && body_chars > hard_max {
+            LengthAssessment::HardLong
+        } else if body_chars > soft_max {
+            LengthAssessment::SoftLong
         } else {
             LengthAssessment::Ok
         }
@@ -137,6 +184,28 @@ impl ChapterBudget {
     pub fn soft_short_escalate_message(&self, body_chars: usize, streak: u32) -> String {
         format!(
             "正文字数连续偏短（已连续 {streak} 章未达 {}）：当前 {body_chars} 字，阻断发布，请扩写后再发布",
+            self.range_label()
+        )
+    }
+
+    pub fn soft_long_message(&self, body_chars: usize) -> String {
+        format!(
+            "正文字数偏长（软警告）：当前 {body_chars} 字，创作目标 {}（不阻断发布）",
+            self.range_label()
+        )
+    }
+
+    pub fn hard_long_message(&self, body_chars: usize) -> String {
+        format!(
+            "正文字数严重超限（硬门控）：当前 {body_chars} 字，上限 {} 字（创作目标 {}）。系统将自动拆成两章；若失败请 split_chapter 或压缩后再发布",
+            self.word_hard_max,
+            self.range_label()
+        )
+    }
+
+    pub fn compress_revise_instructions(&self) -> String {
+        format!(
+            "本章严重超长。压缩到约 {} 字完整一章：删除重复机理/复述，保留情节推进与章末钩子；勿另起主线，勿注水反写更长。",
             self.range_label()
         )
     }
@@ -191,6 +260,9 @@ mod tests {
         assert_eq!(b.assess_body_chars(4500), LengthAssessment::SoftShort);
         assert_eq!(b.assess_body_chars(5000), LengthAssessment::Ok);
         assert_eq!(b.assess_body_chars(5600), LengthAssessment::Ok);
+        assert_eq!(b.assess_body_chars(6500), LengthAssessment::SoftLong);
+        assert_eq!(b.assess_body_chars(11000), LengthAssessment::SoftLong);
+        assert_eq!(b.assess_body_chars(11001), LengthAssessment::HardLong);
     }
 
     #[test]

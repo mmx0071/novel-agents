@@ -10,6 +10,7 @@ use novelx_harness::{
     consistency_human_option_labels, merge_verify_audit, normalize_consistency_issues,
     on_consistency_result, on_pacing_result, with_issue_ids, should_publish,
     ChapterBudget, GateDecision, HandlerKind, LengthAssessment, NamingRules, PipelineConfig,
+    ScriptShapeConfig,
 };
 use novelx_llm::LlmClient;
 use novelx_skills::{build_skill_injections, load_skills, SkillScope};
@@ -27,10 +28,11 @@ use crate::memory::{apply_summary_json, load_memory, save_memory, OpenThread};
 use crate::project::{
     chapter_memory_artifact_matches_draft, load_project_state, read_chapter_draft,
     read_chapter_outline, save_project_state, write_chapter_draft, write_chapter_memory_artifact,
-    write_chapter_outline, ProjectState,
+    write_chapter_outline, write_chapter_outline_budget, ProjectState,
 };
 use crate::schemas::{
-    draft_body_chars, normalize_draft_best_effort, validate_draft, MIN_DRAFT_BODY_CHARS,
+    draft_body_chars, normalize_draft_best_effort, normalize_script_best_effort,
+    validate_draft, validate_script, MIN_DRAFT_BODY_CHARS,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +57,10 @@ pub struct RevisionOptions {
     /// Force full rediscovery even when prior open issues exist.
     #[serde(default)]
     pub full_rescan: bool,
+    /// Batch: SoftLong still warns but skip publish so one compress revise can run first.
+    /// Non-batch Continue keeps default false (SoftLong remains publishable).
+    #[serde(default)]
+    pub defer_soft_long_publish: bool,
 }
 
 impl Default for RevisionOptions {
@@ -67,6 +73,7 @@ impl Default for RevisionOptions {
             revision_mode: false,
             verify_previous: false,
             full_rescan: false,
+            defer_soft_long_publish: false,
         }
     }
 }
@@ -135,9 +142,14 @@ pub struct PipelineRun {
     /// Layered audit used light (Pacing) consistency context.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub consistency_light: bool,
-    /// Length gate outcome: ok | soft_short | hard_short | soft_short_escalated
+    /// Length gate: ok | soft_short | hard_short | soft_short_escalated | soft_long | hard_long
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub length_status: String,
+    /// HardLong auto-split wrote `chapter+1` (see `auto_split_to`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_split: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_split_to: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +172,10 @@ pub enum PipelineEvent {
     AutoFixStarted { reason: String },
     /// Batch continue banner / chapter outcome (tool-card progress).
     BatchProgress { message: String },
+    /// Progressive Codex-style checklist (batch write, multi-step jobs).
+    TodoList {
+        todos: Vec<novelx_protocol::TodoItem>,
+    },
     RunCompleted { run_id: String, message: String },
     Error { message: String },
 }
@@ -182,7 +198,9 @@ pub fn plan_chapter_steps_with_activation_for(
     draft: &str,
     chapter: u32,
 ) -> Vec<String> {
-    let pipe = PipelineConfig::load(config_root);
+    let mode_key = crate::project::resolve_project_mode(project_dir).as_str();
+    let short = crate::project::is_short_drama(project_dir);
+    let pipe = PipelineConfig::load_for_mode(config_root, mode_key);
     let mut signals = collect_signals(project_dir, state.published_count, draft);
     signals.chapter = chapter;
     if let Some(vol) = crate::volume::active_volume_for_chapter(project_dir, chapter) {
@@ -205,7 +223,8 @@ pub fn plan_chapter_steps_with_activation_for(
             "agent activation suggestions"
         );
     }
-    let lean = longform_lean_enabled(config_root).then_some(&signals);
+    // Short-drama: no longform lean filtering (foreshadow/volume agents not in pipeline).
+    let lean = (!short && longform_lean_enabled(config_root)).then_some(&signals);
     let tier = novelx_harness::LongformConfig::load_from_config_root(config_root).quality_tier;
     novelx_harness::resolve_pipeline_agents_with_tier(
         &state.active_agents,
@@ -217,9 +236,18 @@ pub fn plan_chapter_steps_with_activation_for(
 }
 
 fn longform_lean_enabled(config_root: &Path) -> bool {
+    feature_flag(config_root, "pipeline.longform_lean", true)
+}
+
+/// Auto-split overlong tip drafts into chapter + chapter+1 (default on).
+pub(crate) fn auto_split_hard_long_enabled(config_root: &Path) -> bool {
+    feature_flag(config_root, "pipeline.auto_split_hard_long", true)
+}
+
+fn feature_flag(config_root: &Path, key: &str, default: bool) -> bool {
     let path = config_root.join("features.yaml");
     let Ok(raw) = std::fs::read_to_string(&path) else {
-        return true; // default on for longform cost control
+        return default;
     };
     #[derive(Deserialize)]
     struct FeaturesFile {
@@ -228,8 +256,8 @@ fn longform_lean_enabled(config_root: &Path) -> bool {
     }
     serde_yaml::from_str::<FeaturesFile>(&raw)
         .ok()
-        .and_then(|f| f.features.get("pipeline.longform_lean").copied())
-        .unwrap_or(true)
+        .and_then(|f| f.features.get(key).copied())
+        .unwrap_or(default)
 }
 
 fn use_layered_consistency_light(
@@ -275,9 +303,12 @@ pub fn plan_steps_for_mode(
     let state = load_project_state(&project_dir)?;
     let existing_draft = read_chapter_draft(&project_dir, chapter).unwrap_or_default();
     if matches!(mode, RunMode::AuditOnly) && existing_draft.trim().is_empty() {
-        anyhow::bail!("第{chapter}章尚无正文（draft.md），无法审校");
+        let unit = if crate::project::is_short_drama(&project_dir) { "集" } else { "章" };
+        let body = crate::project::unit_body_filename(&project_dir);
+        anyhow::bail!("第{chapter}{unit}尚无正文（{body}），无法审校");
     }
-    let pipe = PipelineConfig::load(config_root);
+    let mode_key = crate::project::resolve_project_mode(&project_dir).as_str();
+    let pipe = PipelineConfig::load_for_mode(config_root, mode_key);
     let prefer_local = revision.prefer_local_patch
         && (revision.revision_mode
             || matches!(mode, RunMode::Revise)
@@ -327,6 +358,33 @@ pub async fn execute_single_agent_step(
         false,
     )
     .await
+}
+
+
+fn normalize_unit_body_best_effort(
+    project_dir: &Path,
+    unit: u32,
+    text: &str,
+    script_shape: &ScriptShapeConfig,
+) -> (String, Vec<String>) {
+    if crate::project::is_short_drama(project_dir) {
+        normalize_script_best_effort(unit, text, script_shape)
+    } else {
+        normalize_draft_best_effort(unit, text)
+    }
+}
+
+fn validate_unit_body(
+    project_dir: &Path,
+    unit: u32,
+    text: &str,
+    script_shape: &ScriptShapeConfig,
+) -> Result<String, crate::schemas::SchemaError> {
+    if crate::project::is_short_drama(project_dir) {
+        validate_script(unit, text, script_shape)
+    } else {
+        validate_draft(unit, text)
+    }
 }
 
 pub async fn execute_pipeline(
@@ -389,7 +447,9 @@ pub async fn execute_pipeline_with_steps(
 
     let existing_draft = read_chapter_draft(&project_dir, chapter).unwrap_or_default();
     if matches!(mode, RunMode::AuditOnly) && existing_draft.trim().is_empty() {
-        anyhow::bail!("第{chapter}章尚无正文（draft.md），无法审校");
+        let unit = if crate::project::is_short_drama(&project_dir) { "集" } else { "章" };
+        let body = crate::project::unit_body_filename(&project_dir);
+        anyhow::bail!("第{chapter}{unit}尚无正文（{body}），无法审校");
     }
     // Any re-audit with prior open issues defaults to verify (stops rediscovery growth),
     // unless caller forces full_rescan.
@@ -442,6 +502,8 @@ pub async fn execute_pipeline_with_steps(
         plot_accept_rationale: None,
         consistency_light: false,
         length_status: String::new(),
+        auto_split: false,
+        auto_split_to: None,
     };
     let audit_only = matches!(mode, RunMode::AuditOnly);
     let mut report_parts: Vec<String> = Vec::new();
@@ -461,8 +523,12 @@ pub async fn execute_pipeline_with_steps(
     let naming = NamingRules::load_from_config_root(config_root);
     let naming_block = naming.prompt_block();
     let content_rules = ContentRulesConfig::load_from_config_root(config_root);
-    let chapter_budget = ChapterBudget::load_from_config_root(config_root);
-    let pipe = PipelineConfig::load(config_root);
+    let project_mode = crate::project::resolve_project_mode(&project_dir);
+    let mode_key = project_mode.as_str();
+    let short_drama = project_mode == crate::project::ProjectMode::ShortDrama;
+    let chapter_budget = ChapterBudget::load_for_mode(config_root, mode_key);
+    let script_shape = ScriptShapeConfig::load_from_config_root(config_root);
+    let pipe = PipelineConfig::load_for_mode(config_root, mode_key);
 
     let mut draft = existing_draft.clone();
     let mut outline = read_chapter_outline(&project_dir, chapter).unwrap_or_default();
@@ -494,7 +560,11 @@ pub async fn execute_pipeline_with_steps(
         // local_reviser reuses writer skill for full-revise fallback; local patches use a
         // short system prompt inside revise_by_local_patches.
         let skill_key = if agent == "local_reviser" {
-            "writer".to_string()
+            if short_drama {
+                "script-writer".to_string()
+            } else {
+                "writer".to_string()
+            }
         } else {
             agent.replace('_', "-")
         };
@@ -511,19 +581,33 @@ pub async fn execute_pipeline_with_steps(
         let summary = match handler_kind {
             Some(HandlerKind::ChapterPlanner) => {
                 let canon = rebuild_canon(&draft, &outline, ContextProfile::Full);
+                let mat_hooks = crate::materials::format_material_hooks_for_context(
+                    &project_dir,
+                    900,
+                );
+                let canon_md = if mat_hooks.is_empty() {
+                    canon.markdown.clone()
+                } else {
+                    format!("{}\n\n{mat_hooks}", canon.markdown)
+                };
                 let prev_outline = outline.clone();
                 let mut generated = run_chapter_planner(
                     &llm,
                     skill_body,
                     &state,
                     chapter,
-                    &canon.markdown,
+                    &canon_md,
                     &naming_block,
                 )
                 .await?;
                 let mut write_err = None;
                 for attempt in 0..2u8 {
-                    match write_chapter_outline(&project_dir, chapter, &generated) {
+                    let write_outline = if short_drama {
+                        write_chapter_outline(&project_dir, chapter, &generated)
+                    } else {
+                        write_chapter_outline_budget(&project_dir, chapter, &generated)
+                    };
+                    match write_outline {
                         Ok(()) => {
                             write_err = None;
                             break;
@@ -551,6 +635,62 @@ pub async fn execute_pipeline_with_steps(
                                     &write_err.as_ref().unwrap().to_string(),
                                 )
                                 .await?;
+                            }
+                        }
+                    }
+                }
+                // Soft budget repair: empty includes / missing defers under active plot.
+                if write_err.is_none() {
+                    if let Ok(parsed) =
+                        crate::schemas::parse_chapter_outline_text_budget(&generated)
+                    {
+                        let has_plot =
+                            crate::plots::active_plot_exit_context(&project_dir).is_some();
+                        if let Some(hint) =
+                            crate::schemas::outline_budget_repair_hint(&parsed, has_plot)
+                        {
+                            tracing::warn!(chapter, %hint, "chapter_planner budget soft repair");
+                            emit(
+                                &tx,
+                                PipelineEvent::LlmDelta {
+                                    agent: agent.clone(),
+                                    delta: "\n章纲篇幅切片不完整，正在补全…\n".into(),
+                                },
+                            );
+                            let repaired = run_chapter_planner_repair(
+                                &llm,
+                                skill_body,
+                                chapter,
+                                &generated,
+                                &hint,
+                            )
+                            .await?;
+                            let write_repaired = if short_drama {
+                                write_chapter_outline(&project_dir, chapter, &repaired)
+                            } else {
+                                write_chapter_outline_budget(&project_dir, chapter, &repaired)
+                            };
+                            match write_repaired {
+                                Ok(()) => generated = repaired,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        chapter,
+                                        error = %e,
+                                        "budget soft repair still invalid; keeping prior outline"
+                                    );
+                                }
+                            }
+                            if let Ok(again) =
+                                crate::schemas::parse_chapter_outline_text_budget(&generated)
+                            {
+                                if crate::schemas::outline_budget_repair_hint(&again, has_plot)
+                                    .is_some()
+                                {
+                                    tracing::warn!(
+                                        chapter,
+                                        "chapter_planner budget gaps remain after soft repair"
+                                    );
+                                }
                             }
                         }
                     }
@@ -632,7 +772,12 @@ pub async fn execute_pipeline_with_steps(
                     .unwrap_or(draft);
                 }
                 // Save-first: never discard a non-empty generation on schema mismatch.
-                let (shaped, mut shape_issues) = normalize_draft_best_effort(chapter, &draft);
+                let (shaped, mut shape_issues) = normalize_unit_body_best_effort(
+                    &project_dir,
+                    chapter,
+                    &draft,
+                    &script_shape,
+                );
                 if shaped.trim().is_empty() {
                     anyhow::bail!("writer 产出为空，无法保留");
                 }
@@ -652,8 +797,12 @@ pub async fn execute_pipeline_with_steps(
                     match run_draft_shape_fix(&llm, chapter, &draft, &shape_issues, &tx).await
                     {
                         Ok(fixed) => {
-                            let (again, issues2) =
-                                normalize_draft_best_effort(chapter, &fixed);
+                            let (again, issues2) = normalize_unit_body_best_effort(
+                                &project_dir,
+                                chapter,
+                                &fixed,
+                                &script_shape,
+                            );
                             if !again.trim().is_empty() {
                                 draft = again;
                                 write_chapter_draft(&project_dir, chapter, &draft)?;
@@ -671,7 +820,9 @@ pub async fn execute_pipeline_with_steps(
                 }
 
                 if shape_issues.is_empty() {
-                    if let Ok(ok) = validate_draft(chapter, &draft) {
+                    if let Ok(ok) =
+                        validate_unit_body(&project_dir, chapter, &draft, &script_shape)
+                    {
                         draft = ok;
                         write_chapter_draft(&project_dir, chapter, &draft)?;
                     }
@@ -717,7 +868,19 @@ pub async fn execute_pipeline_with_steps(
                     )
                     .await?;
                     if draft != before {
+                        let (shaped, shape_issues) = normalize_draft_best_effort(chapter, &draft);
+                        if !shaped.trim().is_empty() {
+                            draft = shaped;
+                        }
                         write_chapter_draft(&project_dir, chapter, &draft)?;
+                        if !shape_issues.is_empty() {
+                            has_blocking = true;
+                            tracing::warn!(
+                                chapter,
+                                issues = ?shape_issues,
+                                "nomenclature rename left draft shape issues"
+                            );
+                        }
                         format!("禁名已替换：{}", banned.join("、"))
                     } else {
                         format!("禁名仍可能残留：{}", banned.join("、"))
@@ -743,9 +906,24 @@ pub async fn execute_pipeline_with_steps(
                     if polished.trim().is_empty() || polished == draft {
                         format!("{agent} 无实质改动")
                     } else {
-                        draft = polished;
-                        write_chapter_draft(&project_dir, chapter, &draft)?;
-                        format!("{agent} 完成（{} 字）", draft.chars().count())
+                        let (shaped, shape_issues) =
+                            normalize_draft_best_effort(chapter, &polished);
+                        if shaped.trim().is_empty() {
+                            format!("{agent} 产出为空，已保留原稿")
+                        } else {
+                            draft = shaped;
+                            write_chapter_draft(&project_dir, chapter, &draft)?;
+                            if !shape_issues.is_empty() {
+                                has_blocking = true;
+                                tracing::warn!(
+                                    chapter,
+                                    agent,
+                                    issues = ?shape_issues,
+                                    "specialist rewrite left draft shape issues"
+                                );
+                            }
+                            format!("{agent} 完成（{} 字）", draft.chars().count())
+                        }
                     }
                 }
             }
@@ -897,6 +1075,7 @@ pub async fn execute_pipeline_with_steps(
                                 pacing_suggestions: vec![],
                                 verify_previous: false,
                                 full_rescan: false,
+                                defer_soft_long_publish: false,
                             };
                             let fix_canon =
                                 rebuild_canon(&draft, &outline, ContextProfile::Full);
@@ -917,9 +1096,22 @@ pub async fn execute_pipeline_with_steps(
                                 &content_rules,
                             )
                             .await?;
-                            draft = new_draft;
+                            let (shaped, shape_issues) =
+                                normalize_draft_best_effort(chapter, &new_draft);
+                            if !shaped.trim().is_empty() {
+                                draft = shaped;
+                            } else {
+                                draft = new_draft;
+                            }
                             write_chapter_draft(&project_dir, chapter, &draft)?;
                             run.revision_applied_via_patch = via_patch;
+                            if !shape_issues.is_empty() {
+                                tracing::warn!(
+                                    chapter,
+                                    issues = ?shape_issues,
+                                    "consistency AutoFix left draft shape issues"
+                                );
+                            }
                             // AutoFix 后仍需复审才可发布：保持 has_blocking。
                         }
                         GateDecision::AwaitHuman => {
@@ -994,6 +1186,7 @@ pub async fn execute_pipeline_with_steps(
                             pacing_suggestions: gate.auto_fix_suggestions,
                             verify_previous: false,
                             full_rescan: false,
+                            defer_soft_long_publish: false,
                         };
                         let fix_canon = rebuild_canon(&draft, &outline, ContextProfile::Full);
                         let (new_draft, via_patch) = run_writer(
@@ -1013,9 +1206,22 @@ pub async fn execute_pipeline_with_steps(
                             &content_rules,
                         )
                         .await?;
-                        draft = new_draft;
+                        let (shaped, shape_issues) =
+                            normalize_draft_best_effort(chapter, &new_draft);
+                        if !shaped.trim().is_empty() {
+                            draft = shaped;
+                        } else {
+                            draft = new_draft;
+                        }
                         write_chapter_draft(&project_dir, chapter, &draft)?;
                         run.revision_applied_via_patch = via_patch;
+                        if !shape_issues.is_empty() {
+                            tracing::warn!(
+                                chapter,
+                                issues = ?shape_issues,
+                                "pacing AutoFix left draft shape issues"
+                            );
+                        }
                     }
                 }
                 let block = format!("## 节奏审查（第{chapter}章）\n\n{report}");
@@ -1094,6 +1300,8 @@ pub async fn execute_pipeline_with_steps(
                             .get("rationale")
                             .and_then(|x| x.as_str())
                             .unwrap_or("已跳过");
+                        // Missing exit on the card is a hard schema gap — block publish.
+                        // "无进行中剧情卡" is handled by plot write gate earlier; do not soft-skip.
                         if r.contains("缺少收束") {
                             has_blocking = true;
                             run.needs_user_choice = true;
@@ -1106,19 +1314,21 @@ pub async fn execute_pipeline_with_steps(
                         run.plot_accept_passed = Some(true);
                         "剧情验收通过（待本章发布后 completed）".into()
                     } else if let Some(r) = v.get("rationale").and_then(|x| x.as_str()) {
-                        // Fail blocks publish — do not advance with unmet exit conditions.
-                        has_blocking = true;
-                        run.needs_user_choice = true;
+                        // Multi-chapter cards: early chapters default fail (see plot-acceptor skill).
+                        // Incomplete progress must NOT block publish — only pass completes the card.
                         run.plot_accept_passed = Some(false);
                         run.plot_accept_rationale = Some(r.to_string());
-                        report_parts.push(format!("## 剧情验收（未通过·阻断发布）\n{r}"));
-                        format!("剧情验收未通过（未发布）：{r}")
+                        report_parts.push(format!(
+                            "## 剧情验收（未收束·可发布）\n卡仍进行中，缺口：{r}"
+                        ));
+                        format!("剧情验收未收束（已放行发布）：{r}")
                     } else {
-                        has_blocking = true;
-                        run.needs_user_choice = true;
                         run.plot_accept_passed = Some(false);
-                        report_parts.push("## 剧情验收（未通过·阻断发布）".into());
-                        "剧情验收：未通过（未发布）".into()
+                        report_parts.push(
+                            "## 剧情验收（未收束·可发布）\n卡仍进行中，本章未兑现全部收束条件。"
+                                .into(),
+                        );
+                        "剧情验收：未收束（已放行发布）".into()
                     }
                 }
             }
@@ -1228,8 +1438,10 @@ pub async fn execute_pipeline_with_steps(
     }
 
     // Length budget: hard short blocks; soft short warns; streak may escalate SoftShort.
+    // HardLong + pipeline.auto_split_hard_long → split then defer publish for re-audit.
     let mut length_soft_short = false;
     let mut length_ok = false;
+    let mut just_auto_split = false;
     if !draft.is_empty() {
         let body_n = draft_body_chars(&draft);
         match chapter_budget.assess_body_chars(body_n) {
@@ -1286,6 +1498,141 @@ pub async fn execute_pipeline_with_steps(
                     }
                 }
             }
+            LengthAssessment::SoftLong => {
+                // Soft long: warn but allow publish; resets soft-short streak.
+                length_ok = true;
+                run.length_status = "soft_long".into();
+                let msg = chapter_budget.soft_long_message(body_n);
+                tracing::info!(chapter, body_chars = body_n, "{msg}");
+                report_parts.push(format!("## 字数门控（软警告）\n{msg}"));
+                if run.message.is_empty() {
+                    run.message = format!("完成，另有{msg}");
+                } else {
+                    run.message = format!("{}\n\n{msg}", run.message);
+                }
+            }
+            LengthAssessment::HardLong => {
+                let mut handled = false;
+                if !short_drama && auto_split_hard_long_enabled(config_root) {
+                    match crate::split_chapter::split_chapter_draft(
+                        &project_dir,
+                        chapter,
+                        0.5,
+                        None,
+                        false,
+                    ) {
+                        Ok(split) => {
+                            if let Some(new_draft) = read_chapter_draft(&project_dir, chapter) {
+                                draft = new_draft;
+                                // Re-scan hard rules on the shortened half.
+                                violations = check_draft_with(
+                                    &content_rules,
+                                    &draft,
+                                    &naming.forbidden_names,
+                                );
+                                for msg in crate::body_state::check_body_state_side_conflicts(
+                                    &project_dir,
+                                    chapter,
+                                    &draft,
+                                ) {
+                                    violations.push(ContentRuleViolation {
+                                        rule: "body_state_side".into(),
+                                        message: msg,
+                                        blocking: true,
+                                    });
+                                }
+                                for msg in crate::body_state::check_body_state_locus_conflicts(
+                                    &project_dir,
+                                    chapter,
+                                    &draft,
+                                ) {
+                                    violations.push(ContentRuleViolation {
+                                        rule: "body_state_locus".into(),
+                                        message: msg,
+                                        blocking: true,
+                                    });
+                                }
+                                let body_after = draft_body_chars(&draft);
+                                run.auto_split = true;
+                                run.auto_split_to = Some(split.chapter_b);
+                                just_auto_split = true;
+                                let note = format!(
+                                    "正文超长（{body_n} 字），已自动拆成第{}章（{}字）+ 第{}章（{}字）；将对前半复审后再发布",
+                                    split.chapter_a,
+                                    split.chars_a,
+                                    split.chapter_b,
+                                    split.chars_b
+                                );
+                                tracing::info!(
+                                    chapter_a = split.chapter_a,
+                                    chapter_b = split.chapter_b,
+                                    chars_a = split.chars_a,
+                                    chars_b = split.chars_b,
+                                    "auto-split hard_long chapter"
+                                );
+                                report_parts.push(format!("## 字数门控（自动拆章）\n{note}"));
+                                if run.message.is_empty() {
+                                    run.message = note.clone();
+                                } else {
+                                    run.message = format!("{}\n\n{note}", run.message);
+                                }
+                                match chapter_budget.assess_body_chars(body_after) {
+                                    LengthAssessment::Ok => {
+                                        length_ok = true;
+                                        run.length_status = "ok".into();
+                                        handled = true;
+                                    }
+                                    LengthAssessment::SoftLong => {
+                                        length_ok = true;
+                                        run.length_status = "soft_long".into();
+                                        handled = true;
+                                    }
+                                    LengthAssessment::SoftShort => {
+                                        length_soft_short = true;
+                                        run.length_status = "soft_short".into();
+                                        handled = true;
+                                    }
+                                    LengthAssessment::HardShort => {
+                                        has_blocking = true;
+                                        run.length_status = "hard_short".into();
+                                        run.needs_user_choice = true;
+                                        just_auto_split = false;
+                                        let msg = chapter_budget.hard_short_message(body_after);
+                                        report_parts.push(format!(
+                                            "## 字数门控（拆章后偏短·阻断）\n{msg}"
+                                        ));
+                                        handled = true;
+                                    }
+                                    LengthAssessment::HardLong => {
+                                        just_auto_split = false;
+                                        run.auto_split = false;
+                                        run.auto_split_to = None;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(chapter, error = %e, "auto-split hard_long failed");
+                            report_parts.push(format!(
+                                "## 字数门控（自动拆章失败）\n{e}；请人工拆章或压缩。"
+                            ));
+                        }
+                    }
+                }
+                if !handled {
+                    has_blocking = true;
+                    run.length_status = "hard_long".into();
+                    run.needs_user_choice = true;
+                    let msg = chapter_budget.hard_long_message(body_n);
+                    tracing::warn!(chapter, body_chars = body_n, "{msg}");
+                    report_parts.push(format!("## 字数门控（严重超长·阻断发布）\n{msg}"));
+                    if run.message.is_empty() {
+                        run.message = format!("完成，但{msg}");
+                    } else {
+                        run.message = format!("{}\n\n{msg}", run.message);
+                    }
+                }
+            }
             LengthAssessment::Ok => {
                 length_ok = true;
                 run.length_status = "ok".into();
@@ -1293,15 +1640,69 @@ pub async fn execute_pipeline_with_steps(
         }
     }
 
+    // Final shape gate: specialists / AutoFix may drop title — coerce then hard-block.
+    if allow_publish && !draft.trim().is_empty() {
+        let (shaped, shape_issues) = if short_drama {
+            normalize_script_best_effort(chapter, &draft, &script_shape)
+        } else {
+            normalize_draft_best_effort(chapter, &draft)
+        };
+        if !shaped.trim().is_empty() && shaped != draft {
+            draft = shaped;
+            let _ = write_chapter_draft(&project_dir, chapter, &draft);
+        }
+        let shape_err = if short_drama {
+            validate_script(chapter, &draft, &script_shape).err()
+        } else {
+            validate_draft(chapter, &draft).err()
+        };
+        if let Some(e) = shape_err {
+            has_blocking = true;
+            run.needs_user_choice = true;
+            let label = if short_drama { "剧本" } else { "正文" };
+            let msg = format!("{label}形状不合规，已拦发布：{}", e.message);
+            tracing::warn!(chapter, error = %e.message, "pre-publish shape validate failed");
+            report_parts.push(format!("## {label}形状门控（阻断发布）\n{msg}"));
+            if !shape_issues.is_empty() {
+                report_parts.push(format!("残留问题：{}", shape_issues.join("；")));
+            }
+            if run.message.is_empty() {
+                run.message = msg;
+            } else {
+                run.message = format!("{}\n\n{msg}", run.message);
+            }
+        }
+    }
+
     let banned_blocking = has_blocking_violation(&violations);
     run.content_rule_blocked = banned_blocking;
     run.content_rule_violations = violations.clone();
+    // Batch SoftLong: warn-only product semantics, but hold publish once for compress.
+    let defer_soft_long =
+        revision.defer_soft_long_publish && run.length_status == "soft_long";
+    if defer_soft_long {
+        report_parts.push(
+            "## 字数门控（批写暂缓发布）\n正文字数偏长（SoftLong）：先自动压缩一轮再发布。"
+                .into(),
+        );
+    }
+    // After auto-split, body changed — defer publish so caller re-audits part A.
     let publish_ok = allow_publish
+        && !just_auto_split
+        && !defer_soft_long
         && should_publish(consistency_passed, has_blocking || await_human)
         && !banned_blocking;
 
     if !allow_publish {
         tracing::debug!(chapter, "skip publish finalize (single-step / no-publish run)");
+    } else if defer_soft_long {
+        // finalize_chapter_publish ignores SoftLong defer — skip it so batch can compress.
+        run.published = false;
+        tracing::info!(
+            chapter,
+            body_status = %run.length_status,
+            "defer SoftLong publish for batch compress"
+        );
     } else if !draft.is_empty() {
         // AuditOnly must also publish when consistency now passes (write failed gate,
         // then revise → reaudit). Previously only Continue advanced counters, leaving
@@ -1523,8 +1924,13 @@ async fn run_chapter_planner(
         "为小说《{}》（题材：{}）撰写第{chapter}章章纲。\n\
          只输出一个 JSON 对象（可包在 ```json 代码块中），不要输出 Markdown 散文或解释。\n\
          必填字段：title, pov, time_location, goal, conflict, emotion_curve,\n\
-         key_events(数组≥2), characters(数组), items(数组), locations(数组),\n\
+         plot_includes(数组), plot_defers(数组),\n\
+         key_events(数组 2–4 条), characters(数组), items(数组), locations(数组),\n\
          scene_tags(数组), cliffhanger, lore_queries(数组)。\n\
+         篇幅预算：plot_includes 合计按可写成 5000–6000 字估量（通常 1 主推进+至多 1 加压/揭示）；\n\
+         key_events 只展开 includes，禁止 5 条及以上。\n\
+         若有进行中剧情卡：只切片本章场面，禁止把卡的完整走向/收束一次写进本章；\n\
+         plot_defers 至少 1 条（含「本章不兑现收束条件」类声明，除非 includes 显式触及落点）。\n\
          items/locations：本章要用的物品卡/地点卡规范名（可空数组）；系统据此加载设定卡。\n\
          JSON 硬约束：字符串内禁止未转义的英文双引号；对话/强调请用「」或『』；不要尾逗号。\n\
          必须与 CanonContext 卷幕目标、未收线与剧情卡一致，不得引入未定义设定。\n\
@@ -1545,11 +1951,13 @@ async fn run_chapter_planner_repair(
     error: &str,
 ) -> Result<String> {
     let user = format!(
-        "第{chapter}章章纲 JSON 无法解析，请输出修正后的完整 JSON 对象（可包在 ```json 中），不要解释。\n\
+        "第{chapter}章章纲 JSON 无法解析或不合预算，请输出修正后的完整 JSON 对象（可包在 ```json 中），不要解释。\n\
          错误：{error}\n\
          要求：保留原情节要点；字符串内不要用未转义英文双引号（改用「」）；去掉尾逗号；\
-         字段齐全：title/pov/time_location/goal/conflict/emotion_curve/key_events(≥2)/\
-         characters/items/locations/scene_tags/cliffhanger/lore_queries。\n\n\
+         字段齐全：title/pov/time_location/goal/conflict/emotion_curve/\
+         plot_includes/plot_defers/key_events(2–4 条)/\
+         characters/items/locations/scene_tags/cliffhanger/lore_queries；\
+         key_events 不得超过 4 条；有进行中剧情卡时 plot_defers 至少 1 条。\n\n\
          # 待修正原文\n{broken}"
     );
     llm.complete_for_agent("chapter_planner", skill, &user).await
@@ -1610,13 +2018,17 @@ async fn run_writer(
     // User asked for expansion/rewrite → skip local patch entirely.
     // TIMELINE P0 needs whole-chapter monotonic clocks — local multi-span patches
     // repeatedly fail and loop; escalate to full revise.
+    // Only trust priorities after soft-P0 demotion (e.g. 「不构成硬性回跳」).
+    let (_, audit_normalized) =
+        novelx_harness::normalize_consistency_issues(revision.audit_issues.clone());
+    let timeline_p0 = has_timeline_p0(&audit_normalized);
     let force_full = revision
         .user_instructions
         .as_deref()
         .map(needs_full_rewrite)
         .unwrap_or(false)
-        || has_timeline_p0(&revision.audit_issues);
-    if force_full && has_timeline_p0(&revision.audit_issues) {
+        || timeline_p0;
+    if force_full && timeline_p0 {
         if let Some(tx) = tx {
             let _ = tx.send(PipelineEvent::LlmDelta {
                 agent: "writer".into(),
@@ -1718,29 +2130,35 @@ async fn run_writer(
     }
 
     // new chapter generation — stream so UI doesn't look stuck
-    let target_line = budget.writer_target_line();
+    let mode_key = crate::project::resolve_project_mode(project_dir).as_str();
+    let short = crate::project::is_short_drama(project_dir);
+    let target_line = budget.writer_target_line_for_mode(mode_key);
+    let unit_label = if short { "集" } else { "章" };
+    let outline_label = if short { "集纲" } else { "章纲" };
+    let empty_outline = if short {
+        "（无集纲，按题材与 CanonContext 规划一集漫剧剧本）"
+    } else {
+        "（无章纲，按题材与 CanonContext 规划一章）"
+    };
     let user = format!(
-        "小说《{}》第{chapter}章。\n\
+        "作品《{}》第{chapter}{unit_label}。\n\
          正文必须服从 CanonContext（尤其【身体与能力状态板】、人物状态、名词、世界观、剧情走向）。\n\
          写前先扫一眼状态板：伤势侧别/部位与能力寄宿点抄错即属 P0。\n\
          命名遵守取名硬约束，禁止语料脸谱名。\n\
          {WRITER_HARD_CONSTRAINTS}\n\n\
-         {naming_block}\n\n{canon}\n\n# 章纲\n{}\n\n{target_line}",
+         {naming_block}\n\n{canon}\n\n# {outline_label}\n{}\n\n{target_line}",
         state.name,
-        if outline.is_empty() {
-            "（无章纲，按题材与 CanonContext 规划一章）"
-        } else {
-            outline
-        }
+        if outline.is_empty() { empty_outline } else { outline }
     );
-    let model = llm.model_for_agent("writer");
+    let writer_agent = if short { "script_writer" } else { "writer" };
+    let model = llm.model_for_agent(writer_agent);
     // Codex-like: stream tool output deltas (coalesced in core) + intermittent draft.md flush.
     let draft = stream_agent_llm(
         llm,
         skill,
         &user,
         &model,
-        "writer",
+        writer_agent,
         tx,
         true,
         Some(DraftFlushSink {
@@ -1762,8 +2180,9 @@ const WRITER_HARD_CONSTRAINTS: &str = "\
 3. 时段词：凌晨/清晨/上午/傍晚/夜里/夜晚/深夜等会被当成叙事时刻扫描；全章只沿一条时段线前进；\
 回到更早时段必须交代跨日（翌日/天亮/过了一夜）。\
 **禁止把时段词当修辞**：当前是凌晨时勿写「……的夜晚/夜里」；氛围改用「黑暗/夜色/未亮的天」。\n\
-4. 伤势侧别/部位：若 CanonContext 有【身体与能力状态板】或近章事实写明左/右、肩/臂/手/腿等，\
-本章必须沿用；禁止无交代左右对调或肩臂挪移。\n\
+4. 伤势侧别/部位：若 CanonContext 有【身体与能力状态板】或近章事实——脑中锁定侧别/部位；\
+禁止无交代左右对调或肩臂挪移。承接默认用症状/动作限制（颤抖、冷汗、握力发虚），\
+非分侧剧情勿反复点名「左/右」；中性「手/指尖」不算挪伤。首发或变更须写清侧别与可见过程。\n\
 5. 能力寄宿/附着/载体：状态板与近章事实中的所在肢体/器物/印记点必须沿用；\
 更换须写可见转移过程，禁止默默换位。\n\
 6. 作者旁白/管线泄露（绝对禁止）：正文禁止「章纲里/章纲写/按大纲/设定上」等对读；\
@@ -1778,7 +2197,8 @@ const LOCAL_REVISER_SKILL: &str = "你是小说局部修订编辑。只按用户
 输出替换正文或要求的 JSON，不要写作说明，不要扩写全章。\
 涉及倒计时/钟点时：只保留一条单调当前读数，禁止回跳；回忆初始值须标明「最初/原先」，勿伪装成当前值。\
 涉及时段词时：勿把「夜晚/夜里」当修辞与「凌晨」混用；冲突时段须理顺或补跨日。\
-涉及伤势/能力位置时：保持左/右与部位、寄宿/载体与改前及 CanonContext 状态板一致，禁止默默挪位。\
+涉及伤势/能力位置时：保持寄宿/载体与改前及 CanonContext 状态板一致，禁止默默挪位；\
+伤势承接优先改为症状/动作限制句，非分侧剧情勿堆砌左右；点名侧别时不得写反侧。\
 禁止写入章纲对读、作者纠错释义、机制讲义。";
 
 async fn revise_by_local_patches(
@@ -2002,6 +2422,29 @@ fn enrich_revision_with_issues(revision: &RevisionOptions) -> RevisionOptions {
     out
 }
 
+/// Length constraints appended to full-chapter revise user prompts.
+pub(crate) fn revise_full_length_note(
+    instr: &str,
+    audit_issues: &[Value],
+    budget: &ChapterBudget,
+) -> String {
+    let (_, normalized) = novelx_harness::normalize_consistency_issues(audit_issues.to_vec());
+    if needs_full_rewrite(instr) || has_timeline_p0(&normalized) {
+        format!(
+            "\n{}硬上限 {} 字（不得超过）；修一致性/时间线时禁止借机扩写超上限。\
+不得只改几句或原样返回短稿；输出完整正文 Markdown。",
+            budget.revise_length_hint(),
+            budget.word_max
+        )
+    } else {
+        format!(
+            "\n输出修订后的完整正文 Markdown；篇幅宜在 {} 字内，不得超过 {} 字。",
+            budget.range_label(),
+            budget.word_max
+        )
+    }
+}
+
 async fn revise_full(
     llm: &LlmClient,
     skill: &str,
@@ -2027,14 +2470,7 @@ async fn revise_full(
     } else {
         format!("\n\n# 审校问题清单\n{issues_block}")
     };
-    let length_note = if needs_full_rewrite(&instr) {
-        format!(
-            "\n{}不得只改几句或原样返回短稿；输出完整正文 Markdown。",
-            budget.revise_length_hint()
-        )
-    } else {
-        "\n输出修订后的完整正文 Markdown。".to_string()
-    };
+    let length_note = revise_full_length_note(&instr, &revision.audit_issues, budget);
     let user = format!(
         "修订《{}》第{chapter}章。\n指令：{instr}{issues_section}{length_note}\n\
          修订必须服从 CanonContext，并遵守取名硬约束；清单中的问题必须在正文中可见地消除。\n\
@@ -2570,78 +3006,115 @@ async fn stream_agent_llm(
     let acc = Arc::new(Mutex::new(String::new()));
     let flush_state = Arc::new(Mutex::new((Instant::now(), 0usize)));
     let flush_sink = draft_flush.map(Arc::new);
+    let retry_n = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let max_tokens = llm.max_tokens_for_agent(agent);
     let result = llm
-        .complete_stream_limited(skill, user, Some(model), Some(max_tokens), |delta| {
-            let tx = tx.clone();
-            let agent = agent.to_string();
-            let got_c = got_c.clone();
-            let stop_c = stop_c.clone();
-            let acc = acc.clone();
-            let flush_state = flush_state.clone();
-            let flush_sink = flush_sink.clone();
-            async move {
-                let first = !got_c.swap(true, std::sync::atomic::Ordering::Relaxed);
-                if first {
-                    stop_c.store(true, std::sync::atomic::Ordering::Relaxed);
-                    if !mirror_deltas {
-                        if let Some(tx) = tx.as_ref() {
-                            let _ = tx.send(PipelineEvent::LlmDelta {
-                                agent: agent.clone(),
-                                delta: "（生成中…）\n".into(),
-                            });
-                        }
-                    }
-                }
-                if mirror_deltas {
-                    if let Some(tx) = tx.as_ref() {
-                        let _ = tx.send(PipelineEvent::LlmDelta {
-                            agent: agent.clone(),
-                            delta: delta.clone(),
-                        });
-                    }
-                }
-                if let Some(sink) = flush_sink.as_ref() {
-                    let snapshot = {
-                        let mut buf = acc.lock().unwrap_or_else(|e| e.into_inner());
-                        buf.push_str(&delta);
-                        let chars = buf.chars().count();
-                        let mut st = flush_state.lock().unwrap_or_else(|e| e.into_inner());
-                        let elapsed = st.0.elapsed().as_millis();
-                        let grown = chars.saturating_sub(st.1);
-                        let first_flush = st.1 == 0 && chars >= DRAFT_FLUSH_FIRST_CHARS;
-                        let cadence =
-                            grown >= DRAFT_FLUSH_MIN_CHARS || elapsed >= DRAFT_FLUSH_MIN_MS;
-                        if chars > 0 && (first_flush || (st.1 > 0 && cadence)) {
-                            st.0 = Instant::now();
-                            st.1 = chars;
-                            Some((buf.clone(), chars))
-                        } else {
-                            None
-                        }
-                    };
-                    if let Some((text, chars)) = snapshot {
-                        if let Err(e) = write_chapter_draft(&sink.project_dir, sink.chapter, &text)
-                        {
-                            tracing::warn!(
-                                chapter = sink.chapter,
-                                error = %e,
-                                "intermittent draft flush failed"
-                            );
-                        } else if let Some(tx) = tx.as_ref() {
-                            // Reader sync marker; prose itself already streams when mirror_deltas.
-                            let _ = tx.send(PipelineEvent::DraftFlushed { chars });
-                            if !mirror_deltas {
+        .complete_stream_limited_restart(
+            skill,
+            user,
+            Some(model),
+            Some(max_tokens),
+            |delta| {
+                let tx = tx.clone();
+                let agent = agent.to_string();
+                let got_c = got_c.clone();
+                let stop_c = stop_c.clone();
+                let acc = acc.clone();
+                let flush_state = flush_state.clone();
+                let flush_sink = flush_sink.clone();
+                async move {
+                    let first = !got_c.swap(true, std::sync::atomic::Ordering::Relaxed);
+                    if first {
+                        stop_c.store(true, std::sync::atomic::Ordering::Relaxed);
+                        if !mirror_deltas {
+                            if let Some(tx) = tx.as_ref() {
                                 let _ = tx.send(PipelineEvent::LlmDelta {
                                     agent: agent.clone(),
-                                    delta: format!("（已生成约 {chars} 字…）\n"),
+                                    delta: "（生成中…）\n".into(),
                                 });
                             }
                         }
                     }
+                    if mirror_deltas {
+                        if let Some(tx) = tx.as_ref() {
+                            let _ = tx.send(PipelineEvent::LlmDelta {
+                                agent: agent.clone(),
+                                delta: delta.clone(),
+                            });
+                        }
+                    }
+                    if let Some(sink) = flush_sink.as_ref() {
+                        let snapshot = {
+                            let mut buf = acc.lock().unwrap_or_else(|e| e.into_inner());
+                            buf.push_str(&delta);
+                            let chars = buf.chars().count();
+                            let mut st = flush_state.lock().unwrap_or_else(|e| e.into_inner());
+                            let elapsed = st.0.elapsed().as_millis();
+                            let grown = chars.saturating_sub(st.1);
+                            let first_flush = st.1 == 0 && chars >= DRAFT_FLUSH_FIRST_CHARS;
+                            let cadence =
+                                grown >= DRAFT_FLUSH_MIN_CHARS || elapsed >= DRAFT_FLUSH_MIN_MS;
+                            if chars > 0 && (first_flush || (st.1 > 0 && cadence)) {
+                                st.0 = Instant::now();
+                                st.1 = chars;
+                                Some((buf.clone(), chars))
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some((text, chars)) = snapshot {
+                            if let Err(e) =
+                                write_chapter_draft(&sink.project_dir, sink.chapter, &text)
+                            {
+                                tracing::warn!(
+                                    chapter = sink.chapter,
+                                    error = %e,
+                                    "intermittent draft flush failed"
+                                );
+                            } else if let Some(tx) = tx.as_ref() {
+                                // Reader sync marker; prose itself already streams when mirror_deltas.
+                                let _ = tx.send(PipelineEvent::DraftFlushed { chars });
+                                if !mirror_deltas {
+                                    let _ = tx.send(PipelineEvent::LlmDelta {
+                                        agent: agent.clone(),
+                                        delta: format!("（已生成约 {chars} 字…）\n"),
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
-            }
-        })
+            },
+            || {
+                let tx = tx.clone();
+                let agent = agent.to_string();
+                let got_c = got_content.clone();
+                let acc = acc.clone();
+                let flush_state = flush_state.clone();
+                let flush_sink = flush_sink.clone();
+                let retry_n = retry_n.clone();
+                async move {
+                    let n = retry_n.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    // Drop partial stream so the next attempt doesn't concatenate.
+                    {
+                        let mut buf = acc.lock().unwrap_or_else(|e| e.into_inner());
+                        buf.clear();
+                    }
+                    {
+                        let mut st = flush_state.lock().unwrap_or_else(|e| e.into_inner());
+                        *st = (Instant::now(), 0);
+                    }
+                    got_c.store(false, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(sink) = flush_sink.as_ref() {
+                        // Keep prior draft on disk until new tokens arrive; UI note only.
+                        let _ = sink;
+                    }
+                    // LLM layer already emits a retry marker via on_delta; only log here.
+                    tracing::info!(agent = %agent, retry = n, "stream_agent_llm cleared partial buffer for retry");
+                    let _ = tx;
+                }
+            },
+        )
         .await;
 
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2698,7 +3171,8 @@ async fn run_summarizer(llm: &LlmClient, skill: &str, draft: &str) -> Result<Str
                 "为正文生成 JSON 摘要。字段：event_summary, relationship_changes, new_facts[], \
                  body_state:{{injuries:[],ability_loci:[]}}, foreshadow_updates[], ending_hook, \
                  plot_progress（可选）。\
-                 body_state 必填：伤势写清侧别/部位与行动限制；能力写清寄宿/附着/载体；无变化则空数组。\
+                 body_state 必填：当前有效伤势写清侧别/部位与行动限制（每角色每部位一条）；\
+已愈合/仅残迹须显式标明；能力写清寄宿/附着/载体；无变化则空数组，勿复抄上章长伤势。\
                  注意正文可能含中段/章末切片，须覆盖结尾钩子与后半关键事实。只输出 JSON。\
                  剧情卡是否完结由后续 plot_acceptor 判定，本步不要输出 plot_exit_met。\n\n\
                  # 正文\n{excerpt}"
@@ -2892,12 +3366,25 @@ fn apply_foreshadow_report(project_dir: &Path, chapter: u32, report: &str) -> Re
             ) {
                 continue;
             }
+            let urgency = item
+                .get("urgency")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let horizon_raw = item
+                .get("horizon")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            let horizon =
+                crate::foreshadow::normalize_foreshadow_horizon(horizon_raw, &urgency);
             mem.open_threads.push(OpenThread {
                 id,
                 text,
                 status: "open".into(),
                 planted_chapter: chapter,
-                resolved_chapter: 0,
+                horizon,
+                urgency,
+                ..Default::default()
             });
             n += 1;
         }
@@ -2967,7 +3454,46 @@ fn apply_foreshadow_report(project_dir: &Path, chapter: u32, report: &str) -> Re
                 .get("id")
                 .and_then(|x| x.as_str())
                 .unwrap_or("");
-            if text.is_empty()
+            let urgency = item
+                .get("urgency")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let horizon_raw = item
+                .get("horizon")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            let horizon =
+                crate::foreshadow::normalize_foreshadow_horizon(horizon_raw, &urgency);
+            // Refresh horizon/urgency on an already-known open thread.
+            let mut updated = false;
+            if !horizon.is_empty() || !urgency.is_empty() {
+                for t in mem
+                    .open_threads
+                    .iter_mut()
+                    .chain(mem.archived_threads.iter_mut())
+                {
+                    if !(t.status == "open" || t.status.is_empty()) {
+                        continue;
+                    }
+                    let id_hit = !id.is_empty() && t.id == id;
+                    let text_hit = !text.is_empty()
+                        && (t.text.contains(&text) || text.contains(&t.text));
+                    if id_hit || text_hit {
+                        if !horizon.is_empty() {
+                            t.horizon = horizon.clone();
+                        }
+                        if !urgency.is_empty() {
+                            t.urgency = urgency.clone();
+                        }
+                        updated = true;
+                        n += 1;
+                        break;
+                    }
+                }
+            }
+            if updated
+                || text.is_empty()
                 || crate::memory::foreshadow_already_known(
                     project_dir,
                     &mem,
@@ -2986,7 +3512,9 @@ fn apply_foreshadow_report(project_dir: &Path, chapter: u32, report: &str) -> Re
                 text,
                 status: "open".into(),
                 planted_chapter: chapter,
-                resolved_chapter: 0,
+                horizon,
+                urgency,
+                ..Default::default()
             });
             n += 1;
         }
@@ -3036,6 +3564,7 @@ pub fn steer_revision_options(message: &str) -> RevisionOptions {
         pacing_suggestions: vec![],
         verify_previous: false,
         full_rescan: false,
+        defer_soft_long_publish: false,
     }
 }
 
@@ -3060,6 +3589,77 @@ pub struct PublishFinalizeResult {
     pub plot_setting_blocker: bool,
     pub plot_accept_passed: Option<bool>,
     pub plot_accept_rationale: Option<String>,
+}
+
+/// When publish-time draft fingerprint no longer matches chapter memory JSON,
+/// re-run foreshadow_tracker / summarizer so hot memory is not silently skipped.
+async fn refresh_stale_chapter_memory_for_publish(
+    project_dir: &Path,
+    config_root: &Path,
+    chapter: u32,
+    draft: &str,
+    llm: &LlmClient,
+) -> (bool, bool) {
+    if draft.trim().is_empty() {
+        return (false, false);
+    }
+    let mut foreshadow_ok =
+        chapter_memory_artifact_matches_draft(project_dir, chapter, "foreshadow.json", draft);
+    let mut summary_ok =
+        chapter_memory_artifact_matches_draft(project_dir, chapter, "summary.json", draft);
+    if foreshadow_ok && summary_ok {
+        return (true, true);
+    }
+    let skill_outcome = load_skills(&[
+        (SkillScope::Studio, config_root.join("skills")),
+        (SkillScope::Agent, config_root.join("skills/agents")),
+    ]);
+    let outline = read_chapter_outline(project_dir, chapter).unwrap_or_default();
+    if !foreshadow_ok {
+        let skill = load_agent_skill_body(&skill_outcome.skills, "foreshadow-tracker");
+        match run_foreshadow_tracker(llm, &skill, project_dir, chapter, draft, &outline).await {
+            Ok(report) => {
+                if let Err(e) = write_chapter_memory_artifact(
+                    project_dir,
+                    chapter,
+                    "foreshadow.json",
+                    &report,
+                    draft,
+                ) {
+                    tracing::warn!(error = %e, chapter, "write regenerated foreshadow.json failed");
+                } else {
+                    foreshadow_ok = true;
+                    tracing::info!(chapter, "regenerated foreshadow.json for publish");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, chapter, "regenerate foreshadow.json failed");
+            }
+        }
+    }
+    if !summary_ok {
+        let skill = load_agent_skill_body(&skill_outcome.skills, "summarizer");
+        match run_summarizer(llm, &skill, draft).await {
+            Ok(summary) => {
+                if let Err(e) = write_chapter_memory_artifact(
+                    project_dir,
+                    chapter,
+                    "summary.json",
+                    &summary,
+                    draft,
+                ) {
+                    tracing::warn!(error = %e, chapter, "write regenerated summary.json failed");
+                } else {
+                    summary_ok = true;
+                    tracing::info!(chapter, "regenerated summary.json for publish");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, chapter, "regenerate summary.json failed");
+            }
+        }
+    }
+    (foreshadow_ok, summary_ok)
 }
 
 /// Advance `next_chapter`, close bridge plots, apply plot_acceptor pass, evaluate volume end.
@@ -3108,21 +3708,30 @@ pub async fn finalize_chapter_publish(
 
     out.published = true;
     // Hot memory only after publish, and only when chapter JSON matches current draft.
+    // If fingerprint mismatch / missing: regenerate before apply (revise-only paths often skip).
     let draft_now = read_chapter_draft(project_dir, chapter).unwrap_or_default();
     let ch_dir = project_dir
         .join("chapters")
         .join(format!("{chapter:03}"));
-    if chapter_memory_artifact_matches_draft(project_dir, chapter, "foreshadow.json", &draft_now) {
+    let (foreshadow_fresh, summary_fresh) = refresh_stale_chapter_memory_for_publish(
+        project_dir,
+        config_root,
+        chapter,
+        &draft_now,
+        llm.as_ref(),
+    )
+    .await;
+    if foreshadow_fresh {
         if let Ok(report) = std::fs::read_to_string(ch_dir.join("foreshadow.json")) {
             match apply_foreshadow_report(project_dir, chapter, &report) {
                 Ok(n) => tracing::info!(chapter, n, "foreshadow applied on publish"),
                 Err(e) => tracing::warn!(error = %e, chapter, "foreshadow apply on publish failed"),
             }
         }
-    } else if ch_dir.join("foreshadow.json").exists() {
-        tracing::warn!(chapter, "skip stale foreshadow.json (draft fingerprint mismatch)");
+    } else {
+        tracing::warn!(chapter, "foreshadow.json unavailable or stale after refresh; skip apply");
     }
-    if chapter_memory_artifact_matches_draft(project_dir, chapter, "summary.json", &draft_now) {
+    if summary_fresh {
         if let Ok(summary) = std::fs::read_to_string(ch_dir.join("summary.json")) {
             match apply_summary_json(project_dir, chapter, &summary) {
                 Ok(n) => tracing::info!(chapter, n, "summary digest applied on publish"),
@@ -3141,10 +3750,10 @@ pub async fn finalize_chapter_publish(
                 Err(e) => tracing::warn!(error = %e, chapter, "lore assert on publish failed"),
             }
         }
-    } else if ch_dir.join("summary.json").exists() {
-        tracing::warn!(chapter, "skip stale summary.json (draft fingerprint mismatch)");
+    } else {
+        tracing::warn!(chapter, "summary.json unavailable or stale after refresh; skip apply");
         out.report_parts.push(
-            "## 热记忆\n摘要与当前正文不一致，已跳过入库（请再跑修订以重生成摘要）".into(),
+            "## 热记忆\n摘要与当前正文不一致且重生成失败，已跳过入库".into(),
         );
     }
     if state.next_chapter <= chapter {
@@ -3298,33 +3907,46 @@ pub async fn finalize_chapter_publish(
             project_dir,
             crate::phases::VolumePhase::AwaitingSync,
         );
-        out.volume_ended = Some(vol.volume_index);
-        out.volume_ended_name = Some(vol.name.clone());
-        out.volume_ended_start = Some(vol.start_chapter.max(1));
-        out.volume_ended_end = Some(chapter);
-        out.await_human = true;
-        let matched = if decision.matched.is_empty() {
-            decision.reason.clone()
+        // Same-turn safety net: planned/next_plot work must not leave us in handoff.
+        if crate::phases::recover_false_volume_end(project_dir).is_some() {
+            tracing::info!(
+                chapter,
+                volume = vol.volume_index,
+                "volume end rolled back: open plot ladder remains"
+            );
+            out.report_parts.push(
+                "## 卷末判定\n检测到本卷仍有未完成剧情卡/下一张未设计，已取消卷末交接，继续本卷写作。"
+                    .into(),
+            );
         } else {
-            decision.matched.join("；")
-        };
-        if let Some(tx) = tx {
-            let _ = tx.send(PipelineEvent::AwaitingHuman {
-                prompt: format!(
-                    "第{}卷「{}」终止条件已达成（至第{}章），是否同步设定库？",
-                    vol.volume_index, vol.name, chapter
-                ),
-                options: vec!["同步设定库".into(), "跳过".into()],
-            });
+            out.volume_ended = Some(vol.volume_index);
+            out.volume_ended_name = Some(vol.name.clone());
+            out.volume_ended_start = Some(vol.start_chapter.max(1));
+            out.volume_ended_end = Some(chapter);
+            out.await_human = true;
+            let matched = if decision.matched.is_empty() {
+                decision.reason.clone()
+            } else {
+                decision.matched.join("；")
+            };
+            if let Some(tx) = tx {
+                let _ = tx.send(PipelineEvent::AwaitingHuman {
+                    prompt: format!(
+                        "第{}卷「{}」终止条件已达成（至第{}章），是否同步设定库？",
+                        vol.volume_index, vol.name, chapter
+                    ),
+                    options: vec!["同步设定库".into(), "跳过".into()],
+                });
+            }
+            out.report_parts.push(format!(
+                "## 卷末\n第{}卷「{}」至第{}章：终止条件命中。\n- {}\n- 下一章将写第{}章（下卷）。待确认是否同步设定库。",
+                vol.volume_index,
+                vol.name,
+                chapter,
+                matched,
+                chapter + 1
+            ));
         }
-        out.report_parts.push(format!(
-            "## 卷末\n第{}卷「{}」至第{}章：终止条件命中。\n- {}\n- 下一章将写第{}章（下卷）。待确认是否同步设定库。",
-            vol.volume_index,
-            vol.name,
-            chapter,
-            matched,
-            chapter + 1
-        ));
     }
     let _ = mode;
     Ok(out)
@@ -3361,12 +3983,14 @@ pub async fn plan_local_revision_preview(
     if existing.trim().is_empty() {
         anyhow::bail!("第{chapter}章无正文，无法规划局部修订");
     }
+    let (_, audit_normalized) =
+        novelx_harness::normalize_consistency_issues(revision.audit_issues.clone());
     if revision
         .user_instructions
         .as_deref()
         .map(needs_full_rewrite)
         .unwrap_or(false)
-        || has_timeline_p0(&revision.audit_issues)
+        || has_timeline_p0(&audit_normalized)
     {
         return Ok(LocalRevisionPreview {
             patches: vec![],
@@ -3547,6 +4171,44 @@ fn append_drift_sample(project_dir: &Path, chapter: u32) -> anyhow::Result<()> {
         .open(path)?;
     writeln!(f, "{}", serde_json::to_string(&line)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod revise_full_length_note_tests {
+    use super::*;
+    use novelx_harness::ChapterBudget;
+    use serde_json::json;
+
+    #[test]
+    fn force_full_timeline_note_caps_word_max() {
+        let budget = ChapterBudget::load_from_config_root(std::path::Path::new("config"));
+        let note = revise_full_length_note(
+            "按一致性 P0 整章理顺时间线",
+            &[json!({
+                "type": "TIMELINE",
+                "priority": "P0",
+                "message": "倒计时回跳",
+                "location": "段1",
+                "quote": "还剩"
+            })],
+            &budget,
+        );
+        assert!(note.contains("不得超过"), "{note}");
+        assert!(note.contains(&budget.word_max.to_string()), "{note}");
+        assert!(note.contains("禁止借机扩写") || note.contains("硬上限"), "{note}");
+    }
+
+    #[test]
+    fn soft_long_defer_flag_only_applies_to_soft_long() {
+        let defer = RevisionOptions {
+            defer_soft_long_publish: true,
+            ..Default::default()
+        };
+        assert!(defer.defer_soft_long_publish && "soft_long" == "soft_long");
+        assert!(!(defer.defer_soft_long_publish && "ok" == "soft_long"));
+        let no_defer = RevisionOptions::default();
+        assert!(!no_defer.defer_soft_long_publish);
+    }
 }
 
 #[cfg(test)]

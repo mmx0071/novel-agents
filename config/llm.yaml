@@ -64,9 +64,11 @@ agents:
   master_planner: planning
   arc_planner: planning
   chapter_planner: planning
+  episode_planner: planning
   entity_designer: planning
   plot_designer: planning
   writer: creative
+  script_writer: creative
   local_reviser: patch
   dialogue_specialist: editing
   scene_specialist: editing
@@ -78,6 +80,9 @@ agents:
   pacing_reviewer: analysis
   summarizer: analysis
   plot_acceptor: analysis
+  beat_acceptor: analysis
   lore_librarian: analysis
   expectation_reviewer: analysis
+  decision_council: analysis
+  material_researcher: analysis
 default_provider: deepseek

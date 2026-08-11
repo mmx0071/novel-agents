@@ -38,6 +38,12 @@ pub struct PersistedThread {
     pub outline_rewrite_active: bool,
     #[serde(default)]
     pub pending_impact: Option<crate::PendingImpact>,
+    #[serde(default)]
+    pub council_retry_count: u32,
+    #[serde(default)]
+    pub council_last_p0_types: Vec<String>,
+    #[serde(default)]
+    pub council_same_type_streak: u32,
 }
 
 pub fn project_novelx_dir(projects_root: &Path, project: &str) -> PathBuf {
@@ -92,6 +98,9 @@ pub fn from_state(thread_id: &str, state: &ThreadState) -> PersistedThread {
         awaiting_studio_next: state.awaiting_studio_next.clone(),
         outline_rewrite_active: state.outline_rewrite_active,
         pending_impact: state.pending_impact.clone(),
+        council_retry_count: state.council_retry_count,
+        council_last_p0_types: state.council_last_p0_types.clone(),
+        council_same_type_streak: state.council_same_type_streak,
     }
 }
 
@@ -125,9 +134,17 @@ pub fn into_state(p: PersistedThread) -> (String, ThreadState) {
             awaiting_studio_next: p.awaiting_studio_next,
             outline_rewrite_active: p.outline_rewrite_active,
             pending_impact: p.pending_impact,
+            council_retry_count: p.council_retry_count,
+            council_last_p0_types: p.council_last_p0_types,
+            council_same_type_streak: p.council_same_type_streak,
+            council_auto_steer: None,
+            council_auto_continue: None,
+            council_suppress_auto_continue: false,
+            history_sealed_pending_write: false,
             session_source: SessionSource::Root,
             lifecycle: AgentLifecycle::Running,
             subagent_job: None,
+            last_composer_phase: None,
         },
     )
 }

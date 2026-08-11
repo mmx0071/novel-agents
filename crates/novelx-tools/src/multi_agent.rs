@@ -37,17 +37,19 @@ impl ToolHandler for SpawnAgent {
         "spawn_agent"
     }
     fn description(&self) -> &'static str {
-        "启动子 Agent 线程（章纲规划/正文写作等）。完成后用 wait_agent 收取结果。"
+        "启动单步专精 / 只读旁路 SubAgent（如 literary_editor）。\
+勿用于整章续写/修订/审校——请用 continue_writing / revise_chapter / audit_chapter（或 audit_chapters）。\
+禁止带 mode=continue|revise|audit_only。完成后用 wait_agent 收取结果。"
     }
     fn parameters(&self) -> Value {
         json!({
             "type":"object",
             "properties":{
-                "role":{"type":"string","description":"agents.yaml 角色 id，如 writer"},
+                "role":{"type":"string","description":"agents.yaml 角色 id，如 literary_editor（单步专精）"},
                 "task":{"type":"string","description":"交给子 Agent 的任务说明"},
                 "project":{"type":"string"},
-                "chapter":{"type":"integer"},
-                "mode":{"type":"string","description":"continue|revise|audit_only"},
+                "chapter":{"type":"integer","description":"可选；勿与 mode=continue|revise|audit_only 联用"},
+                "mode":{"type":"string","description":"勿填 continue|revise|audit_only（整章请用专用工具）"},
                 "parent_thread_id":{"type":"string"}
             },
             "required":["role","task"]
@@ -60,14 +62,24 @@ impl ToolHandler for SpawnAgent {
         if role.is_empty() || task.is_empty() {
             anyhow::bail!("role and task are required");
         }
+        let chapter = args["chapter"].as_u64().map(|n| n as u32);
+        let mode = args["mode"].as_str();
+        if chapter.is_some()
+            && matches!(mode, Some("continue") | Some("revise") | Some("audit_only"))
+        {
+            anyhow::bail!(
+                "整章续写/修订/审校请用 continue_writing / revise_chapter / audit_chapter（或 audit_chapters），\
+勿 spawn_agent(mode=continue|revise|audit_only)；SubAgent 仅用于单步专精或只读旁路"
+            );
+        }
         let resp = rt
             .spawn_agent(SpawnAgentRequest {
                 parent_thread_id: parent_id(ctx, &args)?,
                 role: role.clone(),
                 task: task.clone(),
                 project: args["project"].as_str().map(|s| s.to_string()),
-                chapter: args["chapter"].as_u64().map(|n| n as u32),
-                mode: args["mode"].as_str().map(|s| s.to_string()),
+                chapter,
+                mode: mode.map(|s| s.to_string()),
                 revision: None,
             })
             .await?;
@@ -174,7 +186,8 @@ impl ToolHandler for WaitAgent {
         "wait_agent"
     }
     fn description(&self) -> &'static str {
-        "等待子 Agent 完成并返回结果摘要"
+        "等待 spawn_agent 启动的单步专精 / 只读旁路子 Agent 完成并返回摘要。\
+勿与整章 continue_writing / revise / audit 混用（整章走进程内流水线，无需 wait_agent）。"
     }
     fn parameters(&self) -> Value {
         json!({

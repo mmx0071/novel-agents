@@ -143,17 +143,43 @@ intents:
       - 无人值守连写
       - continue_writing_batch
       - 批写
+      - 继续连写
+      - 继续批写
+      - 接着连写
+      - 接着批写
     all_keyword_groups:
       - [连写, 卡点]
       - [连续, 写, 章]
       - [一口气, 写]
       - [自动, 连写]
+      - [继续, 连写]
+      - [继续, 批写]
     none_keywords:
       - 审这一卷
       - 复盘
       - design_plot
       - 到哪了
       - 进度
+
+  # 「写第3集 / 续写下一集」→ continue_episode（short_drama）
+  - id: write_episode
+    tool: continue_episode
+    priority: 72
+    require_project: true
+    extract: chapter_optional
+    clear_history: on_start
+    any_keywords:
+      - 写下一集
+      - 续写下一集
+      - continue_episode
+    all_keyword_groups:
+      - [写第, 集]
+      - [续写, 集]
+    none_keywords:
+      - 章
+      - 批写
+      - sync_volume
+      - design_plot
 
   # 「写第10章 / 续写 / 写下一章」→ continue_writing
   # 衔接章由剧情卡 needs_bridge（Agent）决定，0 或 1 章，用户无需声明
@@ -302,6 +328,25 @@ intents:
       - 审阅章
       - 这一卷
 
+  # 「拆成两章 / 拆章」→ split_chapter（严重超长未发布草稿）
+  - id: split_chapter
+    tool: split_chapter
+    priority: 65
+    require_project: true
+    extract: chapter
+    any_keywords:
+      - 拆成两章
+      - 拆章
+      - 分成两章
+      - 拆成两章发布
+      - split_chapter
+      - 太长了拆
+      - 超长拆
+    none_keywords:
+      - 章纲
+      - outline
+      - 润色
+
   # 「修正/扩写第五章」「按审校局部修订第N章」→ revise_chapter
   - id: revise_chapter
     tool: revise_chapter
@@ -320,11 +365,15 @@ intents:
       - 写长
       - 太短
       - 太少
+      - 压缩
+      - 写短
+      - 太长
       - rewrite
       - revise
       - expand
+      - compress
     # 「润色/去 AI 腔」不进本意图：交给 Studio → activate_agents(literary_editor)
-    # 「改章纲」走 revise_outline
+    # 「改章纲」走 revise_outline；「拆成两章」走 split_chapter
     none_keywords:
       - 润色
       - 去AI腔
@@ -332,6 +381,10 @@ intents:
       - AI腔
       - 章纲
       - outline
+      - 拆成两章
+      - 拆章
+      - 分成两章
+      - split_chapter
     default_instructions: >-
       扩写/重写本章至约 5000–6000 字，按章纲补足情节与细节，保持与前后章衔接。
     instructions_min_chars: 24

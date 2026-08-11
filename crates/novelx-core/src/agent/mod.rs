@@ -50,16 +50,24 @@ impl AgentHub {
     }
 
     pub async fn publish_result(&self, thread_id: &str, summary: String, data: Value) {
-        let resp = WaitAgentResponse {
+        let incoming = WaitAgentResponse {
             thread_id: thread_id.to_string(),
             summary,
             data,
         };
-        let waiters = {
+        // Interrupt must win races with late step completion — never overwrite.
+        let (resp, waiters) = {
             let mut slots = self.slots.lock().await;
             let slot = slots.entry(thread_id.to_string()).or_default();
-            slot.result = Some(resp.clone());
-            std::mem::take(&mut slot.waiters)
+            let resp = if let Some(prev) = slot.result.as_ref().filter(|r| {
+                r.data.get("interrupted").and_then(|v| v.as_bool()) == Some(true)
+            }) {
+                prev.clone()
+            } else {
+                slot.result = Some(incoming.clone());
+                incoming
+            };
+            (resp, std::mem::take(&mut slot.waiters))
         };
         for tx in waiters {
             let _ = tx.send(resp.clone());
@@ -73,6 +81,24 @@ impl AgentHub {
             .entry(parent.to_string())
             .or_default()
             .push(child.to_string());
+    }
+
+    pub async fn children_of(&self, parent: &str) -> Vec<ThreadId> {
+        self.children
+            .lock()
+            .await
+            .get(parent)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Summary from a completed wait slot (if any).
+    pub async fn result_summary(&self, thread_id: &str) -> Option<String> {
+        self.slots
+            .lock()
+            .await
+            .get(thread_id)
+            .and_then(|s| s.result.as_ref().map(|r| r.summary.clone()))
     }
 }
 
@@ -92,23 +118,16 @@ impl AgentRuntime for CoreAgentRuntime {
         if !registry::is_spawnable_role(&req.role) {
             anyhow::bail!("role '{}' is not spawnable", req.role);
         }
+        // Block full-chapter pipeline modes — those stranded Studio turns historically.
+        if let Some(msg) =
+            registry::pipeline_mode_spawn_forbidden(req.chapter, req.mode.as_deref())
+        {
+            anyhow::bail!("{msg}");
+        }
         let core = {
             let g = self.hub.core.lock().await;
             self.hub.upgrade(&g)?
         };
-        // Chapter pipeline children must be pipeline roles (writer, auditor, …).
-        // Use disk `pipeline.yaml` (same as execute), not compile-time defaults only.
-        if req.chapter.is_some()
-            && req.mode.as_deref().is_some_and(|m| {
-                matches!(m, "continue" | "revise" | "audit_only")
-            })
-            && !registry::is_pipeline_role(&req.role, &core.roots.config_root)
-        {
-            anyhow::bail!(
-                "role '{}' is not a chapter-pipeline agent",
-                req.role
-            );
-        }
         let parent = core
             .get_session_source(&req.parent_thread_id)
             .await

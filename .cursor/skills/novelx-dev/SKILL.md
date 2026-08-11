@@ -85,7 +85,7 @@ description: >-
 
 ## 超长篇约束（800–1000 章 × 5–6k）
 
-- 批写：`continue_writing_batch` / `--batch`；上限 `longform.batch_max_chapters`；遇硬门即停。
+- 批写：`continue_writing_batch` / `--batch`；上限 `longform.batch_max_chapters`；遇硬门即停；软门默认见 `unattended.yaml`。
 - `audit_tier: layered`：常规章轻量一致性上下文；高潮/奇数章/复审 full。
 - `quality_tier` + `pipeline.longform_lean`：专改/伏笔过滤。
 - 字数：目标 5000–6000；硬门默认 ≥4500；连续 SoftShort 可升格阻断。
@@ -105,9 +105,9 @@ description: >-
 ## 流水线与发布
 
 - 顺序以 `pipeline.yaml` 为准：先生产 → 专改 → 一致性 → 摘要 → `plot_acceptor`。
-- 一致性 P0 **挡发布**；节奏 P0 **不挡**；`plot_acceptor` 通过并发布成功才 `completed`。
+- 一致性 P0 **挡发布**；节奏 P0 **不挡**；`plot_acceptor` 未收束 **不挡**发布（跨多章铺垫）；通过并发布成功才 `completed`（可自动升 `next_plot`）。
 - 发布收尾只在**完整章流水线末尾**一次；单步 spawn 不推进 `next_chapter`。
-- 发布链：`validate_draft` → 字数硬门 → `content_rules` → 一致性 P0 → plot_acceptor。
+- 发布链：`validate_draft` → 字数硬门 → `content_rules` → 一致性 P0；缺收束条件硬拦，未收束仅记录。
 - 门控文案须吃透真实 `rule id` / `gate_prompt`，勿用泛化「第N章/禁名」fallback 盖掉细节。
 
 ## 测试与迁移
@@ -140,3 +140,9 @@ description: >-
 | 配置编辑边界 | `config/README.md` |
 | 架构总览 | `README.md` |
 | 创作工作流 | `.cursor/skills/create-novel/SKILL.md` |
+
+## 项目模式（longform / short_drama）
+
+- `meta.json` → `project_mode`：`longform`（默认）或 `short_drama`（AI 漫剧剧本）。
+- 短剧落盘 `episodes/NNN/script.md` + `pipeline-script.yaml`；**勿**套用 `chapter.yaml` 4500 字门与 volume/batch 工具。
+- 行为差异优先 YAML（`script.yaml` / `pipeline-script.yaml` / intents），保持题材中立。

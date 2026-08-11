@@ -126,6 +126,8 @@ pub async fn serve(repo_root: PathBuf, addr: SocketAddr) -> Result<()> {
         .route("/api/thread/new", post(thread_new))
         .route("/api/thread/resume", post(thread_resume))
         .route("/api/thread/turns", post(thread_save_turns))
+        .route("/api/thread/{id}/agents", get(thread_agents))
+        .route("/api/thread/{id}/snapshot", get(thread_snapshot_get))
         .route("/api/turn/start", post(turn_start))
         .route("/api/turn/interrupt", post(turn_interrupt))
         .route("/api/turn/steer", post(turn_steer))
@@ -155,6 +157,14 @@ pub async fn serve(repo_root: PathBuf, addr: SocketAddr) -> Result<()> {
         .route(
             "/api/projects/{name}/ops_journal",
             get(ops_journal_get),
+        )
+        .route(
+            "/api/projects/{name}/version_nodes",
+            get(version_nodes_get),
+        )
+        .route(
+            "/api/projects/{name}/version_nodes/{sha}/restore",
+            post(version_nodes_restore),
         )
         .route(
             "/api/projects/{name}/chapters/{chapter}",
@@ -242,6 +252,30 @@ struct ResumeReq {
     thread_id: String,
 }
 
+/// List SubAgents under a parent thread (Studio rail hydrate).
+async fn thread_agents(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let agents = state.core.list_child_agents(&id).await;
+    Json(serde_json::json!({ "ok": true, "threadId": id, "agents": agents }))
+}
+
+/// HTTP snapshot of any thread (root or SubAgent) — turns for replay.
+async fn thread_snapshot_get(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.core.thread_snapshot(&id).await {
+        Some(snap) => Json(snap),
+        None => Json(serde_json::json!({
+            "error": "unknown thread",
+            "threadId": id,
+            "turns": [],
+        })),
+    }
+}
+
 async fn thread_resume(
     State(state): State<AppState>,
     Json(req): Json<ResumeReq>,
@@ -304,7 +338,8 @@ async fn turn_start(
 #[derive(Debug, Deserialize)]
 struct InterruptReq {
     thread_id: String,
-    turn_id: String,
+    #[serde(default)]
+    turn_id: Option<String>,
 }
 
 async fn turn_interrupt(
@@ -317,7 +352,7 @@ async fn turn_interrupt(
         .handle_op(
             Op::InterruptTurn {
                 thread_id: req.thread_id,
-                turn_id: Some(req.turn_id),
+                turn_id: req.turn_id.filter(|s| !s.is_empty()),
             },
             tx,
         )
@@ -890,57 +925,39 @@ fn build_preview(repo_root: &std::path::Path, name: &str) -> serde_json::Value {
     let published = st.as_ref().map(|s| s.published_count).unwrap_or(0);
     let next = st.as_ref().map(|s| s.next_chapter).unwrap_or(1);
     let mut chapters = Vec::new();
-    let chapters_dir = dir.join("chapters");
-    if chapters_dir.exists() {
-        if let Ok(rd) = std::fs::read_dir(&chapters_dir) {
-            let mut nums: Vec<u32> = rd
-                .flatten()
-                .filter_map(|e| {
-                    e.file_name()
-                        .to_str()
-                        .and_then(|s| s.parse::<u32>().ok())
-                })
-                .collect();
-            nums.sort_unstable();
-            for n in nums {
-                let draft_raw = read_chapter_draft(&dir, n)
-                    .or_else(|| novelx_pipeline::read_chapter_draft_resolved(&dir, n))
-                    .unwrap_or_default();
-                let body_chars = if draft_raw.trim().is_empty() {
-                    0usize
-                } else {
-                    draft_body_chars(&draft_raw)
-                };
-                let has_outline = dir
-                    .join("chapters")
-                    .join(format!("{n:03}"))
-                    .join("outline.json")
-                    .exists()
-                    || dir
-                        .join("chapters")
-                        .join(format!("{n:03}"))
-                        .join("outline.md")
-                        .exists();
-                // Title: first markdown heading if present, else 第N章.
-                let title = draft_raw
-                    .lines()
-                    .next()
-                    .map(|l| l.trim().trim_start_matches('#').trim())
-                    .filter(|t| !t.is_empty() && t.chars().count() < 80)
-                    .map(|t| t.to_string())
-                    .unwrap_or_else(|| format!("第{n}章"));
-                chapters.push(serde_json::json!({
-                    "number": n,
-                    "title": title,
-                    "has_draft": body_chars > 0,
-                    "has_outline": has_outline,
-                    "body_chars": body_chars,
-                    // Bodies loaded on demand via GET /chapters/{n} (longform-safe).
-                    "draft": "",
-                    "outline": "",
-                }));
-            }
-        }
+    let short = novelx_pipeline::is_short_drama(&dir);
+    let unit_word = if short { "集" } else { "章" };
+    let nums = novelx_pipeline::list_chapter_numbers(&dir);
+    for n in nums {
+        let draft_raw = read_chapter_draft(&dir, n)
+            .or_else(|| novelx_pipeline::read_chapter_draft_resolved(&dir, n))
+            .unwrap_or_default();
+        let body_chars = if draft_raw.trim().is_empty() {
+            0usize
+        } else {
+            draft_body_chars(&draft_raw)
+        };
+        let unit_dir = novelx_pipeline::chapter_dir(&dir, n);
+        let has_outline = unit_dir.join("outline.json").exists()
+            || unit_dir.join("outline.md").exists();
+        // Title: first markdown heading if present, else 第N章/集.
+        let title = draft_raw
+            .lines()
+            .next()
+            .map(|l| l.trim().trim_start_matches('#').trim())
+            .filter(|t| !t.is_empty() && t.chars().count() < 80)
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| format!("第{n}{unit_word}"));
+        chapters.push(serde_json::json!({
+            "number": n,
+            "title": title,
+            "has_draft": body_chars > 0,
+            "has_outline": has_outline,
+            "body_chars": body_chars,
+            // Bodies loaded on demand via GET /chapters/{n} (longform-safe).
+            "draft": "",
+            "outline": "",
+        }));
     }
 
     let mut entities = serde_json::json!({
@@ -1037,10 +1054,14 @@ fn build_preview(repo_root: &std::path::Path, name: &str) -> serde_json::Value {
                 if ext == "md" || ext == "txt" {
                     if let Ok(text) = std::fs::read_to_string(&path) {
                         let display = match stem {
-                            "master_outline" | "master_planner" => display_master_outline(&text),
+                            "master_outline" | "master_planner" | "series_outline" => {
+                                display_master_outline(&text)
+                            }
                             "bible" => display_bible(&text),
                             _ => text,
                         };
+                        // series_outline is short-drama alias of 总纲 — keep for fallback reads,
+                        // but UI only surfaces the「总纲」tab (filters this key).
                         artifacts.insert(stem.to_string(), serde_json::Value::String(display));
                     }
                 }
@@ -1079,9 +1100,14 @@ fn build_preview(repo_root: &std::path::Path, name: &str) -> serde_json::Value {
 
     let setup_phase = resolve_setup_phase(&dir);
     let volume_phase = resolve_volume_phase(&dir);
+    let config_root = repo_root.join("config");
+    let volume_qa_phase =
+        novelx_pipeline::resolve_volume_qa_phase(&config_root, &dir, next.max(1));
+    let foreshadow = novelx_pipeline::resolve_foreshadow_phase(&config_root, &dir);
     let has_arc = !arc_outlines.is_empty() || novelx_pipeline::has_any_arc_outline(&dir);
     let has_master = artifacts
         .get("master_outline")
+        .or_else(|| artifacts.get("series_outline"))
         .or_else(|| artifacts.get("master_planner"))
         .and_then(|v| v.as_str())
         .map(|s| s.trim().len() > 20)
@@ -1096,6 +1122,7 @@ fn build_preview(repo_root: &std::path::Path, name: &str) -> serde_json::Value {
         "project": name,
         "name": name,
         "chapters": chapters,
+        "project_mode": if short { "short_drama" } else { "longform" },
         "story_outline": story_outline,
         "plots": plots,
         "entities": entities,
@@ -1110,6 +1137,10 @@ fn build_preview(repo_root: &std::path::Path, name: &str) -> serde_json::Value {
         "state": state_json,
         "setup_phase": setup_phase.as_str(),
         "volume_phase": volume_phase.as_str(),
+        "volume_qa_phase": volume_qa_phase.as_str(),
+        "foreshadow_phase": foreshadow.phase.as_str(),
+        "foreshadow_pressure": foreshadow.pressure,
+        "foreshadow_debt_cap": foreshadow.debt_cap,
         "has_master_outline": has_master,
         "has_arc_outline": has_arc,
         "longform_health": novelx_pipeline::longform_health_snapshot(&dir),
@@ -1186,6 +1217,7 @@ async fn library(State(state): State<AppState>) -> impl IntoResponse {
     for name in names {
         let dir = state.repo_root.join("projects").join(&name);
         let st = load_project_state(&dir).ok();
+        let short = novelx_pipeline::is_short_drama(&dir);
         items.push(serde_json::json!({
             "id": name,
             "name": name,
@@ -1194,6 +1226,7 @@ async fn library(State(state): State<AppState>) -> impl IntoResponse {
             "genre": st.as_ref().map(|s| s.genre.clone()).unwrap_or_default(),
             "next_chapter": st.as_ref().map(|s| s.next_chapter).unwrap_or(1),
             "published_count": st.as_ref().map(|s| s.published_count).unwrap_or(0),
+            "project_mode": if short { "short_drama" } else { "longform" },
             "status": "active",
         }));
     }
@@ -1210,6 +1243,7 @@ async fn library_one(State(state): State<AppState>, Path(name): Path<String>) ->
             "genre": st.get("genre").and_then(|v| v.as_str()).unwrap_or(""),
             "published_count": preview.get("published_count"),
             "next_chapter": preview.get("next_chapter"),
+            "project_mode": preview.get("project_mode"),
             "status": "active",
         },
         "preview": preview,
@@ -1286,6 +1320,90 @@ async fn ops_journal_get(
         "entries": entries,
     }))
     .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct VersionNodesGetQuery {
+    #[serde(default = "default_version_nodes_limit")]
+    limit: usize,
+}
+
+fn default_version_nodes_limit() -> usize {
+    40
+}
+
+async fn version_nodes_get(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(q): Query<VersionNodesGetQuery>,
+) -> impl IntoResponse {
+    let dir = state.repo_root.join("projects").join(&name);
+    if !dir.is_dir() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("项目「{name}」不存在"),
+            })),
+        )
+            .into_response();
+    }
+    let limit = q.limit.clamp(1, 500);
+    match state.core.list_project_version_nodes(&name, limit) {
+        Ok(nodes) => Json(serde_json::json!({
+            "ok": true,
+            "project": name,
+            "count": nodes.len(),
+            "nodes": nodes,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": e.to_string(),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn version_nodes_restore(
+    State(state): State<AppState>,
+    Path((name, sha)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let dir = state.repo_root.join("projects").join(&name);
+    if !dir.is_dir() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("项目「{name}」不存在"),
+            })),
+        )
+            .into_response();
+    }
+    match state
+        .core
+        .restore_project_version_node(&name, &sha, None, None)
+        .await
+    {
+        Ok(node) => Json(serde_json::json!({
+            "ok": true,
+            "project": name,
+            "restored": true,
+            "node": node,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": e.to_string(),
+            })),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1502,11 +1620,33 @@ fn replace_markdown_body(existing: &str, new_body: &str) -> String {
 }
 
 async fn library_delete(State(state): State<AppState>, Path(name): Path<String>) -> impl IntoResponse {
+    if name.is_empty()
+        || name == ".gitkeep"
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": "非法项目名", "deleted": name})),
+        )
+            .into_response();
+    }
     let dir = state.repo_root.join("projects").join(&name);
     if dir.exists() {
-        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("删除失败: {e}"),
+                    "deleted": name,
+                })),
+            )
+                .into_response();
+        }
     }
-    Json(serde_json::json!({"ok": true, "deleted": name}))
+    Json(serde_json::json!({"ok": true, "deleted": name})).into_response()
 }
 
 /// On-demand chapter body (preview lists omit full drafts for longform scale).
@@ -1677,6 +1817,7 @@ fn event_matches_thread(ev: &EventMsg, thread_id: &str) -> bool {
         | EventMsg::ReasoningContentDelta { thread_id: tid, .. }
         | EventMsg::ToolCallOutputDelta { thread_id: tid, .. }
         | EventMsg::RequestUserInput { thread_id: tid, .. }
+        | EventMsg::SessionPhaseChanged { thread_id: tid, .. }
         | EventMsg::TodoUpdated { thread_id: tid, .. }
         | EventMsg::ChatHistoryReset { thread_id: tid, .. } => tid == thread_id,
         EventMsg::AgentStatusChanged { status } => {

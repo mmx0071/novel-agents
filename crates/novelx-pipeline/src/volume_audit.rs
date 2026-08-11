@@ -112,6 +112,7 @@ pub fn persist_volume_audit_report(
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&path, &report.report_markdown)?;
+    let _ = crate::volume_qa::clear_volume_qa_mid_due(project_dir, report.volume_index);
     Ok(path)
 }
 

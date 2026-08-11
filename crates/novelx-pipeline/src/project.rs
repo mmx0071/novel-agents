@@ -78,14 +78,82 @@ pub fn project_dir(projects_root: &Path, name: &str) -> PathBuf {
     projects_root.join(name)
 }
 
+/// Project creation / runtime mode (`meta.json` → `project_mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectMode {
+    Longform,
+    ShortDrama,
+}
+
+impl ProjectMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Longform => "longform",
+            Self::ShortDrama => "short_drama",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s.trim() {
+            "short_drama" | "short-drama" | "script" | "drama" => Self::ShortDrama,
+            // Legacy alias used in early drafts / Web labels.
+            "novel" | "longform" | "" => Self::Longform,
+            _ => Self::Longform,
+        }
+    }
+}
+
+/// Read `project_mode` from meta.json (default longform).
+pub fn resolve_project_mode(project_dir: &Path) -> ProjectMode {
+    let path = project_dir.join("meta.json");
+    let Ok(text) = fs::read_to_string(&path) else {
+        return ProjectMode::Longform;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        return ProjectMode::Longform;
+    };
+    v.get("project_mode")
+        .and_then(|x| x.as_str())
+        .map(ProjectMode::parse)
+        .unwrap_or(ProjectMode::Longform)
+}
+
+pub fn is_short_drama(project_dir: &Path) -> bool {
+    resolve_project_mode(project_dir) == ProjectMode::ShortDrama
+}
+
 pub fn init_project(
     projects_root: &Path,
     name: &str,
     genre: &str,
     chapters: u32,
 ) -> Result<PathBuf> {
+    init_project_with_mode(projects_root, name, genre, chapters, ProjectMode::Longform)
+}
+
+pub fn init_project_with_mode(
+    projects_root: &Path,
+    name: &str,
+    genre: &str,
+    chapters: u32,
+    mode: ProjectMode,
+) -> Result<PathBuf> {
     let dir = project_dir(projects_root, name);
-    fs::create_dir_all(dir.join("chapters"))?;
+    let target = if mode == ProjectMode::ShortDrama && chapters == 900 {
+        20
+    } else {
+        chapters
+    };
+    match mode {
+        ProjectMode::ShortDrama => {
+            fs::create_dir_all(dir.join("episodes"))?;
+            // Keep chapters/ for tooling that probes both; empty is fine.
+            fs::create_dir_all(dir.join("chapters"))?;
+        }
+        ProjectMode::Longform => {
+            fs::create_dir_all(dir.join("chapters"))?;
+        }
+    }
     fs::create_dir_all(dir.join("entities/characters"))?;
     fs::create_dir_all(dir.join("entities/locations"))?;
     fs::create_dir_all(dir.join("entities/items"))?;
@@ -93,20 +161,51 @@ pub fn init_project(
     fs::create_dir_all(dir.join("lore"))?;
     fs::create_dir_all(dir.join("artifacts"))?;
 
-    let state = ProjectState::new(name, genre, chapters);
+    let mut state = ProjectState::new(name, genre, target);
+    if mode == ProjectMode::ShortDrama {
+        state.active_agents = novelx_harness::PipelineConfig::defaults_for_mode("short_drama")
+            .mvp()
+            .to_vec();
+        state
+            .meta
+            .insert("project_mode".into(), json!("short_drama"));
+    }
     save_project_state(&dir, &state)?;
 
-    let meta = serde_json::json!({
+    let mut meta = serde_json::json!({
         "name": name,
         "genre": genre,
-        "target_chapters": chapters,
+        "target_chapters": target,
         "brief": "",
         "setup_phase": "collecting",
+        "project_mode": mode.as_str(),
     });
+    if mode == ProjectMode::ShortDrama {
+        meta.as_object_mut()
+            .unwrap()
+            .insert("target_episodes".into(), json!(target));
+    }
     fs::write(dir.join("meta.json"), serde_json::to_string_pretty(&meta)?)?;
 
-    let bible = format!("# {name}\n\n题材：{genre}\n\n（世界观 Bible 待完善）\n");
+    // Schema-valid stub so setup can advance after outlines; upsert_setting still expected to flesh out.
+    let bible = format!(
+        "# 世界观 Bible\n\n\
+         ## 0. 一句话世界\n\
+         （待补全：一句话世界）\n\n\
+         ## 1. 时代与叙事框架\n\
+         题材：{genre}\n\n\
+         ## 2. 全局势力与阵营\n\
+         （待补全）\n\n\
+         ## 7. 开放问题\n\
+         （待补全）\n"
+    );
     fs::write(dir.join("artifacts/bible.md"), &bible)?;
+    // Best-effort shadow git for version nodes (ignore if git missing).
+    if crate::version_nodes::git_available() {
+        if let Err(e) = crate::version_nodes::ensure_repo(&dir) {
+            tracing::warn!(error = %e, "version repo init skipped");
+        }
+    }
     Ok(dir)
 }
 
@@ -141,7 +240,9 @@ pub fn refresh_meta_flags(project_dir: &Path) -> Result<()> {
     obj.insert(
         "has_master_outline".into(),
         Value::Bool(
-            path_nonempty(&project_dir.join("artifacts/master_planner.md"))
+            path_nonempty(&project_dir.join("artifacts/master_outline.md"))
+                || path_nonempty(&project_dir.join("artifacts/master_planner.md"))
+                || path_nonempty(&project_dir.join("artifacts/series_outline.md"))
                 || path_nonempty(&project_dir.join("artifacts/story_outline.json")),
         ),
     );
@@ -272,23 +373,42 @@ fn json_u64(n: u32) -> Value {
     Value::Number(n.into())
 }
 
+/// Unit directory: `chapters/NNN` (longform) or `episodes/NNN` (short_drama).
 pub fn chapter_dir(project_dir: &Path, chapter: u32) -> PathBuf {
-    project_dir.join("chapters").join(format!("{chapter:03}"))
+    let folder = if is_short_drama(project_dir) {
+        "episodes"
+    } else {
+        "chapters"
+    };
+    project_dir.join(folder).join(format!("{chapter:03}"))
+}
+
+/// Body filename under the unit dir.
+pub fn unit_body_filename(project_dir: &Path) -> &'static str {
+    if is_short_drama(project_dir) {
+        "script.md"
+    } else {
+        "draft.md"
+    }
 }
 
 pub fn read_chapter_draft(project_dir: &Path, chapter: u32) -> Option<String> {
-    // Prefer resolved draft (handles cold-archive gzip / stub).
-    if let Some(t) = crate::cold_archive::read_chapter_draft_resolved(project_dir, chapter) {
-        return Some(t);
+    let body_name = unit_body_filename(project_dir);
+    if body_name == "draft.md" {
+        // Prefer resolved draft (handles cold-archive gzip / stub).
+        if let Some(t) = crate::cold_archive::read_chapter_draft_resolved(project_dir, chapter) {
+            return Some(t);
+        }
     }
-    let path = chapter_dir(project_dir, chapter).join("draft.md");
+    let path = chapter_dir(project_dir, chapter).join(body_name);
     fs::read_to_string(path).ok()
 }
 
 pub fn write_chapter_draft(project_dir: &Path, chapter: u32, draft: &str) -> Result<()> {
     let dir = chapter_dir(project_dir, chapter);
     fs::create_dir_all(&dir)?;
-    fs::write(dir.join("draft.md"), draft)?;
+    let body_name = unit_body_filename(project_dir);
+    fs::write(dir.join(body_name), draft)?;
     // Invalidate cold-archive pointers so subsequent reads use the live draft.
     let _ = fs::remove_file(dir.join("draft.md.stub"));
     let _ = fs::remove_file(dir.join("draft.md.gz"));
@@ -365,8 +485,44 @@ pub fn read_chapter_outline(project_dir: &Path, chapter: u32) -> Option<String> 
 }
 
 /// Validate and write `outline.json` (JSON object or fenced JSON text).
+/// Legacy-compatible: allows `key_events` above the chapter budget (Web / migrate).
 pub fn write_chapter_outline(project_dir: &Path, chapter: u32, outline: &str) -> Result<()> {
-    let parsed = crate::schemas::parse_chapter_outline_text(outline)?;
+    write_chapter_outline_with(
+        project_dir,
+        chapter,
+        outline,
+        crate::schemas::OutlineValidateMode::Compatible,
+    )
+}
+
+/// Write outline enforcing chapter budget (`key_events` ≤ 4). Use for planner / revise_outline.
+pub fn write_chapter_outline_budget(
+    project_dir: &Path,
+    chapter: u32,
+    outline: &str,
+) -> Result<()> {
+    write_chapter_outline_with(
+        project_dir,
+        chapter,
+        outline,
+        crate::schemas::OutlineValidateMode::EnforceBudget,
+    )
+}
+
+fn write_chapter_outline_with(
+    project_dir: &Path,
+    chapter: u32,
+    outline: &str,
+    mode: crate::schemas::OutlineValidateMode,
+) -> Result<()> {
+    let parsed = match mode {
+        crate::schemas::OutlineValidateMode::Compatible => {
+            crate::schemas::parse_chapter_outline_text(outline)?
+        }
+        crate::schemas::OutlineValidateMode::EnforceBudget => {
+            crate::schemas::parse_chapter_outline_text_budget(outline)?
+        }
+    };
     let dir = chapter_dir(project_dir, chapter);
     fs::create_dir_all(&dir)?;
     let pretty = serde_json::to_string_pretty(&parsed)?;
@@ -396,23 +552,30 @@ pub fn list_projects(projects_root: &Path) -> Result<Vec<String>> {
 /// List chapter numbers that have a folder under `chapters/`.
 /// Disk directories are authoritative — indexes must not resurrect deleted chapters.
 pub fn list_chapter_numbers(project_dir: &Path) -> Vec<u32> {
-    let root = project_dir.join("chapters");
+    let roots = if is_short_drama(project_dir) {
+        vec![project_dir.join("episodes"), project_dir.join("chapters")]
+    } else {
+        vec![project_dir.join("chapters")]
+    };
     let mut disk = Vec::new();
-    if let Ok(rd) = fs::read_dir(&root) {
-        for e in rd.flatten() {
-            if !e.path().is_dir() {
-                continue;
-            }
-            if let Some(n) = e
-                .file_name()
-                .to_str()
-                .and_then(|s| s.parse::<u32>().ok())
-            {
-                disk.push(n);
+    for root in roots {
+        if let Ok(rd) = fs::read_dir(&root) {
+            for e in rd.flatten() {
+                if !e.path().is_dir() {
+                    continue;
+                }
+                if let Some(n) = e
+                    .file_name()
+                    .to_str()
+                    .and_then(|s| s.parse::<u32>().ok())
+                {
+                    disk.push(n);
+                }
             }
         }
     }
     disk.sort_unstable();
+    disk.dedup();
     disk
 }
 
@@ -613,7 +776,7 @@ mod tests {
                 text: "第二章才埋的线".into(),
                 status: "open".into(),
                 planted_chapter: 2,
-                resolved_chapter: 0,
+                ..Default::default()
             }],
             ..Default::default()
         };

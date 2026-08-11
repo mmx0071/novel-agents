@@ -94,6 +94,20 @@ pub enum AgentLifecycle {
     Interrupted,
 }
 
+/// Composer / dialogue readiness for a root (or parent) thread.
+///
+/// - `working`: active turn and/or descendant agents still running
+/// - `awaiting_human`: a Studio gate needs a choice (overrides working for the input box)
+/// - `idle`: nothing running and no open gate — waiting for the next user message
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerPhase {
+    #[default]
+    Idle,
+    Working,
+    AwaitingHuman,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentStatus {
@@ -330,6 +344,13 @@ pub enum EventMsg {
     AgentStatusChanged {
         status: AgentStatus,
     },
+    /// Authoritative composer busy/idle signal (turn + agent tree + human gates).
+    SessionPhaseChanged {
+        thread_id: ThreadId,
+        phase: ComposerPhase,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_turn_id: Option<TurnId>,
+    },
     Error {
         thread_id: Option<ThreadId>,
         message: String,
@@ -365,6 +386,41 @@ pub enum TodoStatus {
 pub struct TodoItem {
     pub content: String,
     pub status: TodoStatus,
+}
+
+/// Build a Codex-style progressive checklist for any multi-step job
+/// (audit queue, batch write, setup ladder, …).
+///
+/// - `current_index` is `in_progress` (clamped)
+/// - items before it are `completed`
+/// - items after it are `pending`
+/// - when `finished`, every item is `completed`
+pub fn progressive_todo_list(
+    labels: &[impl AsRef<str>],
+    current_index: usize,
+    finished: bool,
+) -> Vec<TodoItem> {
+    if labels.is_empty() {
+        return Vec::new();
+    }
+    let cur = current_index.min(labels.len().saturating_sub(1));
+    labels
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            let status = if finished || i < cur {
+                TodoStatus::Completed
+            } else if i == cur && !finished {
+                TodoStatus::InProgress
+            } else {
+                TodoStatus::Pending
+            };
+            TodoItem {
+                content: label.as_ref().to_string(),
+                status,
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -521,6 +577,8 @@ pub enum OpsJournalKind {
     AuditReport,
     HardBlock,
     HistoryReset,
+    CheckpointCreated,
+    CheckpointRestored,
 }
 
 impl OpsJournalKind {
@@ -546,6 +604,8 @@ impl OpsJournalKind {
             Self::AuditReport => "audit_report",
             Self::HardBlock => "hard_block",
             Self::HistoryReset => "history_reset",
+            Self::CheckpointCreated => "checkpoint_created",
+            Self::CheckpointRestored => "checkpoint_restored",
         }
     }
 
@@ -571,6 +631,8 @@ impl OpsJournalKind {
             "audit_report" => Some(Self::AuditReport),
             "hard_block" => Some(Self::HardBlock),
             "history_reset" => Some(Self::HistoryReset),
+            "checkpoint_created" => Some(Self::CheckpointCreated),
+            "checkpoint_restored" => Some(Self::CheckpointRestored),
             _ => None,
         }
     }
@@ -621,6 +683,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn progressive_todo_list_marks_one_in_progress() {
+        let labels = ["写第1章", "写第2章", "写第3章"];
+        let mid = progressive_todo_list(&labels, 1, false);
+        assert_eq!(mid[0].status, TodoStatus::Completed);
+        assert_eq!(mid[1].status, TodoStatus::InProgress);
+        assert_eq!(mid[2].status, TodoStatus::Pending);
+        let done = progressive_todo_list(&labels, 2, true);
+        assert!(done.iter().all(|t| t.status == TodoStatus::Completed));
+    }
+
+    #[test]
     fn event_roundtrip() {
         let ev = EventMsg::TurnStarted {
             thread_id: "thr_1".into(),
@@ -629,6 +702,26 @@ mod tests {
         let s = serde_json::to_string(&ev).unwrap();
         let back: EventMsg = serde_json::from_str(&s).unwrap();
         assert!(matches!(back, EventMsg::TurnStarted { .. }));
+    }
+
+    #[test]
+    fn session_phase_changed_roundtrip() {
+        let ev = EventMsg::SessionPhaseChanged {
+            thread_id: "thr_1".into(),
+            phase: ComposerPhase::AwaitingHuman,
+            active_turn_id: None,
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        assert!(s.contains("session_phase_changed"));
+        assert!(s.contains("awaiting_human"));
+        let back: EventMsg = serde_json::from_str(&s).unwrap();
+        assert!(matches!(
+            back,
+            EventMsg::SessionPhaseChanged {
+                phase: ComposerPhase::AwaitingHuman,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -674,5 +767,13 @@ mod tests {
         let back: OpsJournalEntry = serde_json::from_str(&s).unwrap();
         assert_eq!(back.kind, OpsJournalKind::MutationApplied);
         assert_eq!(OpsJournalKind::parse("gate_opened"), Some(OpsJournalKind::GateOpened));
+        assert_eq!(
+            OpsJournalKind::parse("checkpoint_created"),
+            Some(OpsJournalKind::CheckpointCreated)
+        );
+        assert_eq!(
+            OpsJournalKind::parse("checkpoint_restored"),
+            Some(OpsJournalKind::CheckpointRestored)
+        );
     }
 }

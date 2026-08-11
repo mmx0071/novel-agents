@@ -232,6 +232,49 @@ fn finish_in_progress_items(obj: &mut serde_json::Map<String, Value>) {
     }
 }
 
+/// Append streamed text onto an existing tool card without renaming it.
+/// Used when council steer/reaudit nests into the parent `audit_chapters` item.
+pub fn append_ui_tool_output(
+    turns: Value,
+    turn_id: &str,
+    item_id: &str,
+    delta: &str,
+    status: Option<&str>,
+) -> Value {
+    if delta.is_empty() && status.is_none() {
+        return turns;
+    }
+    let mut arr = match turns {
+        Value::Array(a) => a,
+        _ => Vec::new(),
+    };
+    for turn in &mut arr {
+        let Value::Object(obj) = turn else { continue };
+        if obj.get("id").and_then(|v| v.as_str()) != Some(turn_id) {
+            continue;
+        }
+        let Some(items) = obj.get_mut("items").and_then(|v| v.as_array_mut()) else {
+            break;
+        };
+        for item in items.iter_mut() {
+            let Value::Object(it) = item else { continue };
+            if it.get("id").and_then(|v| v.as_str()) != Some(item_id) {
+                continue;
+            }
+            if !delta.is_empty() {
+                let prev = it.get("output").and_then(|v| v.as_str()).unwrap_or("");
+                it.insert("output".into(), json!(format!("{prev}{delta}")));
+            }
+            if let Some(s) = status {
+                it.insert("status".into(), json!(s));
+            }
+            break;
+        }
+        break;
+    }
+    Value::Array(arr)
+}
+
 /// Persist a tool card into `ui_turns` so HTTP restore keeps the process timeline.
 pub fn upsert_ui_tool_call(
     turns: Value,
@@ -760,6 +803,35 @@ mod tests {
         assert_eq!(items[1]["name"], "continue_writing");
         assert!(items[0]["text"].as_str().unwrap().contains("完成"));
         assert_eq!(next[0]["status"], "complete");
+    }
+
+    #[test]
+    fn append_ui_tool_output_keeps_parent_name_and_running() {
+        let turns = json!([{
+            "id": "turn_1",
+            "status": "running",
+            "items": [{
+                "id": "audit_1",
+                "type": "tool_call",
+                "name": "audit_chapters",
+                "arguments": {"project": "sample-novel", "from": 1, "to": 3},
+                "output": "审阅队列：第1章",
+                "status": "in_progress"
+            }]
+        }]);
+        let next = append_ui_tool_output(
+            turns,
+            "turn_1",
+            "audit_1",
+            "\n评审团自动修订中…",
+            Some("in_progress"),
+        );
+        let item = &next[0]["items"][0];
+        assert_eq!(item["name"], "audit_chapters");
+        assert_eq!(item["status"], "in_progress");
+        let out = item["output"].as_str().unwrap();
+        assert!(out.contains("审阅队列：第1章"));
+        assert!(out.contains("评审团自动修订中"));
     }
 
     #[test]

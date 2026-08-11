@@ -3,6 +3,10 @@
 #   resolve_pipeline_agents(active_agents ∪ pipeline.mvp ∪ suggestions)
 # 按 config/pipeline.yaml 的 order 执行（无独立 Orchestrator LLM）。
 # 亦可用工具 activate_agents 显式激活扩展 Agent。
+#
+# 约定：
+# - 执行顺序只认 pipeline.yaml 的 order（勿写 depends_on；运行时不读该字段）。
+# - tier: mvp 的角色由 pipeline.mvp 每章纳入；勿再挂 activation（会被忽略）。
 
 agents:
   # ── MVP / Studio 注册（实际章节步骤见 pipeline.yaml mvp∪order） ──
@@ -18,35 +22,43 @@ agents:
     layer: story
     tier: mvp
     description: 输出单章详细章纲
-    depends_on: []
 
   writer:
     name: 正文写作
     layer: production
     tier: mvp
     description: 按章纲撰写正文初稿
-    depends_on: [chapter_planner]
 
   consistency_auditor:
     name: 一致性审计
     layer: qa
     tier: mvp
     description: 检查人物、时间线、设定一致性
-    depends_on: [writer]
 
   summarizer:
     name: 章节摘要
     layer: memory
     tier: mvp
     description: 生成章节摘要与新事实清单
-    depends_on: [consistency_auditor]
 
   plot_acceptor:
     name: 剧情验收
     layer: story
     tier: mvp
     description: 对照进行中剧情卡收束条件验收本章；通过则自动 completed
-    depends_on: [summarizer]
+
+  lore_librarian:
+    name: 设定检索
+    layer: world
+    tier: mvp
+    description: >-
+      Lore 确定性 query/assert（非 LLM）。章纲后切片注入 Writer；摘要后入库。
+
+  pacing_reviewer:
+    name: 节奏审查
+    layer: qa
+    tier: mvp
+    description: 检查节奏与信息密度（MVP 每章必跑；节奏 P0 不阻断发布）
 
   # ── 扩展 Agent（按需激活） ──
   world_architect:
@@ -59,21 +71,6 @@ agents:
         reason: 项目尚无世界观 Bible
       - condition: bible_stale
         reason: 设定变更超过 3 次未同步 Bible
-
-  lore_librarian:
-    name: 设定检索
-    layer: world
-    tier: mvp
-    description: >-
-      Lore 确定性 query/assert（非 LLM）。章纲后切片注入 Writer；摘要后入库。
-    depends_on: [chapter_planner]
-    activation:
-      - condition: entity_count_gt
-        threshold: 20
-        reason: 实体数量超过 20，需要结构化知识库
-      - condition: chapter_count_gt
-        threshold: 5
-        reason: 已发布超过 5 章，需要 RAG 检索
 
   volume_auditor:
     name: 卷级复盘
@@ -96,8 +93,6 @@ agents:
     activation:
       - condition: no_nomenclature
         reason: 尚无名词表，需建立与能力绑定的命名体系
-      - condition: has_bible
-        reason: 世界观已建立，启用取名 Agent 管理全书名词
       - condition: has_new_entity_hints
         reason: 本章出现未登记的新实体待命名
 
@@ -158,22 +153,10 @@ agents:
         threshold: 0
         reason: 已有未收伏笔，须每章核销/延期
       - condition: chapter_count_gt
-        threshold: 2
-        reason: 第 3 章起系统化伏笔管理，降低长程丢失
-
-  pacing_reviewer:
-    name: 节奏审查
-    layer: qa
-    tier: mvp
-    # 已在 pipeline.yaml mvp，每章必跑；下列 activation 仅兼容旧逻辑/说明，不表示「超阈值才审」。
-    description: 检查节奏与信息密度（MVP 每章必跑；节奏 P0 不阻断发布）
-    activation:
-      - condition: word_count_gt
-        threshold: 6000
-        reason: 本章超过 6000 字（提示加严节奏审，非启用门槛）
-      - condition: audit_fail_rate_gt
-        threshold: 0.2
-        reason: 近 5 章质检 FAIL 率超过 20%（提示加严节奏审）
+        threshold: 10
+        reason: >-
+          第 11 章起建议巡检（摘要可先埋线）；longform lean 在无未收且奇数章会跳过，
+          偶数章保留种植/巡检 cadence
 
   literary_editor:
     name: 文学润色
@@ -228,3 +211,43 @@ agents:
     description: 检阅预处理预期事件是否可纳入当前章/卷；不改正文，决策权在用户
     # 不进章流水线；由 Studio `review_expected_events` 按需调用
     activation: []
+
+  decision_council:
+    name: 评审团
+    layer: qa
+    tier: extended
+    description: 决策冲突加审；确定性聚合票，共识可自动修订，死锁才人审
+    # 不进章流水线；in-process（不 spawn SubAgent）；见 decision_council.yaml
+    activation: []
+
+  material_researcher:
+    name: 素材研究
+    layer: story
+    tier: extended
+    description: >-
+      剧情枯竭/需灵感时按需产出参考素材卡（非 Canon）；默认不进章流水线。
+      由 Studio `research_materials` 或 activate_agents 显式调用。
+    activation:
+      - condition: plot_drought
+        reason: 剧情冲突/钩子耗尽，建议补充背景素材
+      - condition: inspiration_needed
+        reason: 支路难分或质感不足，建议补充题材相关灵感素材
+
+  # ── 短剧 / AI 漫剧（project_mode=short_drama）──
+  episode_planner:
+    name: 集纲规划
+    layer: story
+    tier: mvp
+    description: 短剧单集场次/beat 集纲（pipeline-script）
+
+  script_writer:
+    name: 剧本草稿
+    layer: production
+    tier: mvp
+    description: 按集纲撰写漫剧剧本 script.md
+
+  beat_acceptor:
+    name: Beat 验收
+    layer: story
+    tier: mvp
+    description: 对照 beat/剧情卡收束条件验收本集（短剧语义的 plot_acceptor）

@@ -1,6 +1,7 @@
 //! Chapter-by-chapter audit queue (persisted under projects/<name>/.novelx/).
 
 use anyhow::Result;
+use novelx_protocol::{TodoItem, TodoStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -97,14 +98,14 @@ impl AuditQueue {
     }
 
     /// Codex-style todos: exactly one `in_progress` until the queue finishes.
-    pub fn to_codex_todos(&self) -> Vec<serde_json::Value> {
+    pub fn to_todo_items(&self) -> Vec<TodoItem> {
         self.results
             .iter()
             .enumerate()
             .map(|(i, r)| {
                 let (status, note) = if self.is_finished() {
                     (
-                        "completed",
+                        TodoStatus::Completed,
                         match r.status {
                             AuditQueueStatus::Skipped => "已跳过",
                             AuditQueueStatus::Revised => "已修订",
@@ -114,13 +115,16 @@ impl AuditQueue {
                         },
                     )
                 } else if i == self.index {
-                    ("in_progress", match r.status {
-                        AuditQueueStatus::Failed => "未通过 · 待处理",
-                        _ => "进行中",
-                    })
+                    (
+                        TodoStatus::InProgress,
+                        match r.status {
+                            AuditQueueStatus::Failed => "未通过 · 待处理",
+                            _ => "进行中",
+                        },
+                    )
                 } else if i < self.index {
                     (
-                        "completed",
+                        TodoStatus::Completed,
                         match r.status {
                             AuditQueueStatus::Skipped => "已跳过",
                             AuditQueueStatus::Revised => "已修订",
@@ -129,12 +133,27 @@ impl AuditQueue {
                         },
                     )
                 } else {
-                    ("pending", "待审")
+                    (TodoStatus::Pending, "待审")
                 };
-                json!({
-                    "content": format!("审校第{}章（{}）", r.chapter, note),
-                    "status": status,
-                })
+                TodoItem {
+                    content: format!("审校第{}章（{}）", r.chapter, note),
+                    status,
+                }
+            })
+            .collect()
+    }
+
+    /// JSON form for tool `data.todos` (same content as [`Self::to_todo_items`]).
+    pub fn to_codex_todos(&self) -> Vec<serde_json::Value> {
+        self.to_todo_items()
+            .into_iter()
+            .map(|t| {
+                let status = match t.status {
+                    TodoStatus::Completed => "completed",
+                    TodoStatus::InProgress => "in_progress",
+                    TodoStatus::Pending => "pending",
+                };
+                json!({ "content": t.content, "status": status })
             })
             .collect()
     }
@@ -232,4 +251,27 @@ pub fn clear_audit_queue(projects_root: &Path, project: &str) -> Result<()> {
         std::fs::remove_file(path)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn todos_track_progress_like_codex_checklist() {
+        let mut q = AuditQueue::new("sample-novel", 1, 3);
+        let t0 = q.to_todo_items();
+        assert_eq!(t0.len(), 3);
+        assert_eq!(t0[0].status, TodoStatus::InProgress);
+        assert_eq!(t0[1].status, TodoStatus::Pending);
+        assert_eq!(t0[2].status, TodoStatus::Pending);
+
+        q.set_current(AuditQueueStatus::Passed, "一致性通过");
+        assert!(q.advance());
+        let t1 = q.to_todo_items();
+        assert_eq!(t1[0].status, TodoStatus::Completed);
+        assert_eq!(t1[1].status, TodoStatus::InProgress);
+        assert!(t1[0].content.contains("第1章"));
+        assert!(t1[1].content.contains("第2章"));
+    }
 }

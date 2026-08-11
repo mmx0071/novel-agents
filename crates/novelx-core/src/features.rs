@@ -41,22 +41,30 @@ impl FeatureFlags {
         m.insert("studio.pause_after_clean_write".into(), false);
         m.insert("studio.stream_reasoning".into(), true);
         m.insert("studio.clear_history_on_new_chapter".into(), true);
-        m.insert("studio.auto_reaudit_after_steer".into(), true);
+        m.insert("studio.auto_reaudit_after_steer".into(), false);
         m.insert("studio.reject_weak_ui_turns".into(), true);
         m.insert("studio.enforce_setup_gate".into(), true);
         m.insert("studio.enforce_volume_phase".into(), true);
         m.insert("studio.enforce_chapter_order".into(), true);
         m.insert("studio.require_mutation_confirm".into(), true);
+        m.insert("studio.mutation_severity_policy".into(), true);
+        m.insert("studio.version_nodes".into(), true);
         m.insert("studio.impact_cascade".into(), true);
         m.insert("studio.impact_scan_all_drafts".into(), false);
         // Default false: use longform.yaml impact_scan_mode (indexed) instead of full-book scan.
         m.insert("studio.impact_scan_all_on_setting".into(), false);
         m.insert("pipeline.longform_lean".into(), true);
+        m.insert("pipeline.auto_split_hard_long".into(), true);
         m.insert("studio.require_volume_audit_mid".into(), true);
         m.insert("studio.require_volume_audit_handoff".into(), true);
+        // Batch / council auto-continue default-skip soft gates (unattended.yaml).
+        m.insert("studio.unattended_soft_skip".into(), true);
         m.insert("studio.cold_archive_drafts".into(), true);
         // Append-only decision/execution audit trail under .novelx/ops_journal.jsonl.
         m.insert("studio.ops_journal".into(), true);
+        m.insert("studio.decision_council".into(), false);
+        m.insert("studio.revise_plan".into(), true);
+        m.insert("studio.seal_on_chapter_pass".into(), true);
         Self { map: Arc::new(m) }
     }
 
@@ -118,6 +126,22 @@ impl FeatureFlags {
             .unwrap_or(true)
     }
 
+    /// When true with require_mutation_confirm: only high-severity tools open human cards.
+    pub fn mutation_severity_policy(&self) -> bool {
+        self.map
+            .get("studio.mutation_severity_policy")
+            .copied()
+            .unwrap_or(true)
+    }
+
+    /// Shadow git version nodes under `.novelx/versions.git`.
+    pub fn version_nodes(&self) -> bool {
+        self.map
+            .get("studio.version_nodes")
+            .copied()
+            .unwrap_or(true)
+    }
+
     pub fn impact_cascade(&self) -> bool {
         self.map
             .get("studio.impact_cascade")
@@ -139,6 +163,27 @@ impl FeatureFlags {
             .copied()
             .unwrap_or(true)
     }
+
+    /// Multi-agent Decision Council auto-resolve for content-audit FAIL.
+    pub fn decision_council(&self) -> bool {
+        self.enabled("studio.decision_council")
+    }
+
+    /// Deterministic RevisePlan before steer_run revise (local|full by type/hard gate).
+    pub fn revise_plan(&self) -> bool {
+        self.map
+            .get("studio.revise_plan")
+            .copied()
+            .unwrap_or(true)
+    }
+
+    /// Seal Studio chat after a chapter passes (before N+1).
+    pub fn seal_on_chapter_pass(&self) -> bool {
+        self.map
+            .get("studio.seal_on_chapter_pass")
+            .copied()
+            .unwrap_or(true)
+    }
 }
 
 #[cfg(test)]
@@ -152,5 +197,29 @@ mod tests {
             map: Arc::new(HashMap::from([("studio.ops_journal".into(), false)])),
         };
         assert!(!off.ops_journal());
+    }
+
+    #[test]
+    fn decision_council_defaults_off_seal_on() {
+        let d = FeatureFlags::defaults();
+        assert!(!d.decision_council());
+        assert!(d.seal_on_chapter_pass());
+    }
+
+    #[test]
+    fn severity_and_version_nodes_default_on() {
+        let d = FeatureFlags::defaults();
+        assert!(d.mutation_severity_policy());
+        assert!(d.version_nodes());
+    }
+
+    #[test]
+    fn unattended_soft_skip_defaults_on() {
+        // Disk-backed reads use UnattendedPolicy::soft_skip_enabled; map default stays aligned.
+        assert!(FeatureFlags::defaults().enabled("studio.unattended_soft_skip"));
+        let off = FeatureFlags {
+            map: Arc::new(HashMap::from([("studio.unattended_soft_skip".into(), false)])),
+        };
+        assert!(!off.enabled("studio.unattended_soft_skip"));
     }
 }

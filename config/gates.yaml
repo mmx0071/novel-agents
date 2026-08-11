@@ -9,13 +9,13 @@ gates:
   audit:
     options:
       - id: "1"
-        label: 修全部阻断项
+        label: 修全部问题
         tool: steer_run
         args:
           project: "{{project}}"
           chapter: "{{chapter}}"
           choice: revise
-        aliases: [修全部阻断项, 按审校局部修订, 局部修订]
+        aliases: [修全部问题, 修全部阻断项, 按审校局部修订, 局部修订]
       - id: "2"
         label: 接受并结束本轮
         tool: steer_run
@@ -30,12 +30,12 @@ gates:
   audit_infra:
     options:
       - id: ai_retry
-        label: 重试审计
+        label: 重新审校
         tool: audit_chapter
         args:
           project: "{{project}}"
           chapter: "{{chapter}}"
-        aliases: [重试审计, 重新审计, 再审一次, 再审计]
+        aliases: [重新审校, 重试审计, 重新审计, 再审一次, 再审计]
       - id: ai_skip
         label: 暂不处理
         tool: steer_run
@@ -50,13 +50,13 @@ gates:
   audit_queue:
     options:
       - id: "1"
-        label: 修全部阻断项
+        label: 修全部问题
         tool: steer_run
         args:
           project: "{{project}}"
           chapter: "{{chapter}}"
           choice: revise
-        aliases: [修全部阻断项, 按审校局部修订, 局部修订]
+        aliases: [修全部问题, 修全部阻断项, 按审校局部修订, 局部修订]
       - id: "2"
         label: 跳过，审下一章
         tool: audit_chapters
@@ -76,20 +76,20 @@ gates:
     options:
       # Non-numeric ids so typed「1/2/3」map via display order (resolve_volume_visible).
       - id: vs_sync
-        label: 同步设定并确认卷记忆
+        label: 同步设定并确认本卷摘要
         tool: sync_volume
         args:
           project: "{{project}}"
           volume: "{{volume}}"
           confirm_memory: "true"
-        aliases: [同步设定库, 同步, 同步设定并确认卷记忆, "1"]
+        aliases: [同步设定并确认本卷摘要, 同步设定库, 同步, 同步设定并确认卷记忆, "1"]
       - id: vs_memory
-        label: 仅确认卷记忆
+        label: 仅确认本卷摘要
         tool: confirm_volume_memory
         args:
           project: "{{project}}"
           volume: "{{volume}}"
-        aliases: [仅确认卷记忆, 确认卷记忆, 写入卷摘要, "2"]
+        aliases: [仅确认本卷摘要, 仅确认卷记忆, 确认卷记忆, 写入卷摘要, "2"]
       - id: vs_skip
         label: 跳过
         resolve: skip_volume
@@ -231,21 +231,21 @@ gates:
   setup_need_bible:
     options:
       - id: sbi_design
-        label: 生成世界观 Bible
+        label: 生成世界观
         tool: upsert_setting
         args:
           project: "{{project}}"
           topic: 完整世界观
-          content: "根据 brief、总纲与卷纲生成完整世界观 Bible，须含 # 世界观 与 ## 0./1./2./7. 必填节。"
-        aliases: [生成世界观 Bible, 生成 Bible, 补齐 Bible, upsert_setting]
+          content: "根据 brief、总纲与卷纲生成完整世界观，须含 # 世界观 与 ## 0./1./2./7. 必填节。"
+        aliases: [生成世界观, 生成世界观 Bible, 生成 Bible, 补齐 Bible, upsert_setting]
       - id: sbi_dismiss
         label: 暂不处理
         resolve: dismiss_gate
         aliases: [暂不处理, 取消, 稍后]
 
   # After chapter write/revise: server filters by publish result.
-  # published → cn_continue only; content-rule / length / plot_accept fail → cn_revise only
-  # (accept fail blocks publish). Legacy published+accept-fail may still show both.
+  # published → cn_continue (+ batch); hard_long → cn_split + cn_revise(compress);
+  # other length / content-rule / plot_accept fail → cn_revise.
   # IDs must NOT collide with audit / volume_sync bare ids.
   chapter_next:
     options:
@@ -258,6 +258,13 @@ gates:
         # (write next chapter / clarify). Listing it as a gate token makes stale-gate
         # handling treat「继续」as an expired audit choice.
         aliases: [继续创作, 继续写, 下一章, 续写, 继续推进, 继续推进本卡]
+      - id: cn_split
+        label: 拆成两章
+        tool: split_chapter
+        args:
+          project: "{{project}}"
+          chapter: "{{chapter}}"
+        aliases: [拆成两章, 拆章, 分成两章, 拆成两章发布, split_chapter]
       - id: cn_revise
         label: 修正本章
         tool: revise_chapter
@@ -271,5 +278,9 @@ gates:
         tool: continue_writing_batch
         args:
           project: "{{project}}"
+          # Soft phase skips also default via config/unattended.yaml; explicit for gate apply_args.
+          confirm_skip_volume_audit: "true"
+          confirm_skip_expected: "true"
+          confirm_skip_foreshadow: "true"
         aliases: [连写到卡点, 批写, 连续创作, 无人值守连写, continue_writing_batch]
 

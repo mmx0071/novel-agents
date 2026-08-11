@@ -1,5 +1,7 @@
 //! Mutation confirm helpers: preview first, apply only with `apply=true`.
+//! With `studio.mutation_severity_policy`, routine tools self-confirm (no human card).
 
+use crate::mutation_policy::{cached_policy, severity_policy_enabled};
 use crate::ToolResult;
 use serde_json::{json, Value};
 use std::path::Path;
@@ -14,12 +16,34 @@ pub fn wants_apply(args: &Value) -> bool {
     args.get("apply").and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
+/// Bool from JSON bool or gate-template string `"true"` / `"1"`.
+pub fn json_bool_arg(args: &Value, key: &str) -> Option<bool> {
+    args.get(key).and_then(|v| {
+        v.as_bool().or_else(|| {
+            v.as_str()
+                .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        })
+    })
+}
+
 /// Human gate already confirmed intent (e.g. chapter_order → continue_writing).
 /// Skips a second mutation confirm card; still subject to hard gates.
 pub fn confirm_skipped(args: &Value) -> bool {
     args.get("confirm_skip")
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
+}
+
+/// Routine tool under severity policy — system self-confirms (no human card).
+pub fn is_routine_self_confirm(config_root: &Path, kind: &str) -> bool {
+    if !mutation_confirm_enabled(config_root) {
+        return false;
+    }
+    if !severity_policy_enabled(config_root) {
+        return false;
+    }
+    let policy = cached_policy(config_root);
+    policy.severity_mode && policy.is_routine(kind)
 }
 
 /// When confirm is required, `apply=true` must carry a `mutation_id` from a prior preview.
@@ -92,7 +116,8 @@ pub fn preview_mutation(
 }
 
 /// When confirm is on and caller did not pass apply=true, return preview instead of writing.
-/// `apply=true` without `mutation_id` is rejected (cannot skip the confirm card).
+/// Routine tools under severity policy skip the card (self-confirm).
+/// `apply=true` without `mutation_id` is rejected for high tools.
 /// `confirm_skip=true` (gate-sourced) proceeds without a second card.
 pub fn maybe_preview(
     config_root: &Path,
@@ -107,6 +132,10 @@ pub fn maybe_preview(
         return None;
     }
     if confirm_skipped(args) {
+        return None;
+    }
+    // 1C: routine tools self-confirm — write immediately without human card.
+    if is_routine_self_confirm(config_root, kind) {
         return None;
     }
     if apply_without_mutation_id(config_root, args) {
@@ -126,9 +155,21 @@ pub fn with_confirm_skip(mut args: Value) -> Value {
     args
 }
 
+/// True when this tool call will mutate disk without opening a preview card.
+pub fn will_write_without_preview(config_root: &Path, kind: &str, args: &Value) -> bool {
+    if confirm_skipped(args) || wants_apply(args) {
+        return true;
+    }
+    if !mutation_confirm_enabled(config_root) {
+        return true;
+    }
+    is_routine_self_confirm(config_root, kind)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn preview_with_diffs_mentions_desk_diff() {
@@ -157,5 +198,48 @@ mod tests {
         );
         assert!(r.output.starts_with("⏸ 待确认："));
         assert!(!r.output.contains("写作台「修订对照」"));
+    }
+
+    #[test]
+    fn routine_skips_preview_when_severity_on() {
+        let dir = std::env::temp_dir().join(format!(
+            "novelx-mut-sev-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut feat = std::fs::File::create(dir.join("features.yaml")).unwrap();
+        write!(
+            feat,
+            "version: 1\nfeatures:\n  studio.require_mutation_confirm: true\n  studio.mutation_severity_policy: true\n"
+        )
+        .unwrap();
+        let mut pol = std::fs::File::create(dir.join("mutation_policy.yaml")).unwrap();
+        write!(
+            pol,
+            "version: 1\nmode: severity\nhigh_tools: [delete_entity]\nroutine_tools: [continue_writing, update_plot]\n"
+        )
+        .unwrap();
+        let args = json!({});
+        assert!(maybe_preview(
+            &dir,
+            &args,
+            "continue_writing",
+            "写章",
+            json!({}),
+            "continue_writing",
+            json!({"project": "demo"}),
+        )
+        .is_none());
+        assert!(maybe_preview(
+            &dir,
+            &args,
+            "delete_entity",
+            "删卡",
+            json!({}),
+            "delete_entity",
+            json!({"project": "demo"}),
+        )
+        .is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -5,30 +5,48 @@ mod expected_tools;
 mod multi_agent;
 mod mutation;
 mod mutation_gate;
+mod mutation_policy;
 mod tool_ui;
 
 pub use audit_queue::{
     clear_audit_queue, load_audit_queue, save_audit_queue, AuditQueue, AuditQueueItem,
     AuditQueueStatus,
 };
+
+fn emit_queue_todos(ctx: &ToolContext, q: &AuditQueue) {
+    emit_todos(ctx, q.to_todo_items());
+}
+
+/// Push a progressive checklist to Studio (any multi-step job).
+pub fn emit_todos(ctx: &ToolContext, todos: Vec<novelx_protocol::TodoItem>) {
+    if let Some(tx) = &ctx.todos {
+        let _ = tx.send(todos);
+    }
+}
 pub use mutation::{
-    apply_without_mutation_id, confirm_skipped, maybe_preview, mutation_confirm_enabled,
-    preview_mutation, reject_apply_without_id, wants_apply, with_confirm_skip,
+    apply_without_mutation_id, confirm_skipped, is_routine_self_confirm, json_bool_arg,
+    maybe_preview, mutation_confirm_enabled, preview_mutation, reject_apply_without_id,
+    wants_apply, will_write_without_preview, with_confirm_skip,
 };
+pub use mutation_policy::{cached_policy, MutationPolicy};
 pub use tool_ui::{agent_label_zh, tool_output_for_ui};
 
 use anyhow::Result;
 use async_trait::async_trait;
 use novelx_llm::LlmClient;
-use novelx_harness::NamingRules;
+use novelx_harness::{
+    apply_plan_to_steer_args, build_revise_plan, check_draft_with, load_revise_streak,
+    ContentRulesConfig, NamingRules, RevisePlanConfig, ReviseScope,
+};
 use novelx_pipeline::project::{
-    init_project, load_project_state, project_dir, read_chapter_outline, save_project_state,
-    write_chapter_outline,
+    init_project_with_mode, is_short_drama, load_project_state, project_dir, read_chapter_outline,
+    save_project_state, write_chapter_outline_budget, ProjectMode,
 };
 use novelx_pipeline::{
     active_volume_for_chapter, bound_for_volume, build_chapter_context, build_setting_audit_pack,
-    build_structure_audit_candidate, check_chapter_order, check_plot_write_gate_with,
-    check_revise_target, check_volume_audit_for_continue, check_volume_audit_for_sync,
+    build_structure_audit_candidate,     check_body_state_locus_conflicts,
+    check_body_state_side_conflicts, check_chapter_order, check_plot_write_gate_with,
+    check_revise_target, check_volume_audit_for_continue_ex, check_volume_audit_for_sync,
     confirm_setup_approve, confirm_setup_revise, design_plot_force_allowed,
     display_chapter_outline, ensure_bridge_plot_active, ensure_plot_card_lifecycle_frontmatter,
     execute_pipeline, format_cost_by_agent_line, format_cost_status_line,
@@ -37,16 +55,18 @@ use novelx_pipeline::{
     impact_source_outline, list_plots_summary, list_projects, load_memory, load_meta_json,
     load_volume_bounds, lock_brief, lore_query, mark_volume_sync_skipped,
     materialize_plot_card_markdown, maybe_advance_setup_after_outlines, maybe_cold_archive_volume,
-    normalize_plot_card_best_effort, parse_chapter_outline_text, plot_design_blocked_reason,
+    normalize_plot_card_best_effort, outline_budget_repair_hint,
+    parse_chapter_outline_text_budget, plot_design_blocked_reason,
     read_arc_outline_excerpt, read_arc_outline_text, read_chapter_draft,
     read_chapter_draft_resolved,
     rebuild_plot_index, resolve_setup_next_step, resolve_setup_phase, confirm_volume_memory,
-    resolve_volume_phase, run_continue_batch, run_setting_audit, run_volume_audit,
-    run_volume_drift_check_with, run_volume_sync, set_volume_phase, steer_revision_options,
-    update_plot_card, BatchContinueOpts, DriftCheckOpts, validate_arc_outline, validate_bible,
-    validate_entity_card, validate_master_outline, volume_chapter_span, ContextProfile,
-    EntityKind, PhaseEnforceFlags, PlotWriteGate, PlotWriteMode, RevisionOptions, RunMode,
-    SettingAuditPackOpts, SetupPhase, VolumePhase,
+    resolve_foreshadow_phase, resolve_volume_phase, resolve_volume_qa_phase,
+    run_continue_batch, run_setting_audit, run_volume_audit,
+    run_volume_drift_check_with, run_volume_sync, set_volume_phase, split_chapter_draft,
+    steer_revision_options, update_plot_card, BatchContinueOpts, DriftCheckOpts,
+    validate_arc_outline, validate_bible, validate_entity_card, validate_master_outline,
+    volume_chapter_span, ContextProfile, EntityKind, PhaseEnforceFlags, PlotWriteGate,
+    PlotWriteMode, RevisionOptions, RunMode, SettingAuditPackOpts, SetupPhase, VolumePhase,
 };
 use novelx_protocol::{AgentPath, ThreadId};
 use novelx_skills::{build_skill_injections, load_skills, SkillScope};
@@ -118,6 +138,8 @@ pub struct ToolContext {
     pub llm: Arc<LlmClient>,
     /// Optional sink for streaming tool progress (LLM chunks / step markers).
     pub progress: Option<mpsc::UnboundedSender<String>>,
+    /// Live Codex-style todo list updates (audit queue / multi-step tools).
+    pub todos: Option<mpsc::UnboundedSender<Vec<novelx_protocol::TodoItem>>>,
     /// Codex-style multi-agent control (set by novelx-core).
     pub agent_runtime: Option<Arc<dyn AgentRuntime>>,
     /// Calling thread (root or subagent) for spawn parent attribution.
@@ -142,12 +164,16 @@ pub trait ToolHandler: Send + Sync {
 
 pub struct ListProjects;
 pub struct ContinueWriting;
+pub struct ContinueEpisode;
 pub struct ContinueWritingBatch;
 pub struct ReplanVolume;
 pub struct ReviseChapter;
+pub struct ReviseEpisode;
+pub struct SplitChapter;
 pub struct AuditChapter;
 pub struct AuditChapters;
 pub struct AuditVolume;
+pub struct ResearchMaterials;
 pub struct ApplyDraftPatch;
 pub struct InitNovel;
 pub struct QueryLore;
@@ -207,7 +233,9 @@ impl ToolHandler for ContinueWriting {
             "properties":{
                 "project":{"type":"string"},
                 "chapter":{"type":"integer","description":"目标章号。用户指定第N章时必填；省略则用 next_chapter"},
-                "confirm_skip_volume_audit":{"type":"boolean","description":"跳过本卷中段必须先 audit_volume 的软门控"}
+                "confirm_skip_volume_audit":{"type":"boolean","description":"本次跳过卷 QA mid_due（不永久记入；无人值守批写默认如此）"},
+                "persist_volume_qa_skip":{"type":"boolean","description":"与 confirm_skip_volume_audit 联用：永久跳过本卷 mid 提醒"},
+                "confirm_skip_expected":{"type":"boolean","description":"跳过预处理预期检阅门控（无人值守/评审团自动续写默认已跳过）"}
             },
             "required":["project"]
         })
@@ -218,13 +246,17 @@ impl ToolHandler for ContinueWriting {
         let state = load_project_state(&dir)?;
         let explicit = args.get("chapter").and_then(|v| v.as_u64()).map(|c| c as u32);
         let chapter = explicit.unwrap_or(state.next_chapter).max(1);
-        let skip_vol_audit = args
-            .get("confirm_skip_volume_audit")
-            .and_then(|v| v.as_bool())
+        let skip_vol_audit = mutation::json_bool_arg(&args, "confirm_skip_volume_audit")
             .unwrap_or(false);
-        if let Some(block) =
-            check_volume_audit_for_continue(&ctx.config_root, &dir, chapter, skip_vol_audit)
-        {
+        let persist_vol_qa_skip =
+            mutation::json_bool_arg(&args, "persist_volume_qa_skip").unwrap_or(false);
+        if let Some(block) = check_volume_audit_for_continue_ex(
+            &ctx.config_root,
+            &dir,
+            chapter,
+            skip_vol_audit,
+            persist_vol_qa_skip,
+        ) {
             return Ok(ToolResult {
                 output: format!("⛔ 写章已拦截\n\n{}", block.message),
                 data: json!({
@@ -379,7 +411,7 @@ impl ToolHandler for ContinueWriting {
         ) {
             return Ok(prev);
         }
-        let run = run_pipeline_streaming(
+        let mut run = run_pipeline_streaming(
             ctx,
             &project,
             chapter,
@@ -387,6 +419,23 @@ impl ToolHandler for ContinueWriting {
             RevisionOptions::default(),
         )
         .await?;
+        // HardLong auto-split defers publish — re-audit part A in the same tool call.
+        if run.auto_split && !run.published {
+            let to = run.auto_split_to.unwrap_or(chapter.saturating_add(1));
+            if let Some(p) = &ctx.progress {
+                let _ = p.send(format!("⚙ 已自动拆出第{to}章，复审第{chapter}章…"));
+            }
+            run = run_pipeline_streaming(
+                ctx,
+                &project,
+                chapter,
+                RunMode::AuditOnly,
+                RevisionOptions::default(),
+            )
+            .await?;
+            run.auto_split = true;
+            run.auto_split_to = Some(to);
+        }
         let mut output = if ctx.progress.is_some() {
             if !run.message.is_empty() {
                 format!("\n——\n{}", run.message)
@@ -412,18 +461,24 @@ impl ToolHandler for ContinueWritingBatch {
         "continue_writing_batch"
     }
     fn description(&self) -> &'static str {
-        "无人值守连写多章，直到硬门控（一致性 FAIL / 卷审 / 卷末 / 字数阻断 / 剧情门）或达到 max_chapters。\
-         适合超长篇推进；不会跳过需人工确认的门。默认上限见 config/longform.yaml。"
+        "无人值守连写多章/多集，直到硬门控（一致性 FAIL / 卷相位交接 / 卷末 / 字数阻断 / 草稿形状 / 剧情门）或达到成功发布上限。\
+         默认按 config/unattended.yaml 跳过卷 QA mid_due、预期检阅、伏笔近债软相位（可用 respect_soft_gates=true 保留）。\
+         长篇写 chapters；短剧（short_drama）写 episodes（与 continue_episode 同一流水线）。\
+         字数不足可自动扩写；严重超长（HardLong）会自动拆成两单元一次。\
+         剧情验收未收束不阻断发布。未显式指定 until_chapter 时回落项目 target_chapters。\
+         默认上限见 config/longform.yaml。"
     }
     fn parameters(&self) -> Value {
         json!({
             "type":"object",
             "properties":{
                 "project":{"type":"string"},
-                "max_chapters":{"type":"integer","description":"最多连写章数（默认 longform.batch_max_chapters，上限 100）"},
-                "until_chapter":{"type":"integer","description":"写到该章号（含）后停止"},
-                "confirm_skip_volume_audit":{"type":"boolean","description":"跳过卷中审软门控"},
-                "confirm_skip_expected":{"type":"boolean","description":"跳过预处理预期检阅门控"},
+                "max_chapters":{"type":"integer","description":"本批最多成功发布章/集数（默认 longform.batch_max_chapters，上限 100；按发布计数，非尝试次数）"},
+                "until_chapter":{"type":"integer","description":"写到该章/集号（含）后停止；未设时回落 state.target_chapters"},
+                "confirm_skip_volume_audit":{"type":"boolean","description":"跳过卷 QA mid_due（短剧无卷审；无人值守默认已跳过）"},
+                "confirm_skip_expected":{"type":"boolean","description":"跳过预处理预期检阅门控（无人值守默认已跳过）"},
+                "confirm_skip_foreshadow":{"type":"boolean","description":"跳过伏笔 pressure_high 批写软停（无人值守默认已跳过）"},
+                "respect_soft_gates":{"type":"boolean","description":"为 true 时不应用无人值守软相位跳过（除非上面显式 skip）"},
                 "auto_length_revise":{"type":"boolean","description":"字数不足时自动全文扩写一次（默认 true）"}
             },
             "required":["project"]
@@ -434,42 +489,53 @@ impl ToolHandler for ContinueWritingBatch {
         if project.is_empty() {
             anyhow::bail!("project 必填");
         }
+        let dir = project_dir(&ctx.projects_root, &project);
+        let unit = if is_short_drama(&dir) { "集" } else { "章" };
+        let lf = novelx_harness::LongformConfig::load_from_config_root(&ctx.config_root);
+        // Resolve default here so preview / apply_args never show「连写最多 0 章」.
         let max_chapters = args
             .get("max_chapters")
             .and_then(|v| v.as_u64())
-            .map(|n| n as u32);
+            .map(|n| n as u32)
+            .unwrap_or(lf.batch_max_chapters)
+            .max(1)
+            .min(100);
         let until_chapter = args
             .get("until_chapter")
             .and_then(|v| v.as_u64())
             .map(|n| n as u32);
-        let skip_vol = args
-            .get("confirm_skip_volume_audit")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let skip_expected = args
-            .get("confirm_skip_expected")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let auto_length_revise = args
-            .get("auto_length_revise")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+        let skip_vol = mutation::json_bool_arg(&args, "confirm_skip_volume_audit").unwrap_or(false);
+        let skip_expected = mutation::json_bool_arg(&args, "confirm_skip_expected").unwrap_or(false);
+        let skip_foreshadow =
+            mutation::json_bool_arg(&args, "confirm_skip_foreshadow").unwrap_or(false);
+        let respect_soft_gates =
+            mutation::json_bool_arg(&args, "respect_soft_gates").unwrap_or(false);
+        let auto_length_revise =
+            mutation::json_bool_arg(&args, "auto_length_revise").unwrap_or(true);
+        let until_note = until_chapter
+            .map(|u| format!("，直到第{u}{unit}"))
+            .unwrap_or_else(|| {
+                // Mirror batch.rs: unset until falls back to target_chapters when > 0.
+                novelx_pipeline::load_project_state(&dir)
+                    .ok()
+                    .map(|s| s.target_chapters)
+                    .filter(|&t| t > 0)
+                    .map(|t| format!("，直到第{t}{unit}（项目 target_chapters）"))
+                    .unwrap_or_default()
+            });
         if let Some(prev) = mutation::maybe_preview(
             &ctx.config_root,
             &args,
             "continue_writing_batch",
-            &format!(
-                "将连写最多 {} 章（至硬门控为止）{}",
-                max_chapters.unwrap_or(0),
-                until_chapter
-                    .map(|u| format!("，直到第{u}章"))
-                    .unwrap_or_default()
-            ),
+            &format!("将连写最多 {max_chapters} {unit}（至硬门控为止）{until_note}"),
             json!({
                 "kind": "continue_writing_batch",
                 "max_chapters": max_chapters,
                 "until_chapter": until_chapter,
-                "markdown": "确认后开始批写；遇一致性/卷审/卷末/预期检阅/字数阻断即停；字数不足可自动扩写一次。",
+                "unit": unit,
+                "markdown": format!(
+                    "确认后开始批写；遇硬门控（一致性/卷交接/字数/剧情门）即停；默认跳过卷 QA mid_due / 预期检阅 / 伏笔近债软相位；字数不足可自动扩写。（单位：{unit}）"
+                ),
             }),
             "continue_writing_batch",
             json!({
@@ -478,6 +544,8 @@ impl ToolHandler for ContinueWritingBatch {
                 "until_chapter": until_chapter,
                 "confirm_skip_volume_audit": skip_vol,
                 "confirm_skip_expected": skip_expected,
+                "confirm_skip_foreshadow": skip_foreshadow,
+                "respect_soft_gates": respect_soft_gates,
                 "auto_length_revise": auto_length_revise,
             }),
         ) {
@@ -487,10 +555,12 @@ impl ToolHandler for ContinueWritingBatch {
             ctx,
             BatchContinueOpts {
                 project,
-                max_chapters,
+                max_chapters: Some(max_chapters),
                 until_chapter,
                 confirm_skip_volume_audit: skip_vol,
                 confirm_skip_expected: skip_expected,
+                confirm_skip_foreshadow: skip_foreshadow,
+                respect_soft_gates,
                 auto_length_revise,
             },
         )
@@ -528,6 +598,17 @@ impl ToolHandler for ReplanVolume {
         })
     }
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
+        let project = args["project"].as_str().unwrap_or("");
+        if !project.is_empty() {
+            let dir = project_dir(&ctx.projects_root, project);
+            if is_short_drama(&dir) {
+                return Ok(ToolResult {
+                    output: "短剧模式不使用 replan_volume。".into(),
+                    data: json!({"blocked": true, "reason": "short_drama_no_replan"}),
+                });
+            }
+        }
+
         let project = args["project"].as_str().unwrap_or("").to_string();
         let dir = project_dir(&ctx.projects_root, &project);
         let state = load_project_state(&dir)?;
@@ -666,6 +747,14 @@ impl ToolHandler for ReviseChapter {
                     "type":"array",
                     "description":"结构化审校问题（含 id/quote/location）；局部补丁优先按此定位"
                 },
+                "prefer_local_patch":{
+                    "type":"boolean",
+                    "description":"显式局部/整章档；缺省按 instructions 与 policies 判定"
+                },
+                "revise_scope":{
+                    "type":"string",
+                    "description":"local|full（来自 RevisePlan；full 时强制整章）"
+                },
                 "apply":{"type":"boolean","description":"true=确认落盘；默认预览"},
                 "mutation_id":{"type":"string"},
                 "cached_patches":{"description":"局部修订确认时携带的 before/after 补丁数组"}
@@ -699,6 +788,16 @@ impl ToolHandler for ReviseChapter {
         rev.revision_mode = true;
         if !audit_issues.is_empty() {
             rev.audit_issues = audit_issues.clone();
+        }
+        // Explicit RevisePlan / caller flag wins over keyword sniffing.
+        if let Some(flag) = args.get("prefer_local_patch").and_then(|v| v.as_bool()) {
+            rev.prefer_local_patch = flag;
+        } else if let Some(scope) = args.get("revise_scope").and_then(|v| v.as_str()) {
+            if scope.eq_ignore_ascii_case("full") {
+                rev.prefer_local_patch = false;
+            } else if scope.eq_ignore_ascii_case("local") {
+                rev.prefer_local_patch = true;
+            }
         }
         let prefer_local = rev.prefer_local_patch;
 
@@ -814,7 +913,23 @@ impl ToolHandler for ReviseChapter {
             return Ok(prev);
         }
 
-        let run = run_pipeline_streaming(ctx, &project, chapter, RunMode::Revise, rev).await?;
+        let mut run = run_pipeline_streaming(ctx, &project, chapter, RunMode::Revise, rev).await?;
+        if run.auto_split && !run.published {
+            let to = run.auto_split_to.unwrap_or(chapter.saturating_add(1));
+            if let Some(p) = &ctx.progress {
+                let _ = p.send(format!("⚙ 已自动拆出第{to}章，复审第{chapter}章…"));
+            }
+            run = run_pipeline_streaming(
+                ctx,
+                &project,
+                chapter,
+                RunMode::AuditOnly,
+                RevisionOptions::default(),
+            )
+            .await?;
+            run.auto_split = true;
+            run.auto_split_to = Some(to);
+        }
         let output = if ctx.progress.is_some() {
             if !run.message.is_empty() {
                 format!("\n——\n{}", run.message)
@@ -829,6 +944,128 @@ impl ToolHandler for ReviseChapter {
             obj.insert("impact_source".into(), impact_source_draft(chapter));
         }
         Ok(ToolResult { output, data })
+    }
+}
+
+#[async_trait]
+impl ToolHandler for SplitChapter {
+    fn name(&self) -> &'static str {
+        "split_chapter"
+    }
+    fn description(&self) -> &'static str {
+        "将严重超长的未发布草稿按段落边界拆成连续两章（N 与 N+1），不保留同章号上/下。\
+         适用于字数 HardLong 阻断；拆后请审校/发布前半，再处理后半。勿拆已发布章。"
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "project":{"type":"string"},
+                "chapter":{"type":"integer","description":"要拆的章号（通常为 tip 未发布草稿）"},
+                "cut_ratio":{"type":"number","description":"切开位置约 0.35–0.65，默认 0.5"},
+                "title_b":{"type":"string","description":"后半章标题后缀（可选）"},
+                "force":{"type":"boolean","description":"覆盖已有第N+1章短稿或强制拆已发布章（慎用）"},
+                "apply":{"type":"boolean","description":"true=确认落盘；默认预览"},
+                "mutation_id":{"type":"string"}
+            },
+            "required":["project","chapter"]
+        })
+    }
+    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
+        let project = args["project"].as_str().unwrap_or("");
+        if !project.is_empty() {
+            let dir = project_dir(&ctx.projects_root, project);
+            if is_short_drama(&dir) {
+                return Ok(ToolResult {
+                    output: "短剧模式不使用 split_chapter。请用 revise_episode 压缩或拆场。".into(),
+                    data: json!({"blocked": true, "reason": "short_drama_no_split"}),
+                });
+            }
+        }
+
+        let project = args["project"].as_str().unwrap_or("").to_string();
+        let chapter = args["chapter"].as_u64().unwrap_or(0) as u32;
+        if project.is_empty() || chapter == 0 {
+            anyhow::bail!("project 与 chapter 必填");
+        }
+        let cut_ratio = args
+            .get("cut_ratio")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.5) as f32;
+        let title_b = args
+            .get("title_b")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+        let dir = project_dir(&ctx.projects_root, &project);
+        let draft = read_chapter_draft(&dir, chapter).unwrap_or_default();
+        let body_n = novelx_pipeline::draft_body_chars(&draft);
+        if apply_without_mutation_id(&ctx.config_root, &args) {
+            return Ok(reject_apply_without_id());
+        }
+        let mut apply_args = args.clone();
+        if let Some(obj) = apply_args.as_object_mut() {
+            obj.insert("project".into(), json!(project));
+            obj.insert("chapter".into(), json!(chapter));
+            obj.insert("cut_ratio".into(), json!(cut_ratio));
+            if let Some(t) = &title_b {
+                obj.insert("title_b".into(), json!(t));
+            }
+            obj.insert("force".into(), json!(force));
+        }
+        if let Some(prev) = mutation::maybe_preview(
+            &ctx.config_root,
+            &args,
+            "split_chapter",
+            &format!(
+                "将第{chapter}章（约 {body_n} 字）拆成第{chapter}章 + 第{}章",
+                chapter + 1
+            ),
+            json!({
+                "kind": "split_chapter",
+                "project": project,
+                "chapter": chapter,
+                "next_chapter": chapter + 1,
+                "body_chars": body_n,
+                "cut_ratio": cut_ratio,
+                "markdown": format!(
+                    "确认后按段落边界切开：前半保留为第{chapter}章，后半写入第{}章；并清除两章审校/摘要缓存。",
+                    chapter + 1
+                ),
+            }),
+            "split_chapter",
+            apply_args,
+        ) {
+            return Ok(prev);
+        }
+        let result = split_chapter_draft(
+            &dir,
+            chapter,
+            cut_ratio,
+            title_b.as_deref(),
+            force,
+        )?;
+        Ok(ToolResult {
+            output: format!(
+                "已拆章：第{}章「{}」（{}字）+ 第{}章「{}」（{}字）。请先审校/发布前半，再处理后续。",
+                result.chapter_a,
+                result.title_a,
+                result.chars_a,
+                result.chapter_b,
+                result.title_b,
+                result.chars_b
+            ),
+            data: json!({
+                "split": true,
+                "chapter_a": result.chapter_a,
+                "chapter_b": result.chapter_b,
+                "chars_a": result.chars_a,
+                "chars_b": result.chars_b,
+                "title_a": result.title_a,
+                "title_b": result.title_b,
+                "project": project,
+            }),
+        })
     }
 }
 
@@ -915,8 +1152,11 @@ impl ToolHandler for ReviseOutline {
                      用户修订要求：{instructions}\n\n\
                      只输出一个 JSON 对象（可包在 ```json 代码块中），不要 Markdown 散文或解释。\n\
                      必填字段：title, pov, time_location, goal, conflict, emotion_curve,\n\
-                     key_events(数组≥2), characters(数组), items(数组), locations(数组),\n\
+                     plot_includes(数组), plot_defers(数组),\n\
+                     key_events(数组 2–4 条), characters(数组), items(数组), locations(数组),\n\
                      scene_tags(数组), cliffhanger, lore_queries(数组)。\n\
+                     篇幅预算：includes 估 5000–6000 字；key_events 只展开 includes 且≤4；\n\
+                     有进行中剧情卡时勿把整卡走向塞进本章，defers 至少 1 条。\n\
                      JSON 硬约束：字符串内禁止未转义的英文双引号；对话/强调用「」或『』；不要尾逗号。\n\
                      在现有章纲上按指令修改；未点名的情节尽量保留。必须服从 CanonContext。\n\
                      人物/组织命名遵守取名硬约束。\n\n\
@@ -935,16 +1175,19 @@ impl ToolHandler for ReviseOutline {
                     .await?
                     .trim()
                     .to_string();
-                // One repair pass if invalid.
-                if parse_chapter_outline_text(&out).is_err() {
-                    let err = parse_chapter_outline_text(&out)
-                        .err()
-                        .map(|e| e.to_string())
-                        .unwrap_or_default();
+                // Repair: schema/budget invalid, or soft gaps (empty includes / defers).
+                let has_plot =
+                    novelx_pipeline::active_plot_exit_context(&dir).is_some();
+                let needs_repair = match parse_chapter_outline_text_budget(&out) {
+                    Err(e) => Some(e.to_string()),
+                    Ok(o) => outline_budget_repair_hint(&o, has_plot),
+                };
+                if let Some(err) = needs_repair {
                     let repair = format!(
-                        "第{chapter}章章纲 JSON 无法解析，请输出修正后的完整 JSON 对象（可包在 ```json 中），不要解释。\n\
+                        "第{chapter}章章纲 JSON 不合规或篇幅切片不完整，请输出修正后的完整 JSON 对象（可包在 ```json 中），不要解释。\n\
                          错误：{err}\n\
                          要求：落实用户修订「{instructions}」；保留未点名情节；\
+                         plot_includes 至少 1 条；key_events 2–4 条；有进行中剧情卡时 plot_defers 至少 1 条；\
                          字符串内勿用未转义英文双引号；字段齐全。\n\n# 待修正原文\n{out}"
                     );
                     out = ctx
@@ -962,7 +1205,7 @@ impl ToolHandler for ReviseOutline {
             }
         };
 
-        let parsed = match parse_chapter_outline_text(&generated) {
+        let parsed = match parse_chapter_outline_text_budget(&generated) {
             Ok(o) => o,
             Err(e) => {
                 return Ok(ToolResult {
@@ -1013,7 +1256,7 @@ impl ToolHandler for ReviseOutline {
             return Ok(prev);
         }
 
-        write_chapter_outline(&dir, chapter, &pretty)?;
+        write_chapter_outline_budget(&dir, chapter, &pretty)?;
         Ok(ToolResult {
             output: format!("已更新第{chapter}章章纲（outline.json）"),
             data: json!({
@@ -1071,7 +1314,7 @@ impl ToolHandler for AuditChapter {
         let mut rev = RevisionOptions::default();
         rev.verify_previous = verify_previous;
         rev.full_rescan = full_rescan;
-        let run = run_pipeline_streaming(
+        let mut run = run_pipeline_streaming(
             ctx,
             &project,
             chapter,
@@ -1079,6 +1322,22 @@ impl ToolHandler for AuditChapter {
             rev,
         )
         .await?;
+        if run.auto_split && !run.published {
+            let to = run.auto_split_to.unwrap_or(chapter.saturating_add(1));
+            if let Some(p) = &ctx.progress {
+                let _ = p.send(format!("⚙ 已自动拆出第{to}章，复审第{chapter}章…"));
+            }
+            run = run_pipeline_streaming(
+                ctx,
+                &project,
+                chapter,
+                RunMode::AuditOnly,
+                RevisionOptions::default(),
+            )
+            .await?;
+            run.auto_split = true;
+            run.auto_split_to = Some(to);
+        }
         // When progress is live, the report already streamed via LlmDelta / step lines.
         // Do NOT paste run.message again — that duplicated the whole audit in the tool card.
         // Keep coda aligned with the real gate: consistency fail ≠ hard-rule block.
@@ -1177,6 +1436,9 @@ impl ToolHandler for AuditChapters {
                     .map(|q| (q.summary_markdown(), q.to_codex_todos()))
                     .unwrap_or_else(|| ("当前无审阅队列".into(), vec![]));
                 clear_audit_queue(&ctx.projects_root, &project)?;
+                if let Some(tx) = &ctx.todos {
+                    let _ = tx.send(Vec::new());
+                }
                 Ok(ToolResult {
                     output: summary,
                     data: json!({
@@ -1308,6 +1570,17 @@ impl ToolHandler for AuditVolume {
     }
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
         let project = args["project"].as_str().unwrap_or("");
+        if !project.is_empty() {
+            let dir = project_dir(&ctx.projects_root, project);
+            if is_short_drama(&dir) {
+                return Ok(ToolResult {
+                    output: "短剧模式不使用 audit_volume。请用 audit_chapter / audit_chapters 审集。".into(),
+                    data: json!({"blocked": true, "reason": "short_drama_no_audit_volume"}),
+                });
+            }
+        }
+
+        let project = args["project"].as_str().unwrap_or("");
         if project.is_empty() {
             anyhow::bail!("project 必填");
         }
@@ -1360,14 +1633,169 @@ impl ToolHandler for AuditVolume {
     }
 }
 
+#[async_trait]
+impl ToolHandler for ResearchMaterials {
+    fn name(&self) -> &'static str {
+        "research_materials"
+    }
+    fn description(&self) -> &'static str {
+        "剧情枯竭/需灵感时按需检索参考素材卡（非 Canon）。默认不调用；\
+         仅当 get_project_status / 激活建议出现 material_researcher，或用户明确要灵感时使用。\
+         产出 hooks 供 design_plot / 章纲注入，不改 Bible/正文。"
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "project":{"type":"string"},
+                "chapter":{"type":"integer","description":"当前章号，用于冷却；默认 next_chapter"},
+                "reason":{"type":"string","description":"conflict_thin|motif_repeat|world_texture_thin|plot_drought|other"},
+                "force":{"type":"boolean","description":"忽略冷却强制补充"}
+            },
+            "required":["project"]
+        })
+    }
+    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
+        let project = args["project"].as_str().unwrap_or("");
+        if project.is_empty() {
+            anyhow::bail!("project 必填");
+        }
+        let dir = project_dir(&ctx.projects_root, project);
+        let state = load_project_state(&dir)?;
+        let chapter = args["chapter"]
+            .as_u64()
+            .map(|n| n as u32)
+            .unwrap_or_else(|| state.next_chapter.max(1));
+        let reason = args["reason"].as_str().unwrap_or("plot_drought").trim();
+        let force = args["force"].as_bool().unwrap_or(false);
+
+        let mat_cfg = novelx_pipeline::load_material_runtime_config(&ctx.config_root);
+        if !mat_cfg.enabled {
+            return Ok(ToolResult {
+                output: "素材研究已在 decision_council.yaml 中关闭。".into(),
+                data: json!({
+                    "blocked": true,
+                    "reason": "material_disabled",
+                    "project": project,
+                }),
+            });
+        }
+        let cooldown = mat_cfg.cooldown_chapters;
+        let max_cards = mat_cfg.max_cards_per_call;
+        if !force && !novelx_pipeline::material_cooldown_allows(&dir, chapter, cooldown) {
+            return Ok(ToolResult {
+                output: format!(
+                    "素材冷却中（距上次不足 {cooldown} 章）。需要可传 force=true。"
+                ),
+                data: json!({
+                    "blocked": true,
+                    "reason": "material_cooldown",
+                    "project": project,
+                    "chapter": chapter,
+                    "cooldown_chapters": cooldown,
+                }),
+            });
+        }
+
+        let brief = novelx_pipeline::read_project_brief(&dir);
+        let (_src, bible_full) = novelx_pipeline::read_world_doc(&dir);
+        let bible = bible_full.chars().take(1600).collect::<String>();
+        let gaps = novelx_pipeline::active_plot_exit_context(&dir)
+            .map(|(entry, exit, _)| format!("活跃剧情「{}」收束：{exit}", entry.title))
+            .unwrap_or_else(|| "（无活跃剧情卡缺口描述）".into());
+        let skill = load_agent_skill(ctx, "material-researcher");
+        let prompt = novelx_pipeline::material_research_prompt(
+            &brief, &bible, &gaps, reason, max_cards,
+        );
+        let raw = ctx
+            .llm
+            .complete(
+                &skill,
+                &prompt,
+                Some(&ctx.llm.model_for_agent("material_researcher")),
+            )
+            .await?;
+        let parsed = extract_json_value_loose(&raw).unwrap_or_else(|| json!({}));
+        let cards = novelx_pipeline::parse_material_cards_json(&parsed, max_cards as usize);
+        if cards.is_empty() {
+            return Ok(ToolResult {
+                output: format!("素材 Agent 未产出可用卡片。原始输出节选：\n{}", &raw.chars().take(400).collect::<String>()),
+                data: json!({
+                    "blocked": true,
+                    "reason": "empty_materials",
+                    "project": project,
+                    "raw_excerpt": raw.chars().take(400).collect::<String>(),
+                }),
+            });
+        }
+        let ids = novelx_pipeline::save_material_cards(
+            &ctx.projects_root,
+            project,
+            chapter,
+            &cards,
+        )?;
+        let _ = novelx_pipeline::clear_drought_flag(&dir);
+        let _ = novelx_pipeline::clear_inspiration_flag(&dir);
+        let hooks: Vec<String> = cards
+            .iter()
+            .flat_map(|c| c.hooks.iter().cloned())
+            .take(8)
+            .collect();
+        Ok(ToolResult {
+            output: format!(
+                "已写入 {} 张参考素材卡（非 Canon）：{}。可在 design_plot / 章纲中使用 hooks。",
+                ids.len(),
+                ids.join(", ")
+            ),
+            data: json!({
+                "project": project,
+                "chapter": chapter,
+                "card_ids": ids,
+                "hooks": hooks,
+                "provenance": "model_grounded",
+                "do_not_canonize": true,
+            }),
+        })
+    }
+}
+
+fn extract_json_value_loose(raw: &str) -> Option<Value> {
+    let t = raw.trim();
+    if let Ok(v) = serde_json::from_str::<Value>(t) {
+        return Some(v);
+    }
+    if let Some(start) = t.find('{') {
+        if let Some(end) = t.rfind('}') {
+            if end > start {
+                if let Ok(v) = serde_json::from_str::<Value>(&t[start..=end]) {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    if let Some(start) = t.find('[') {
+        if let Some(end) = t.rfind(']') {
+            if end > start {
+                if let Ok(v) = serde_json::from_str::<Value>(&t[start..=end]) {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Audit current chapter; on pass, auto-advance until fail or queue done.
 async fn run_audit_queue_until_gate(
     ctx: &ToolContext,
     q: &mut AuditQueue,
 ) -> Result<ToolResult> {
     let mut reports = Vec::new();
+    // Show the full todo list immediately (Codex-style), then check off as we go.
+    emit_queue_todos(ctx, q);
     loop {
         let Some(chapter) = q.current_chapter() else {
+            emit_queue_todos(ctx, q);
             let todos = q.to_codex_todos();
             let out = q.summary_markdown();
             let project = q.project.clone();
@@ -1378,6 +1806,7 @@ async fn run_audit_queue_until_gate(
             });
         };
 
+        emit_queue_todos(ctx, q);
         if let Some(p) = &ctx.progress {
             let _ = p.send(format!(
                 "\n——\n审阅队列：第{chapter}章（{}/{}）\n{}\n",
@@ -1398,12 +1827,19 @@ async fn run_audit_queue_until_gate(
 
         let consistency_ok = run.consistency_passed == Some(true);
         let hard_blocked = run.content_rule_blocked;
-        // Advance only when consistency is clean and nothing else needs a human gate.
-        let passed = consistency_ok && !hard_blocked && !run.needs_user_choice;
+        let hard_length = audit_queue_hard_length(&run.length_status);
+        // Advance on consistency pass without content-rule / hard-length blocks.
+        // Soft needs_user_choice (shape note, volume_ended, chapter_next prompts) must
+        // NOT stall a multi-chapter audit queue — that left UI saying「复审通过/继续创作」
+        // while the queue was still parked on the same chapter.
+        let passed =
+            audit_queue_should_advance(run.consistency_passed, hard_blocked, &run.length_status);
         let short = if passed {
             "一致性通过".to_string()
         } else if hard_blocked && consistency_ok {
             "硬规则未通过".to_string()
+        } else if hard_length && consistency_ok {
+            "字数硬门未通过".to_string()
         } else if !consistency_ok {
             "一致性未通过".to_string()
         } else {
@@ -1431,7 +1867,9 @@ async fn run_audit_queue_until_gate(
                 &short,
             );
             save_audit_queue(&ctx.projects_root, q)?;
+            emit_queue_todos(ctx, q);
             if !q.advance() {
+                emit_queue_todos(ctx, q);
                 let todos = q.to_codex_todos();
                 let out = format!("{}\n\n{}", reports.join("\n\n——\n\n"), q.summary_markdown());
                 let project = q.project.clone();
@@ -1449,18 +1887,24 @@ async fn run_audit_queue_until_gate(
                 });
             }
             save_audit_queue(&ctx.projects_root, q)?;
+            emit_queue_todos(ctx, q);
             continue;
         }
 
         q.set_current(AuditQueueStatus::Failed, &short);
         save_audit_queue(&ctx.projects_root, q)?;
+        emit_queue_todos(ctx, q);
         let checklist = q.checklist_markdown();
         // Progress already carried the chapter report; keep a short fail coda + queue checklist.
-        // Hard-rule block with clean consistency is not「一致性未通过」.
+        // Hard-rule / hard-length with clean consistency is not「一致性未通过」.
         let output = if ctx.progress.is_some() {
             if hard_blocked && consistency_ok {
                 format!(
                     "\n——\n第{chapter}章硬规则未通过（详见上方流式输出；请在下方选择修正本章）\n\n{checklist}"
+                )
+            } else if hard_length && consistency_ok {
+                format!(
+                    "\n——\n第{chapter}章字数硬门未通过（详见上方流式输出；请在下方选择修正本章）\n\n{checklist}"
                 )
             } else {
                 format!(
@@ -1470,6 +1914,12 @@ async fn run_audit_queue_until_gate(
         } else if hard_blocked && consistency_ok {
             format!(
                 "\n——\n{}\n\n{}\n\n（硬规则未通过 — 请在下方选择修正本章）",
+                reports.join("\n\n——\n\n"),
+                checklist
+            )
+        } else if hard_length && consistency_ok {
+            format!(
+                "\n——\n{}\n\n{}\n\n（字数硬门未通过 — 请在下方选择修正本章）",
                 reports.join("\n\n——\n\n"),
                 checklist
             )
@@ -1507,6 +1957,22 @@ fn queue_data_finished(project: &str, todos: Vec<serde_json::Value>) -> serde_js
     })
 }
 
+/// Whether the audit queue may leave the current chapter after an AuditOnly run.
+/// Soft `needs_user_choice` (shape / volume prompts) is intentionally ignored.
+fn audit_queue_hard_length(length_status: &str) -> bool {
+    matches!(length_status, "hard_short" | "soft_short_escalated")
+}
+
+fn audit_queue_should_advance(
+    consistency_passed: Option<bool>,
+    content_rule_blocked: bool,
+    length_status: &str,
+) -> bool {
+    consistency_passed == Some(true)
+        && !content_rule_blocked
+        && !audit_queue_hard_length(length_status)
+}
+
 #[async_trait]
 impl ToolHandler for ApplyDraftPatch {
     fn name(&self) -> &'static str {
@@ -1541,7 +2007,7 @@ impl ToolHandler for InitNovel {
         "init_novel"
     }
     fn description(&self) -> &'static str {
-        "创建新小说项目"
+        "创建新项目。project_mode=longform（默认超长篇）或 short_drama（AI 漫剧短篇剧本）。"
     }
     fn parameters(&self) -> Value {
         json!({
@@ -1549,7 +2015,16 @@ impl ToolHandler for InitNovel {
             "properties":{
                 "name":{"type":"string"},
                 "genre":{"type":"string"},
-                "chapters":{"type":"integer"}
+                "chapters":{"type":"integer","description":"长篇目标章数软上限；短剧则为目标集数（默认 20）"},
+                "project_mode":{
+                    "type":"string",
+                    "enum":["longform","short_drama","novel"],
+                    "description":"longform/novel=超长篇；short_drama=AI 漫剧短篇剧本模式"
+                },
+                "mode":{
+                    "type":"string",
+                    "description":"project_mode 别名"
+                }
             },
             "required":["name"]
         })
@@ -1557,17 +2032,37 @@ impl ToolHandler for InitNovel {
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
         let name = args["name"].as_str().unwrap_or("untitled").to_string();
         let genre = args["genre"].as_str().unwrap_or("未定").to_string();
-        let chapters = args["chapters"].as_u64().unwrap_or(900) as u32;
-        let dir = init_project(&ctx.projects_root, &name, &genre, chapters)?;
+        let mode_raw = args
+            .get("project_mode")
+            .or_else(|| args.get("mode"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("longform");
+        let mode = ProjectMode::parse(mode_raw);
+        let default_n = if mode == ProjectMode::ShortDrama {
+            20
+        } else {
+            900
+        };
+        let chapters = args["chapters"].as_u64().unwrap_or(default_n) as u32;
+        let dir = init_project_with_mode(&ctx.projects_root, &name, &genre, chapters, mode)?;
         Ok(ToolResult {
-            output: format!("已创建项目 {}", dir.display()),
-            data: json!({"project": name, "path": dir}),
+            output: format!(
+                "已创建项目 {}（mode={}）",
+                dir.display(),
+                mode.as_str()
+            ),
+            data: json!({
+                "project": name,
+                "path": dir,
+                "project_mode": mode.as_str(),
+            }),
         })
     }
 }
 
 /// Read on-disk chapter draft / outline (not CanonContext).
 pub struct ReadChapter;
+pub struct ReadEpisode;
 
 #[async_trait]
 impl ToolHandler for ReadChapter {
@@ -2327,6 +2822,10 @@ impl ToolHandler for ListPlots {
                     .pointer("/foreshadow/dangling_total")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
+                let pressure = health
+                    .pointer("/foreshadow/dangling_pressure")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 output.push_str(&format!(
                     "\n\n——\n项目状态：下一章={} 已发布={} setup={} volume={}",
                     state.next_chapter,
@@ -2335,7 +2834,7 @@ impl ToolHandler for ListPlots {
                     vol.as_str(),
                 ));
                 if dangling > 0 {
-                    output.push_str(&format!(" 伏笔未收={dangling}"));
+                    output.push_str(&format!(" 伏笔未收={dangling}（近债={pressure}）"));
                 }
             }
         }
@@ -2589,8 +3088,21 @@ impl ToolHandler for DesignMasterOutline {
         let dir = project_dir(&ctx.projects_root, project);
         let state = load_project_state(&dir)?;
         let art = dir.join("artifacts");
-        let path = art.join("master_outline.md");
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let short = is_short_drama(&dir);
+        let path = if short {
+            let series = art.join("series_outline.md");
+            if series.exists() || !art.join("master_outline.md").exists() {
+                series
+            } else {
+                art.join("master_outline.md")
+            }
+        } else {
+            art.join("master_outline.md")
+        };
+        let existing = std::fs::read_to_string(&path)
+            .or_else(|_| std::fs::read_to_string(art.join("master_outline.md")))
+            .or_else(|_| std::fs::read_to_string(art.join("series_outline.md")))
+            .unwrap_or_default();
         let text = if wants_apply(&args) {
             args.get("cached_body")
                 .and_then(|v| v.as_str())
@@ -2607,17 +3119,32 @@ impl ToolHandler for DesignMasterOutline {
                     .unwrap_or(state.target_chapters)
                     .max(1);
                 let scale = longform_scale_hint(target, brief);
-                let prompt = format!(
-                    "为小说《{}》（题材：{}；目标体量约 {target} 章）撰写/更新总纲 Markdown。\n\
-                     硬性输出要求：\n\
-                     - 只输出 Markdown 正文本身，第一行必须是 `# 总纲`（可带副标题）\n\
-                     - 必须含 H2：一句话卖点、分卷（超长篇优先 ## 分卷，勿用短篇三幕敷衍）、主角弧、主线冲突；可含中后期升级台阶\n\
-                     - 禁止寒暄、禁止自我介绍、禁止用 ``` 代码块包裹、禁止提及文件路径 / story_outline.json / JSON\n\
-                     - 禁止逐章列表（第1章/第2章…）；但必须按目标体量给出清晰分卷骨架与每卷目标/终止条件\n\
-                     {scale}\n\
-                     用户补充：{brief}\n\n现有总纲（可空，可在其上修订；命名以用户补充与 Bible 为准）：\n{existing}",
-                    state.name, state.genre
-                );
+                let prompt = if short {
+                    format!(
+                        "为短剧/漫剧《{}》（题材：{}；目标约 {target} 集）撰写/更新系列总纲 Markdown。\n\
+                         硬性输出要求：\n\
+                         - 只输出 Markdown 正文本身，第一行必须是 `# 总纲`（可带副标题）\n\
+                         - 必须含以下 H2 标题（字面匹配）：`## 一句话卖点`、`## 分集骨架`、`## 主角弧`、`## 主线冲突`\n\
+                         - `## 分集骨架` 按集数给弧线（勿用长篇「分卷/三幕」敷衍；勿逐集散文细纲）\n\
+                         - 面向 AI 漫剧：对白驱动、场次节奏、集末钩子\n\
+                         - 禁止寒暄、禁止代码块包裹、禁止提及文件路径 / JSON\n\
+                         用户补充：{brief}\n\n现有总纲（可空）：\n{existing}",
+                        state.name, state.genre
+                    )
+                } else {
+                    format!(
+                        "为小说《{}》（题材：{}；目标体量约 {target} 章）撰写/更新总纲 Markdown。\n\
+                         硬性输出要求：\n\
+                         - 只输出 Markdown 正文本身，第一行必须是 `# 总纲`（可带副标题）\n\
+                         - 必须含 H2：一句话卖点、分卷（超长篇优先 ## 分卷，勿用短篇三幕敷衍）、主角弧、主线冲突；可含中后期升级台阶\n\
+                         - 禁止寒暄、禁止自我介绍、禁止用 ``` 代码块包裹、禁止提及文件路径 / story_outline.json / JSON\n\
+                         - 禁止逐章列表（第1章/第2章…）；但必须按目标体量给出清晰分卷骨架与每卷目标/终止条件\n\
+                         {scale}\n\
+                         用户补充：{brief}\n\n现有总纲（可空，可在其上修订；命名以用户补充与 Bible 为准）：\n{existing}",
+                        state.name, state.genre
+                    )
+                };
+
                 ctx.llm
                     .complete(
                         &skill,
@@ -2669,6 +3196,10 @@ impl ToolHandler for DesignMasterOutline {
         }
         std::fs::create_dir_all(&art)?;
         std::fs::write(&path, &text)?;
+        if short {
+            let _ = std::fs::write(art.join("series_outline.md"), &text);
+            let _ = std::fs::write(art.join("master_outline.md"), &text);
+        }
         if !brief.is_empty() {
             let _ = lock_brief(&dir, brief);
         }
@@ -2950,6 +3481,17 @@ impl ToolHandler for SyncVolume {
         })
     }
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
+        let project = args["project"].as_str().unwrap_or("");
+        if !project.is_empty() {
+            let dir = project_dir(&ctx.projects_root, project);
+            if is_short_drama(&dir) {
+                return Ok(ToolResult {
+                    output: "短剧模式不使用 sync_volume（无卷相位）。".into(),
+                    data: json!({"blocked": true, "reason": "short_drama_no_sync_volume"}),
+                });
+            }
+        }
+
         let project = args["project"].as_str().unwrap_or("");
         if project.is_empty() {
             anyhow::bail!("project 必填");
@@ -3290,9 +3832,16 @@ async fn generate_plot_card(
     } else {
         format!("【当前卷纲】\n{arc_excerpt}")
     };
+    let dir = project_dir(&ctx.projects_root, project);
+    let mat_hooks = novelx_pipeline::format_material_hooks_for_context(&dir, 900);
+    let mat_block = if mat_hooks.is_empty() {
+        String::new()
+    } else {
+        format!("\n{mat_hooks}\n")
+    };
     let prompt = format!(
         "为《{project}》写剧情卡「{title}》。要点：{brief}\n\
-         {arc_block}\n\
+         {arc_block}{mat_block}\
          【层级】卷纲统揽整卷；本卡只写卷内**一段**情节（scope 必须是 local）。\
          从卷纲冲突阶梯中切出本段节点，禁止把整卷阶梯/终止条件抄进一张卡。\
          收束条件须是本段落点（通常严于/早于卷纲终止条件），并写 next_plot 指向下一段。\
@@ -3872,8 +4421,8 @@ impl ToolHandler for GetProjectStatus {
         "get_project_status"
     }
     fn description(&self) -> &'static str {
-        "查看项目进度、setup/volume 阶段、active_agents、已有章节草稿；\
-         若触发长程 QA（如本卷 20+ 章 / 卷交接）会附带 volume_auditor → audit_volume 建议"
+        "查看项目进度、setup/volume/volume_qa/foreshadow 相位、active_agents、已有章节草稿；\
+         若触发长程 QA（如本卷 mid_due / 卷交接）会附带 volume_auditor → audit_volume 建议"
     }
     fn parameters(&self) -> Value {
         json!({
@@ -3891,6 +4440,9 @@ impl ToolHandler for GetProjectStatus {
         let state = load_project_state(&dir)?;
         let setup = resolve_setup_phase(&dir);
         let volume = resolve_volume_phase(&dir);
+        let chapter_for_qa = state.next_chapter.max(1);
+        let volume_qa = resolve_volume_qa_phase(&ctx.config_root, &dir, chapter_for_qa);
+        let foreshadow = resolve_foreshadow_phase(&ctx.config_root, &dir);
         let meta = load_meta_json(&dir);
         let brief = meta
             .get("brief")
@@ -3898,30 +4450,26 @@ impl ToolHandler for GetProjectStatus {
             .unwrap_or("")
             .to_string();
         let brief_preview: String = brief.chars().take(80).collect();
+        let short = is_short_drama(&dir);
         let mut chapters = Vec::new();
-        let ch_root = dir.join("chapters");
-        if let Ok(rd) = std::fs::read_dir(ch_root) {
-            for e in rd.flatten() {
-                let draft = e.path().join("draft.md");
-                let gz = e.path().join("draft.md.gz");
-                let stub = e.path().join("draft.md.stub");
-                if !(draft.exists() || gz.exists() || stub.exists()) {
-                    continue;
-                }
-                let n = e.file_name().to_string_lossy().to_string();
-                let ch_num = n.parse::<u32>().unwrap_or(0);
-                let len = if ch_num > 0 {
-                    read_chapter_draft_resolved(&dir, ch_num)
-                        .or_else(|| read_chapter_draft(&dir, ch_num))
-                        .map(|t| t.chars().count())
-                        .unwrap_or(0)
-                } else {
-                    std::fs::read_to_string(&draft)
-                        .map(|t| t.chars().count())
-                        .unwrap_or(0)
-                };
-                chapters.push(json!({"dir": n, "draft_chars": len}));
+        for ch_num in novelx_pipeline::list_chapter_numbers(&dir) {
+            let unit = novelx_pipeline::chapter_dir(&dir, ch_num);
+            let body = novelx_pipeline::unit_body_filename(&dir);
+            let draft = unit.join(body);
+            let gz = unit.join("draft.md.gz");
+            let stub = unit.join("draft.md.stub");
+            if !(draft.exists() || gz.exists() || stub.exists()) {
+                continue;
             }
+            let len = read_chapter_draft_resolved(&dir, ch_num)
+                .or_else(|| read_chapter_draft(&dir, ch_num))
+                .map(|t| t.chars().count())
+                .unwrap_or(0);
+            chapters.push(json!({
+                "dir": format!("{ch_num:03}"),
+                "draft_chars": len,
+                "unit": if short { "episode" } else { "chapter" },
+            }));
         }
         chapters.sort_by(|a, b| {
             let na = a["dir"]
@@ -3935,13 +4483,15 @@ impl ToolHandler for GetProjectStatus {
             na.cmp(&nb)
         });
         let mut output = format!(
-            "《{}》题材={} 下一章={} 已发布={} setup={} volume={} brief={} agents={:?} 草稿章数={}",
+            "《{}》题材={} 下一章={} 已发布={} setup={} volume={} volume_qa={} foreshadow={} brief={} agents={:?} 草稿章数={}",
             state.name,
             state.genre,
             state.next_chapter,
             state.published_count,
             setup.as_str(),
             volume.as_str(),
+            volume_qa.as_str(),
+            foreshadow.phase.as_str(),
             if brief_preview.is_empty() {
                 "（空）"
             } else {
@@ -3950,6 +4500,9 @@ impl ToolHandler for GetProjectStatus {
             state.active_agents,
             chapters.len()
         );
+        if let Some(advice) = novelx_pipeline::foreshadow_phase_advice(&foreshadow) {
+            output.push_str(&format!("\n{advice}"));
+        }
         if let Some(cost) = format_cost_status_line(&dir) {
             output.push_str(&format!("\n{cost}"));
         }
@@ -3959,10 +4512,15 @@ impl ToolHandler for GetProjectStatus {
         let health = longform_health_snapshot(&dir);
         if let Some(fs) = health.get("foreshadow") {
             let total = fs.get("dangling_total").and_then(|v| v.as_u64()).unwrap_or(0);
+            let pressure = fs
+                .get("dangling_pressure")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let far = fs.get("dangling_far").and_then(|v| v.as_u64()).unwrap_or(0);
             let cold = fs.get("open_cold").and_then(|v| v.as_u64()).unwrap_or(0);
             if total > 0 {
                 output.push_str(&format!(
-                    "\n伏笔债务：未收 {total} 条（冷归档 {cold}）"
+                    "\n伏笔债务：总量 {total}（近债/压力 {pressure}，远期 {far}，冷归档 {cold}）"
                 ));
             }
         }
@@ -4006,8 +4564,13 @@ impl ToolHandler for GetProjectStatus {
             data: json!({
                 "state": state_json,
                 "chapters": chapters,
+                "project_mode": if short { "short_drama" } else { "longform" },
                 "setup_phase": setup.as_str(),
                 "volume_phase": volume.as_str(),
+                "volume_qa_phase": volume_qa.as_str(),
+                "foreshadow_phase": foreshadow.phase.as_str(),
+                "foreshadow_pressure": foreshadow.pressure,
+                "foreshadow_debt_cap": foreshadow.debt_cap,
                 "brief": brief,
                 "deferred_pending": ee_pending,
                 "deferred_approved": ee_approved,
@@ -4153,7 +4716,7 @@ impl ToolHandler for SteerRun {
         "steer_run"
     }
     fn description(&self) -> &'static str {
-        "接续审校门控：revise（按 issue_ids 局部修订）/ accept（接受并结束）"
+        "接续审校门控：revise（按 RevisePlan/issue_ids 修订）/ accept（接受并结束）"
     }
     fn parameters(&self) -> Value {
         json!({
@@ -4167,7 +4730,10 @@ impl ToolHandler for SteerRun {
                     "type":"array",
                     "items":{"type":"string"},
                     "description":"只修这些 issue id；省略则修全部非基础设施问题"
-                }
+                },
+                "revise_scope":{"type":"string","description":"local|full（RevisePlan）"},
+                "prefer_local_patch":{"type":"boolean"},
+                "revise_plan":{"type":"object","description":"完整 RevisePlan（可选）"}
             },
             "required":["project","chapter","choice"]
         })
@@ -4176,8 +4742,8 @@ impl ToolHandler for SteerRun {
         let project = args["project"].as_str().unwrap_or("");
         let chapter = args["chapter"].as_u64().unwrap_or(1) as u32;
         let choice = args["choice"].as_str().unwrap_or("").trim().to_ascii_lowercase();
-        let extra = args["instructions"].as_str().unwrap_or("");
-        let issue_ids: Vec<String> = args
+        let mut extra = args["instructions"].as_str().unwrap_or("").to_string();
+        let mut issue_ids: Vec<String> = args
             .get("issue_ids")
             .and_then(|v| v.as_array())
             .map(|a| {
@@ -4204,9 +4770,9 @@ impl ToolHandler for SteerRun {
             .join(format!("{chapter:03}"))
             .join("audit.json");
         let audit_text = std::fs::read_to_string(&audit_path).unwrap_or_default();
-        let issues: Vec<Value> = serde_json::from_str::<Value>(&audit_text)
-            .ok()
-            .and_then(|v| v.get("issues").cloned())
+        let audit_json: Value = serde_json::from_str(&audit_text).unwrap_or(json!({}));
+        let issues: Vec<Value> = audit_json
+            .get("issues")
             .and_then(|x| x.as_array().cloned())
             .unwrap_or_default();
         // Skip META infrastructure noise — it must not drive local-patch revise loops.
@@ -4236,10 +4802,48 @@ impl ToolHandler for SteerRun {
                 issue_ids.join(", ")
             );
         }
+
+        let mut prefer_local_patch = args.get("prefer_local_patch").and_then(|v| v.as_bool());
+        let mut revise_scope = args
+            .get("revise_scope")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let mut plan_value = args.get("revise_plan").cloned();
+
+        // Rebuild plan when caller omitted scope (human gate / raw LLM tool call).
+        if revise_scope.is_none() && studio_revise_plan_enabled(&ctx.config_root) {
+            let plan_cfg = RevisePlanConfig::load(&ctx.config_root);
+            let mut violations = audit_json
+                .get("content_rule_violations")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if violations.is_empty() {
+                violations = live_hard_gate_violations(&dir, chapter, &ctx.config_root);
+            }
+            let streak = load_revise_streak(&dir, chapter);
+            let plan = build_revise_plan(&plan_cfg, &issues, &violations, streak);
+            if plan.scope != ReviseScope::Escalate {
+                let mut merged = args.clone();
+                apply_plan_to_steer_args(&mut merged, &plan);
+                if extra.is_empty() {
+                    extra = plan.instructions.clone();
+                } else if !plan.instructions.is_empty() {
+                    extra = format!("{extra}\n\n{}", plan.instructions);
+                }
+                if issue_ids.is_empty() {
+                    issue_ids = plan.issue_ids.clone();
+                }
+                prefer_local_patch = Some(plan.prefer_local_patch);
+                revise_scope = Some(plan.scope.as_str().to_string());
+                plan_value = Some(plan.to_value());
+            }
+        }
+
         let issue_brief = novelx_draft_patch::format_audit_issues_brief(&issues);
         let instructions = if !extra.is_empty() {
-            if issue_brief.is_empty() {
-                extra.to_string()
+            if issue_brief.is_empty() || extra.contains(&issue_brief) {
+                extra
             } else {
                 format!("{extra}\n\n{issue_brief}")
             }
@@ -4250,19 +4854,85 @@ impl ToolHandler for SteerRun {
         };
         // Reuse revise_chapter so local patches go through diff preview + apply.
         // Pass structured issues so collect_revision_targets can locate quotes/spans.
-        let revise_args = json!({
+        let mut revise_args = json!({
             "project": project,
             "chapter": chapter,
             "instructions": instructions,
             "audit_issues": issues,
         });
+        if let Some(obj) = revise_args.as_object_mut() {
+            if let Some(flag) = prefer_local_patch {
+                obj.insert("prefer_local_patch".into(), json!(flag));
+            }
+            if let Some(scope) = &revise_scope {
+                obj.insert("revise_scope".into(), json!(scope));
+            }
+        }
         let mut result = ReviseChapter.call(ctx, revise_args).await?;
         if let Some(obj) = result.data.as_object_mut() {
             obj.insert("issue_ids".into(), json!(issue_ids));
             obj.insert("targeted_issues".into(), json!(issues.len()));
+            if let Some(scope) = revise_scope {
+                obj.insert("revise_scope".into(), json!(scope));
+            }
+            if let Some(plan) = plan_value {
+                obj.insert("revise_plan".into(), plan);
+            }
         }
         Ok(result)
     }
+}
+
+/// `studio.revise_plan` from features.yaml (default true).
+fn studio_revise_plan_enabled(config_root: &std::path::Path) -> bool {
+    let path = config_root.join("features.yaml");
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return true;
+    };
+    let Ok(v) = serde_yaml::from_str::<Value>(&raw) else {
+        return true;
+    };
+    v.get("features")
+        .and_then(|f| f.get("studio.revise_plan"))
+        .and_then(|b| b.as_bool())
+        .unwrap_or(true)
+}
+
+fn live_hard_gate_violations(
+    project_dir: &std::path::Path,
+    chapter: u32,
+    config_root: &std::path::Path,
+) -> Vec<Value> {
+    let Some(draft) = read_chapter_draft(project_dir, chapter) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let content_rules = ContentRulesConfig::load_from_config_root(config_root);
+    let naming = NamingRules::load_from_config_root(config_root);
+    for v in check_draft_with(&content_rules, &draft, &naming.forbidden_names) {
+        if v.blocking {
+            out.push(json!({
+                "rule": v.rule,
+                "message": v.message,
+                "blocking": true,
+            }));
+        }
+    }
+    for msg in check_body_state_side_conflicts(project_dir, chapter, &draft) {
+        out.push(json!({
+            "rule": "body_state_side",
+            "message": msg,
+            "blocking": true,
+        }));
+    }
+    for msg in check_body_state_locus_conflicts(project_dir, chapter, &draft) {
+        out.push(json!({
+            "rule": "body_state_locus",
+            "message": msg,
+            "blocking": true,
+        }));
+    }
+    out
 }
 
 #[async_trait]
@@ -4658,22 +5328,257 @@ impl ToolHandler for DeleteEntity {
     }
 }
 
+pub struct ListVersionNodes;
+pub struct RestoreVersionNode;
+
+#[async_trait]
+impl ToolHandler for ListVersionNodes {
+    fn name(&self) -> &'static str {
+        "list_version_nodes"
+    }
+    fn description(&self) -> &'static str {
+        "列出作品 shadow git 版本节点（最近优先），供回退选择"
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "project":{"type":"string"},
+                "limit":{"type":"integer","description":"默认 30，最大 200"}
+            },
+            "required":["project"]
+        })
+    }
+    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
+        let project = args["project"].as_str().unwrap_or("");
+        if project.is_empty() {
+            anyhow::bail!("project 必填");
+        }
+        let limit = args["limit"].as_u64().unwrap_or(30).clamp(1, 200) as usize;
+        let dir = project_dir(&ctx.projects_root, project);
+        if novelx_pipeline::version_git_available() {
+            let _ = novelx_pipeline::ensure_version_repo(&dir);
+        }
+        let nodes = novelx_pipeline::list_version_nodes(&dir, limit)?;
+        let lines: Vec<String> = nodes
+            .iter()
+            .map(|n| {
+                format!(
+                    "{}  {}  {}{}",
+                    &n.sha[..n.sha.len().min(10)],
+                    n.label,
+                    n.summary.chars().take(60).collect::<String>(),
+                    n.chapter.map(|c| format!("  ch{c}")).unwrap_or_default()
+                )
+            })
+            .collect();
+        Ok(ToolResult {
+            output: if lines.is_empty() {
+                "尚无版本节点（首次改盘后会自动打点）".into()
+            } else {
+                lines.join("\n")
+            },
+            data: json!({
+                "project": project,
+                "count": nodes.len(),
+                "nodes": nodes,
+            }),
+        })
+    }
+}
+
+#[async_trait]
+impl ToolHandler for RestoreVersionNode {
+    fn name(&self) -> &'static str {
+        "restore_version_node"
+    }
+    fn description(&self) -> &'static str {
+        "将作品工作树回退到指定版本节点 sha（高位操作，须人审确认；会先打 pre-restore 安全点）"
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "project":{"type":"string"},
+                "sha":{"type":"string","description":"版本节点 commit sha（可短 hash）"},
+                "apply":{"type":"boolean"},
+                "mutation_id":{"type":"string"}
+            },
+            "required":["project","sha"]
+        })
+    }
+    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
+        let project = args["project"].as_str().unwrap_or("");
+        let sha = args["sha"].as_str().unwrap_or("").trim();
+        if project.is_empty() || sha.is_empty() {
+            anyhow::bail!("project 与 sha 必填");
+        }
+        if !novelx_pipeline::version_git_available() {
+            return Ok(ToolResult {
+                output: "本机未安装 git，无法回退版本节点".into(),
+                data: json!({"blocked": true, "reason": "git_missing", "project": project}),
+            });
+        }
+        if let Some(prev) = mutation::maybe_preview(
+            &ctx.config_root,
+            &args,
+            "restore_version_node",
+            &format!("将回退作品到版本节点 {sha}"),
+            json!({ "sha": sha, "project": project }),
+            "restore_version_node",
+            args.clone(),
+        ) {
+            return Ok(prev);
+        }
+        let dir = project_dir(&ctx.projects_root, project);
+        let node = novelx_pipeline::restore_version_node(&dir, sha)?;
+        Ok(ToolResult {
+            output: format!(
+                "已回退到 {}（{}）",
+                &node.sha[..node.sha.len().min(12)],
+                node.label
+            ),
+            data: json!({
+                "project": project,
+                "restored": true,
+                "node": node,
+            }),
+        })
+    }
+}
+
+
+#[async_trait]
+impl ToolHandler for ContinueEpisode {
+    fn name(&self) -> &'static str {
+        "continue_episode"
+    }
+    fn description(&self) -> &'static str {
+        "短剧模式：续写下一集或指定集（产出 episodes/NNN/script.md）。多集连写到卡点请用 continue_writing_batch。长篇请用 continue_writing。"
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "project":{"type":"string"},
+                "episode":{"type":"integer","description":"目标集号；省略则用 next_chapter"},
+                "chapter":{"type":"integer","description":"episode 别名"}
+            },
+            "required":["project"]
+        })
+    }
+    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
+        let project = args["project"].as_str().unwrap_or("");
+        let dir = project_dir(&ctx.projects_root, project);
+        if !is_short_drama(&dir) {
+            return Ok(ToolResult {
+                output: "当前项目不是 short_drama。请用 continue_writing，或重建项目时指定 project_mode=short_drama。".into(),
+                data: json!({"blocked": true, "reason": "not_short_drama"}),
+            });
+        }
+        let mut args = args.clone();
+        if let Some(ep) = args.get("episode").cloned() {
+            if let Some(obj) = args.as_object_mut() {
+                obj.insert("chapter".into(), ep);
+            }
+        }
+        ContinueWriting.call(ctx, args).await
+    }
+}
+
+#[async_trait]
+impl ToolHandler for ReviseEpisode {
+    fn name(&self) -> &'static str {
+        "revise_episode"
+    }
+    fn description(&self) -> &'static str {
+        "短剧模式：修订指定集剧本。长篇请用 revise_chapter。"
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "project":{"type":"string"},
+                "episode":{"type":"integer"},
+                "chapter":{"type":"integer","description":"episode 别名"},
+                "instructions":{"type":"string"},
+                "apply":{"type":"boolean"},
+                "mutation_id":{"type":"string"}
+            },
+            "required":["project"]
+        })
+    }
+    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
+        let project = args["project"].as_str().unwrap_or("");
+        let dir = project_dir(&ctx.projects_root, project);
+        if !is_short_drama(&dir) {
+            return Ok(ToolResult {
+                output: "当前项目不是 short_drama。请用 revise_chapter。".into(),
+                data: json!({"blocked": true, "reason": "not_short_drama"}),
+            });
+        }
+        let mut args = args.clone();
+        if let Some(ep) = args.get("episode").cloned() {
+            if let Some(obj) = args.as_object_mut() {
+                obj.insert("chapter".into(), ep);
+            }
+        }
+        ReviseChapter.call(ctx, args).await
+    }
+}
+
+#[async_trait]
+impl ToolHandler for ReadEpisode {
+    fn name(&self) -> &'static str {
+        "read_episode"
+    }
+    fn description(&self) -> &'static str {
+        "短剧模式：读取指定集 script.md 与集纲 outline。"
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "project":{"type":"string"},
+                "episode":{"type":"integer"},
+                "chapter":{"type":"integer","description":"episode 别名"},
+                "max_chars":{"type":"integer"}
+            },
+            "required":["project"]
+        })
+    }
+    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult> {
+        let mut args = args.clone();
+        if let Some(ep) = args.get("episode").cloned() {
+            if let Some(obj) = args.as_object_mut() {
+                obj.insert("chapter".into(), ep);
+            }
+        }
+        ReadChapter.call(ctx, args).await
+    }
+}
+
 pub fn all_tools() -> Vec<Arc<dyn ToolHandler>> {
     vec![
         Arc::new(ListProjects),
         Arc::new(ContinueWriting),
+        Arc::new(ContinueEpisode),
         Arc::new(ContinueWritingBatch),
         Arc::new(ReplanVolume),
         Arc::new(ReviseChapter),
+        Arc::new(ReviseEpisode),
+        Arc::new(SplitChapter),
         Arc::new(ReviseOutline),
         Arc::new(AuditChapter),
         Arc::new(AuditChapters),
         Arc::new(AuditVolume),
+        Arc::new(ResearchMaterials),
         Arc::new(ApplyDraftPatch),
         Arc::new(InitNovel),
         Arc::new(CreateNovel),
         Arc::new(QueryLore),
         Arc::new(ReadChapter),
+        Arc::new(ReadEpisode),
         Arc::new(QueryMemory),
         Arc::new(GetProjectStatus),
         Arc::new(LockBrief),
@@ -4691,6 +5596,8 @@ pub fn all_tools() -> Vec<Arc<dyn ToolHandler>> {
         Arc::new(DesignArcOutline),
         Arc::new(SyncVolume),
         Arc::new(ConfirmVolumeMemory),
+        Arc::new(ListVersionNodes),
+        Arc::new(RestoreVersionNode),
         Arc::new(SteerRun),
         Arc::new(OfferDecisions),
         Arc::new(ActivateAgents),
@@ -4781,9 +5688,10 @@ fn audit_tool_coda(run: &novelx_pipeline::PipelineRun, chapter: u32) -> String {
     format!("\n——\n第{chapter}章审校完成")
 }
 
-/// Forward pipeline events into a tool progress string channel (sparse timeline).
+/// Forward pipeline events into tool progress + progressive todos channels.
 fn spawn_pipeline_progress_forwarder(
-    progress: mpsc::UnboundedSender<String>,
+    progress: Option<mpsc::UnboundedSender<String>>,
+    todos: Option<mpsc::UnboundedSender<Vec<novelx_protocol::TodoItem>>>,
 ) -> (
     mpsc::UnboundedSender<novelx_pipeline::PipelineEvent>,
     tokio::task::JoinHandle<()>,
@@ -4802,6 +5710,17 @@ fn spawn_pipeline_progress_forwarder(
         let mut draft_backed = false;
         let mut last_draft_chars: usize = 0;
         while let Some(ev) = rx.recv().await {
+            if let PipelineEvent::TodoList { todos: list } = &ev {
+                if let Some(t) = &todos {
+                    if t.send(list.clone()).is_err() {
+                        break;
+                    }
+                }
+                continue;
+            }
+            let Some(progress) = &progress else {
+                continue;
+            };
             let chunk = match ev {
                 PipelineEvent::BatchProgress { message } => {
                     let t = message.trim();
@@ -4839,6 +5758,16 @@ fn spawn_pipeline_progress_forwarder(
                             }
                         }
                         LlmProgressKind::GeneratingHint => continue,
+                        LlmProgressKind::StreamRestart => {
+                            // Mid-stream full restart: server cleared the draft buffer;
+                            // reset UI accumulators or 「正文生成中」keeps climbing across retries.
+                            prose_chars.insert(agent.clone(), 0);
+                            last_emit_chars.remove(&agent);
+                            last_prose_emit.remove(&agent);
+                            last_draft_chars = 0;
+                            draft_backed = false;
+                            "  ⚠ 流中断，整段重试（进度已清零）…\n".into()
+                        }
                         LlmProgressKind::ModelDone { chars } => {
                             if chars == 0 {
                                 "  模型返回空（将按缺省处理）\n".into()
@@ -4936,8 +5865,8 @@ pub async fn run_pipeline_streaming(
         .await;
     }
 
-    let progress = ctx.progress.clone().expect("checked above");
-    let (tx, forward) = spawn_pipeline_progress_forwarder(progress);
+    let (tx, forward) =
+        spawn_pipeline_progress_forwarder(ctx.progress.clone(), ctx.todos.clone());
     let run = execute_pipeline(
         &ctx.projects_root,
         &ctx.config_root,
@@ -4958,7 +5887,7 @@ pub async fn run_continue_batch_streaming(
     ctx: &ToolContext,
     opts: BatchContinueOpts,
 ) -> Result<novelx_pipeline::BatchContinueResult> {
-    if ctx.progress.is_none() {
+    if ctx.progress.is_none() && ctx.todos.is_none() {
         return run_continue_batch(
             &ctx.projects_root,
             &ctx.config_root,
@@ -4969,8 +5898,8 @@ pub async fn run_continue_batch_streaming(
         .await;
     }
 
-    let progress = ctx.progress.clone().expect("checked above");
-    let (tx, forward) = spawn_pipeline_progress_forwarder(progress);
+    let (tx, forward) =
+        spawn_pipeline_progress_forwarder(ctx.progress.clone(), ctx.todos.clone());
     let result = run_continue_batch(
         &ctx.projects_root,
         &ctx.config_root,
@@ -4987,6 +5916,8 @@ enum LlmProgressKind {
     CallStarted,
     WaitingFirst { secs: u32 },
     GeneratingHint,
+    /// Mid-stream transport failure → full restart (clear UI char accumulators).
+    StreamRestart,
     ModelDone { chars: usize },
     /// Mirrored model tokens — throttled char ticks (skipped when draft flush is active).
     Prose,
@@ -5002,6 +5933,10 @@ fn classify_llm_progress_delta(delta: &str) -> LlmProgressKind {
     }
     if let Some(secs) = parse_wait_first_secs(t) {
         return LlmProgressKind::WaitingFirst { secs };
+    }
+    // Emitted by novelx-llm before on_restart clears the draft buffer.
+    if t.contains("模型流中断") || t.contains("整段重试") {
+        return LlmProgressKind::StreamRestart;
     }
     if t.contains("生成中…") || t.contains("已生成约") {
         return LlmProgressKind::GeneratingHint;
@@ -5027,6 +5962,68 @@ fn classify_llm_progress_delta(delta: &str) -> LlmProgressKind {
     // often begins a parenthetical (e.g. 「（BLOOD-001）」) and would leak bare「（」
     // lines into the tool card. Harness status lines are already matched above.
     LlmProgressKind::Prose
+}
+
+#[cfg(test)]
+mod audit_queue_advance_tests {
+    use super::{audit_queue_should_advance, AuditQueue, AuditQueueStatus};
+
+    #[test]
+    fn advances_when_consistency_passes_despite_soft_needs_choice() {
+        // Soft needs_user_choice is not an argument — advance ignores it by design.
+        assert!(audit_queue_should_advance(Some(true), false, "soft_long"));
+        assert!(audit_queue_should_advance(Some(true), false, "ok"));
+        assert!(audit_queue_should_advance(Some(true), false, ""));
+    }
+
+    #[test]
+    fn stalls_on_consistency_fail_or_hard_publish_blocks() {
+        assert!(!audit_queue_should_advance(Some(false), false, "ok"));
+        assert!(!audit_queue_should_advance(None, false, "ok"));
+        assert!(!audit_queue_should_advance(Some(true), true, "ok"));
+        assert!(!audit_queue_should_advance(Some(true), false, "hard_short"));
+        assert!(!audit_queue_should_advance(
+            Some(true),
+            false,
+            "soft_short_escalated"
+        ));
+    }
+
+    #[test]
+    fn pass_then_advance_reaches_next_pending_chapter() {
+        let mut q = AuditQueue::new("sample-novel", 1, 3);
+        q.set_current(AuditQueueStatus::Failed, "一致性未通过");
+        // Post-revise re-audit would mark Revised and advance.
+        q.set_current(AuditQueueStatus::Revised, "一致性通过");
+        assert!(q.advance());
+        assert_eq!(q.current_chapter(), Some(2));
+        assert!(!q.is_finished());
+    }
+}
+
+#[cfg(test)]
+mod llm_progress_classify_tests {
+    use super::{classify_llm_progress_delta, LlmProgressKind};
+
+    #[test]
+    fn stream_restart_marker_resets_progress_kind() {
+        assert!(matches!(
+            classify_llm_progress_delta("⚠ 模型流中断，整段重试（1/3）…"),
+            LlmProgressKind::StreamRestart
+        ));
+        assert!(matches!(
+            classify_llm_progress_delta("整段重试中"),
+            LlmProgressKind::StreamRestart
+        ));
+    }
+
+    #[test]
+    fn prose_not_confused_with_restart() {
+        assert!(matches!(
+            classify_llm_progress_delta("陈衍推开门，听到重试机关的咔哒声。"),
+            LlmProgressKind::Prose
+        ));
+    }
 }
 
 #[cfg(test)]

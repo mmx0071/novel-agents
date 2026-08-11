@@ -10,6 +10,23 @@ export const STAGE_ORDER = [
   { id: 'volume_end', label: '卷末' },
 ]
 
+/** Author-facing stage strip labels by project mode. */
+export function stageOrderForMode(mode) {
+  if (String(mode || '') === 'short_drama') {
+    return [
+      { id: 'setup', label: '立项' },
+      { id: 'volume', label: '系列规划' },
+      { id: 'chapter', label: '写集' },
+      { id: 'volume_end', label: '系列收束' },
+    ]
+  }
+  return STAGE_ORDER
+}
+
+function unitWord(mode) {
+  return String(mode || '') === 'short_drama' ? '集' : '章'
+}
+
 /**
  * @param {object|null} preview
  * @param {{ nextChapter?: number, publishedCount?: number }} [extra]
@@ -32,6 +49,8 @@ export function deriveStudioStage(preview, extra = {}) {
   const publishedCount = Number(extra.publishedCount ?? preview.published_count) || 0
   const hasMaster = !!preview.has_master_outline
   const hasArc = !!preview.has_arc_outline
+  const short = String(preview.project_mode || '') === 'short_drama'
+  const unit = unitWord(preview.project_mode)
 
   if (setupPhase === 'awaiting_confirm') {
     return {
@@ -39,7 +58,9 @@ export function deriveStudioStage(preview, extra = {}) {
       stageIndex: 0,
       setupPhase,
       volumePhase,
-      detail: '总纲与卷纲已就绪，待确认定稿',
+      detail: short
+        ? '总纲与世界观已就绪，待确认定稿'
+        : '总纲与卷纲已就绪，待确认定稿',
       cta: {
         id: 'confirm_setup',
         label: '去确认定稿',
@@ -59,22 +80,36 @@ export function deriveStudioStage(preview, extra = {}) {
       stageIndex: 0,
       setupPhase,
       volumePhase,
-      detail: hasMaster
-        ? (hasArc ? '大纲已齐，可确认定稿或继续补世界观' : '总纲已有，请补齐卷纲与世界观后定稿')
-        : '收集灵感、生成总纲与卷纲',
+      detail: short
+        ? (hasMaster
+          ? '总纲已有，可补世界观后确认定稿'
+          : '收集灵感、生成系列总纲')
+        : (hasMaster
+          ? (hasArc ? '大纲已齐，可确认定稿或继续补世界观' : '总纲已有，请补齐卷纲与世界观后定稿')
+          : '收集灵感、生成总纲与卷纲'),
       cta: {
-        id: hasMaster && hasArc ? 'confirm_setup' : 'continue_setup',
-        label: hasMaster && hasArc ? '去确认定稿' : (hasMaster ? '继续完善立项' : '继续立项'),
-        hint: hasMaster && hasArc
-          ? '打开总纲后可一键确认或打回'
-          : '在创作助手中补充灵感、总纲或卷纲',
-        message: hasMaster && hasArc
-          ? null
-          : (hasMaster
-            ? '请继续完善立项：补齐卷纲与世界观 Bible，准备确认定稿'
-            : '请继续立项：锁定灵感并生成总纲与卷纲'),
-        readerTab: hasMaster ? (hasArc ? 'master' : 'arcs') : 'master',
-        focusSetup: !!(hasMaster && hasArc),
+        id: short
+          ? (hasMaster ? 'confirm_setup' : 'continue_setup')
+          : (hasMaster && hasArc ? 'confirm_setup' : 'continue_setup'),
+        label: short
+          ? (hasMaster ? '去确认定稿' : '继续立项')
+          : (hasMaster && hasArc ? '去确认定稿' : (hasMaster ? '继续完善立项' : '继续立项')),
+        hint: short
+          ? (hasMaster ? '打开总纲后可一键确认或打回' : '在创作助手中补充灵感或总纲')
+          : (hasMaster && hasArc
+            ? '打开总纲后可一键确认或打回'
+            : '在创作助手中补充灵感、总纲或卷纲'),
+        message: short
+          ? (hasMaster
+            ? null
+            : '请继续立项：锁定灵感并生成系列总纲')
+          : (hasMaster && hasArc
+            ? null
+            : (hasMaster
+              ? '请继续完善立项：补齐卷纲与世界观，准备确认定稿'
+              : '请继续立项：锁定灵感并生成总纲与卷纲')),
+        readerTab: short ? 'master' : (hasMaster ? (hasArc ? 'master' : 'arcs') : 'master'),
+        focusSetup: short ? !!hasMaster : !!(hasMaster && hasArc),
       },
     }
   }
@@ -86,12 +121,12 @@ export function deriveStudioStage(preview, extra = {}) {
       stageIndex: 3,
       setupPhase,
       volumePhase,
-      detail: '本卷收束，待同步设定库',
+      detail: '本卷收束，待同步人物与设定进度',
       cta: {
         id: 'sync_volume',
-        label: '同步设定库',
-        hint: '卷末同步人物/地点/物品与卷进度',
-        message: '同步设定库',
+        label: '同步本卷设定',
+        hint: '卷末更新人物、地点、物品与本卷进度',
+        message: '同步本卷设定',
         readerTab: 'arcs',
       },
     }
@@ -148,19 +183,19 @@ export function deriveStudioStage(preview, extra = {}) {
       stageIndex: 2,
       setupPhase,
       volumePhase,
-      detail: `第${n}章草稿未发布，待复审`,
+      detail: `第${n}${unit}草稿未发布，请先审校`,
       cta: {
         id: 'audit_draft',
-        label: `审校第${n}章`,
-        hint: '复审通过后才能发布；刚修订完请先审校',
-        message: `审校第${n}章`,
+        label: `审校第${n}${unit}`,
+        hint: '审校通过后才能发布；刚改完请先审校',
+        message: `审校第${n}${unit}`,
         readerTab: 'draft',
         chapter: n,
       },
     }
   }
 
-  if (!hasArc) {
+  if (!short && !hasArc) {
     return {
       stageId: 'volume',
       stageIndex: 1,
@@ -177,19 +212,51 @@ export function deriveStudioStage(preview, extra = {}) {
     }
   }
 
+  const volumeQaPhase = String(preview.volume_qa_phase || '')
+  const foreshadowPhase = String(preview.foreshadow_phase || '')
+
+  // Soft gate: mid-volume QA due — prefer desk CTA, user can still chat to continue writing.
+  if (!short && volumeQaPhase === 'mid_due') {
+    return {
+      stageId: 'chapter',
+      stageIndex: 2,
+      setupPhase,
+      volumePhase,
+      detail: `本卷已到建议复盘节点 · 下一${unit}第 ${nextChapter} ${unit}`,
+      cta: {
+        id: 'volume_mid_audit',
+        label: '做卷中复盘',
+        hint: '复盘本卷节奏与设定；也可在对话里说继续写',
+        message: '对本卷做一次卷中复盘',
+        readerTab: 'arcs',
+      },
+    }
+  }
+
+  let detail = publishedCount > 0
+    ? `已发布 ${publishedCount} ${unit} · 下一${unit}第 ${nextChapter} ${unit}`
+    : `准备写第 ${nextChapter} ${unit}`
+  if (!short && foreshadowPhase === 'pressure_high') {
+    detail += ' · 伏笔压力偏高，宜穿插回收'
+  } else if (!short && foreshadowPhase === 'paydown') {
+    detail += ' · 正在回收伏笔'
+  }
+
   return {
     stageId: 'chapter',
     stageIndex: 2,
     setupPhase,
     volumePhase,
-    detail: publishedCount > 0
-      ? `已发布 ${publishedCount} 章 · 下一章第 ${nextChapter} 章`
-      : `准备写第 ${nextChapter} 章`,
+    detail,
     cta: {
       id: 'write_next',
-      label: `写第${nextChapter}章`,
-      hint: '按当前剧情卡继续创作',
-      message: `写第${nextChapter}章`,
+      label: `写第${nextChapter}${unit}`,
+      hint: short
+        ? '按当前节拍继续写剧本'
+        : (foreshadowPhase === 'pressure_high'
+          ? '续写时可穿插回收近期伏笔'
+          : '按当前剧情卡继续创作'),
+      message: `写第${nextChapter}${unit}`,
       readerTab: 'draft',
       chapter: nextChapter,
     },
@@ -197,7 +264,7 @@ export function deriveStudioStage(preview, extra = {}) {
 }
 
 /**
- * Prefer the same primary action as the chat / audit-dock approval card.
+ * Prefer the same primary action as the open chat approval card.
  * Setup / volume-sync / mutation gates are ignored so phase CTAs stay intact.
  */
 export function pickPrimaryApprovalOption(options) {
@@ -302,7 +369,7 @@ export function resolveStudioCta(stage, audit = {}) {
         id: 'pending_choice',
         label: primary.label || primary.id,
         hint: isApply
-          ? '对照修订预览后落盘（等同 Cursor Apply）'
+          ? '对照修订预览，确认无误后再应用'
           : '与创作助手待选项一致',
         message: String(primary.id || primary.label || ''),
         readerTab: 'draft',
@@ -328,11 +395,11 @@ export function resolveStudioCta(stage, audit = {}) {
     if (revisedAfterFail) {
       return {
         ...stage,
-        detail: `第${draftCh}章修订已落盘，待复审`,
+        detail: `第${draftCh}章修订已保存，请再审校一次`,
         cta: {
           id: 'audit_draft',
           label: `审校第${draftCh}章`,
-          hint: '修订已应用，请复审确认后再发布',
+          hint: '修订已应用，请审校确认后再发布',
           message: `审校第${draftCh}章`,
           readerTab: 'draft',
           chapter: draftCh,
@@ -362,15 +429,20 @@ export function resolveStudioCta(stage, audit = {}) {
 }
 
 /** Build create-novel prompt from form fields (genre-neutral). */
-export function buildCreateNovelMessage({ title, genre, brief }) {
+export function buildCreateNovelMessage({ title, genre, brief, mode }) {
   const name = String(title || '').trim()
   const g = String(genre || '').trim()
   const b = String(brief || '').trim()
-  const parts = ['我想写一本小说']
-  if (name) parts.push(`书名《${name}》`)
+  const m = String(mode || 'longform').trim()
+  const short = m === 'short_drama'
+  const parts = [short ? '我想写一部 AI 漫剧短篇' : '我想写一本小说']
+  if (name) parts.push(short ? `片名《${name}》` : `书名《${name}》`)
   if (g) parts.push(`题材：${g}`)
   let msg = parts.join('，')
   if (b) msg += `。灵感：${b}`
   else msg += '。请先帮我立项。'
+  if (short) {
+    msg += '。请按短剧剧本模式立项，按集产出剧本。'
+  }
   return msg
 }

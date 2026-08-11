@@ -1141,6 +1141,7 @@ pub fn check_plot_write_gate_with(
     project_dir: &Path,
     enforce: crate::phases::PhaseEnforceFlags,
 ) -> PlotWriteGate {
+    let short = crate::project::is_short_drama(project_dir);
     if enforce.setup {
         if let Some(msg) = crate::phases::setup_write_block_reason(project_dir) {
             return PlotWriteGate::Block {
@@ -1150,7 +1151,8 @@ pub fn check_plot_write_gate_with(
             };
         }
     }
-    if enforce.volume {
+    // Short-drama bypasses volume handoff entirely.
+    if enforce.volume && !short {
         if let Some(msg) = crate::phases::volume_write_block_reason(project_dir) {
             return PlotWriteGate::Block {
                 message: msg,
@@ -1164,7 +1166,11 @@ pub fn check_plot_write_gate_with(
     let all: Vec<&PlotIndexEntry> = index.volumes.iter().flat_map(|v| v.plots.iter()).collect();
     if all.is_empty() {
         return PlotWriteGate::Block {
-            message: "尚无剧情卡。请先调用 design_plot 创建指引，再写章（剧情卡不预估章数）。".into(),
+            message: if short {
+                "尚无 beat 卡。请先调用 design_plot 创建冲突单元，再写集。".into()
+            } else {
+                "尚无剧情卡。请先调用 design_plot 创建指引，再写章（剧情卡不预估章数）。".into()
+            },
             reason: "need_design_plot",
             plot_title: None,
         };
@@ -1428,8 +1434,13 @@ pub fn volume_has_open_plot_work(project_dir: &Path, volume_index: u32) -> bool 
     if vol.plots.is_empty() {
         return false;
     }
+    // planned / in_progress / bridging all mean the volume ladder is unfinished —
+    // a just-completed card without next_plot must not end the volume if peers remain.
     for p in &vol.plots {
-        if matches!(p.status.as_str(), "in_progress" | "bridging") {
+        if matches!(
+            p.status.as_str(),
+            "planned" | "in_progress" | "bridging"
+        ) {
             return true;
         }
     }
@@ -1629,6 +1640,12 @@ fn complete_active_in_progress_plot(
     else {
         return Ok(None);
     };
+    let vol_i = index
+        .volumes
+        .iter()
+        .find(|v| v.plots.iter().any(|p| p.title == active.title || p.slug == active.slug))
+        .map(|v| v.volume_index)
+        .unwrap_or(1);
     update_plot_card(
         project_dir,
         &active.title,
@@ -1647,6 +1664,8 @@ fn complete_active_in_progress_plot(
         }
     }
     save_plot_index(project_dir, &index)?;
+    // Bridge first when owed; else ensure next_plot card exists and promote.
+    continue_plot_ladder_after(project_dir, &active, vol_i)?;
     tracing::info!(
         plot = %active.title,
         %rationale,
@@ -1657,6 +1676,158 @@ fn complete_active_in_progress_plot(
         from: "in_progress".into(),
         to: "completed".into(),
     }))
+}
+
+fn next_plot_ref_actionable(next: &str) -> bool {
+    let n = next.trim();
+    if n.chars().count() < 2 {
+        return false;
+    }
+    !matches!(
+        n,
+        "待定" | "待补" | "暂无" | "无" | "TBD" | "tbd" | "n/a" | "N/A" | "-" | "—"
+    )
+}
+
+fn sanitize_plot_filename(name: &str) -> String {
+    let s: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            _ => c,
+        })
+        .collect();
+    let s = s.trim().to_string();
+    if s.is_empty() {
+        "untitled".into()
+    } else {
+        s.chars().take(40).collect()
+    }
+}
+
+fn find_plot_by_ref<'a>(index: &'a PlotIndex, next_ref: &str) -> Option<&'a PlotIndexEntry> {
+    let next_ref = next_ref.trim();
+    index.volumes.iter().flat_map(|v| &v.plots).find(|p| {
+        plot_ref_matches(&p.title, &p.slug, next_ref)
+            || p.title == next_ref
+            || p.slug == next_ref
+            || p.id == next_ref
+    })
+}
+
+/// Ensure a planned card exists for `next_ref` (create stub when missing).
+/// Returns the card title to promote, if any.
+pub fn ensure_next_plot_card(
+    project_dir: &Path,
+    next_ref: &str,
+    volume_index: u32,
+) -> anyhow::Result<Option<String>> {
+    let next_ref = next_ref.trim();
+    if !next_plot_ref_actionable(next_ref) {
+        return Ok(None);
+    }
+    let index = load_plot_index(project_dir);
+    if let Some(p) = find_plot_by_ref(&index, next_ref) {
+        return Ok(Some(p.title.clone()));
+    }
+    let folder = project_dir.join("plots");
+    fs::create_dir_all(&folder)?;
+    let safe = sanitize_plot_filename(next_ref);
+    let mut path = folder.join(format!("{safe}.md"));
+    let mut n = 2u32;
+    while path.exists() {
+        path = folder.join(format!("{safe}-{n}.md"));
+        n += 1;
+        if n > 50 {
+            anyhow::bail!("无法为 next_plot 分配唯一文件名：{next_ref}");
+        }
+    }
+    let (body, _) = crate::schemas::normalize_plot_card_best_effort(next_ref, "");
+    // Seed 概览 with the ladder hint so the stub is not empty of intent.
+    let body = body.replacen("（待补全）", next_ref, 1);
+    fs::write(&path, &body)?;
+    ensure_plot_card_lifecycle_frontmatter(&path, volume_index, "planned")?;
+    tracing::info!(
+        path = %path.display(),
+        title = %next_ref,
+        volume_index,
+        "created stub next_plot card for unattended ladder"
+    );
+    Ok(Some(next_ref.to_string()))
+}
+
+fn try_promote_plot_to_active(project_dir: &Path, title: &str) -> anyhow::Result<()> {
+    let index = load_plot_index(project_dir);
+    let Some(p) = find_plot_by_ref(&index, title).cloned() else {
+        return Ok(());
+    };
+    if matches!(p.status.as_str(), "in_progress" | "bridging") {
+        return Ok(());
+    }
+    if p.status != "planned" {
+        tracing::warn!(
+            plot = %p.title,
+            status = %p.status,
+            "next_plot card is not planned; skip auto-promote"
+        );
+        return Ok(());
+    }
+    update_plot_card(
+        project_dir,
+        &p.title,
+        Some("in_progress"),
+        None,
+        None,
+        None,
+        None,
+        true,
+    )?;
+    tracing::info!(next = %p.title, "auto-promoted next_plot to in_progress");
+    Ok(())
+}
+
+/// After a main card finishes writing work: enter bridging if owed, else ensure+promote next.
+fn continue_plot_ladder_after(
+    project_dir: &Path,
+    from: &PlotIndexEntry,
+    volume_index: u32,
+) -> anyhow::Result<()> {
+    if from.needs_bridge && !from.bridge_done {
+        match ensure_bridge_plot_active(project_dir) {
+            Ok(Some(t)) => tracing::info!(
+                plot = %t,
+                "auto-entered bridging after plot complete"
+            ),
+            Ok(None) => tracing::debug!(
+                plot = %from.title,
+                "bridge owed but ensure_bridge_plot_active returned none"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                plot = %from.title,
+                "failed to enter bridging after plot complete"
+            ),
+        }
+        return Ok(());
+    }
+    let next_ref = from.next_plot.trim();
+    if next_ref.is_empty() {
+        return Ok(());
+    }
+    match ensure_next_plot_card(project_dir, next_ref, volume_index) {
+        Ok(Some(title)) => {
+            if let Err(e) = try_promote_plot_to_active(project_dir, &title) {
+                tracing::warn!(error = %e, next = %title, "failed to auto-promote next_plot");
+            }
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(
+            error = %e,
+            next = %next_ref,
+            "failed to ensure next_plot card"
+        ),
+    }
+    Ok(())
 }
 
 /// Flip pending-bridge completed card → bridging before writing the digest chapter.
@@ -1706,6 +1877,7 @@ pub fn complete_bridging_plots_after_publish(
     project_dir: &Path,
 ) -> anyhow::Result<Vec<PlotAdvanceEvent>> {
     let mut events = Vec::new();
+    let mut sealed: Vec<(PlotIndexEntry, u32)> = Vec::new();
     let cards = load_plot_cards(project_dir);
     for card in cards {
         let status = card
@@ -1720,8 +1892,13 @@ pub fn complete_bridging_plots_after_publish(
         if !path.exists() {
             continue;
         }
+        let mut entry = entry_from_card(&card);
+        let vol_i = volume_index_of(&card);
         patch_plot_card_status(&path, &card, "completed")?;
         patch_plot_bridge_done(&path, true)?;
+        entry.status = "completed".into();
+        entry.bridge_done = true;
+        sealed.push((entry, vol_i));
         events.push(PlotAdvanceEvent {
             title: card.title.clone(),
             from: "bridging".into(),
@@ -1739,6 +1916,10 @@ pub fn complete_bridging_plots_after_publish(
             }
         }
         save_plot_index(project_dir, &index)?;
+        // After bridge seals, promote next_plot (create stub if needed).
+        for (entry, vol_i) in &sealed {
+            let _ = continue_plot_ladder_after(project_dir, entry, *vol_i);
+        }
     }
     Ok(events)
 }
@@ -2443,6 +2624,28 @@ mod tests {
     }
 
     #[test]
+    fn open_plot_work_blocks_when_planned_peer_remains() {
+        let root = tmp();
+        fs::create_dir_all(root.join("plots")).unwrap();
+        fs::write(
+            root.join("plots/a.md"),
+            "---\ntitle: 开局卡\nvolume_index: 2\nplot_type: main\nstatus: completed\n---\n\n# 开局卡\n\n## 收束条件\n已到站\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("plots/b.md"),
+            "---\ntitle: 中段卡\nvolume_index: 2\nplot_type: main\nstatus: planned\n---\n\n# 中段卡\n\n## 收束条件\n钥匙到手\n",
+        )
+        .unwrap();
+        let _ = rebuild_plot_index(&root);
+        assert!(
+            volume_has_open_plot_work(&root, 2),
+            "planned peer must block volume end"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn bridge_complete_only_closes_existing_bridging() {
         let root = tmp();
         fs::write(
@@ -2508,6 +2711,72 @@ mod tests {
         assert_eq!(ev.to, "completed");
         let idx = load_plot_index(&root);
         assert_eq!(idx.volumes[0].plots[0].status, "completed");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn accept_creates_stub_and_promotes_next_plot() {
+        let root = tmp();
+        fs::write(
+            root.join("plots/a.md"),
+            "---\ntitle: 开局卡\nvolume_index: 1\nplot_type: main\nstatus: in_progress\nneeds_bridge: false\nnext_plot: 中段：钥匙与关卡\n---\n\n# 开局卡\n\n## 收束条件\n\n拿到线索。\n",
+        )
+        .unwrap();
+        let _ = rebuild_plot_index(&root);
+        let _ = complete_active_plot_on_accept(
+            &root,
+            r#"{"pass":true,"exit_condition":"拿到线索","rationale":"已拿到","gaps":[]}"#,
+        )
+        .unwrap();
+        let idx = load_plot_index(&root);
+        let next = idx
+            .volumes
+            .iter()
+            .flat_map(|v| &v.plots)
+            .find(|p| p.title.contains("钥匙"))
+            .expect("stub next card");
+        assert_eq!(next.status, "in_progress");
+        assert_eq!(idx.volumes[0].active_main_plot, next.title);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn accept_with_bridge_defers_next_until_bridge_seals() {
+        let root = tmp();
+        fs::write(
+            root.join("plots/a.md"),
+            "---\ntitle: 高潮卡\nvolume_index: 1\nplot_type: main\nstatus: in_progress\nneeds_bridge: true\nbridge_done: false\nnext_plot: 余波后的下一段\n---\n\n# 高潮卡\n\n## 收束条件\n\n对峙结束。\n",
+        )
+        .unwrap();
+        let _ = rebuild_plot_index(&root);
+        let _ = complete_active_plot_on_accept(
+            &root,
+            r#"{"pass":true,"exit_condition":"对峙结束","rationale":"已对峙","gaps":[]}"#,
+        )
+        .unwrap();
+        let idx = load_plot_index(&root);
+        let a = idx.volumes[0]
+            .plots
+            .iter()
+            .find(|p| p.title == "高潮卡")
+            .unwrap();
+        assert_eq!(a.status, "bridging");
+        assert!(!idx
+            .volumes
+            .iter()
+            .flat_map(|v| &v.plots)
+            .any(|p| p.title.contains("余波")));
+
+        let ev = complete_bridging_plots_after_publish(&root).unwrap();
+        assert!(ev.iter().any(|e| e.to.contains("bridge_done")));
+        let idx = load_plot_index(&root);
+        let next = idx
+            .volumes
+            .iter()
+            .flat_map(|v| &v.plots)
+            .find(|p| p.title.contains("余波"))
+            .expect("next after bridge");
+        assert_eq!(next.status, "in_progress");
         let _ = fs::remove_dir_all(&root);
     }
 

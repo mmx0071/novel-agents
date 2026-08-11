@@ -1,9 +1,13 @@
 //! Per-issue audit decisions — compact briefs + dynamic gate options.
 
-use novelx_harness::{issue_priority, issue_type, with_issue_ids};
+use novelx_harness::{
+    apply_plan_to_steer_args, build_revise_plan, filter_issues_by_ids, issue_priority, issue_type,
+    with_issue_ids, RevisePlanConfig, ReviseScope,
+};
 use novelx_protocol::UserInputOption;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::path::Path;
 
 /// One user-facing decision bound to a concrete tool call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,6 +210,48 @@ pub fn build_fallback_audit_decisions(
     out
 }
 
+/// Attach RevisePlan fields to each revise `steer_run` option (keeps per-option issue_ids).
+pub fn enrich_audit_decisions_with_revise_plan(
+    config_root: &Path,
+    decisions: &mut [AuditDecisionOption],
+    issues: &[Value],
+    violations: &[Value],
+    same_type_streak: u32,
+) {
+    let cfg = RevisePlanConfig::load(config_root);
+    if !cfg.enabled {
+        return;
+    }
+    for d in decisions.iter_mut() {
+        if d.tool != "steer_run" {
+            continue;
+        }
+        if d.args.get("choice").and_then(|v| v.as_str()) != Some("revise") {
+            continue;
+        }
+        let ids: Vec<String> = d
+            .args
+            .get("issue_ids")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let subset = if ids.is_empty() {
+            issues.to_vec()
+        } else {
+            filter_issues_by_ids(issues, &ids)
+        };
+        let plan = build_revise_plan(&cfg, &subset, violations, same_type_streak);
+        if plan.scope == ReviseScope::Escalate {
+            continue;
+        }
+        apply_plan_to_steer_args(&mut d.args, &plan);
+    }
+}
+
 pub fn decisions_to_ui_options(decisions: &[AuditDecisionOption]) -> Vec<UserInputOption> {
     decisions
         .iter()
@@ -398,5 +444,27 @@ mod tests {
         let (tool, args) = resolve_decision_pick("1", &opts).unwrap();
         assert_eq!(tool, "steer_run");
         assert_eq!(args["choice"], "revise");
+    }
+
+    #[test]
+    fn enrich_timeline_option_sets_full_keeps_issue_id() {
+        let issues = vec![json!({
+            "type": "TIMELINE",
+            "priority": "P0",
+            "message": "倒计时互斥",
+            "id": "p0-timeline-2"
+        })];
+        let mut opts = build_fallback_audit_decisions("demo", 3, &issues, false);
+        enrich_audit_decisions_with_revise_plan(
+            std::path::Path::new("config"),
+            &mut opts,
+            &issues,
+            &[],
+            0,
+        );
+        let fix = opts.iter().find(|o| o.id == "fix_p0-timeline-2").unwrap();
+        assert_eq!(fix.args["revise_scope"], "full");
+        assert_eq!(fix.args["prefer_local_patch"], false);
+        assert_eq!(fix.args["issue_ids"], json!(["p0-timeline-2"]));
     }
 }

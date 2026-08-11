@@ -1,0 +1,33 @@
+# Short-drama / AI comic script budgets (project_mode=short_drama).
+# Replaces chapter.yaml word gates for episode scripts.
+version: 1
+
+# Soft target band for script body chars (after title line).
+word_min: 800
+word_max: 3500
+# Hard floor / ceiling for publish.
+word_hard_min: 400
+word_hard_max: 8000
+
+# Scene count soft guidance (validated lightly in schema / prompts).
+scene_min: 2
+scene_max: 12
+
+# Soft dialogue-line guidance (approximate).
+dialogue_lines_min: 8
+dialogue_lines_max: 120
+
+# Target duration hint injected into planner/writer (seconds).
+default_duration_sec: 90
+
+# Soft-short streak escalate (0 = never).
+soft_short_auto_revise_after: 0
+
+# Shape hard gate (validate_script) — prose scripts without 【画面】 must not publish.
+picture_min_total: 2          # body must contain at least N 「【画面】」 markers
+picture_min_per_scene: 1      # each 「## 场」 section needs at least N
+reject_title_contains:        # forbidden substrings in the title line
+  - "```"
+  - "markdown"
+strip_title_noise:            # normalize strips these standalone suffix tokens
+  - "章"

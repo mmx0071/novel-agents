@@ -980,6 +980,7 @@ impl LlmClient {
             max_tokens,
             on_delta,
             on_reasoning,
+            || async {},
         )
         .await
     }
@@ -1003,11 +1004,40 @@ impl LlmClient {
             max_tokens,
             on_delta,
             |_: String| async {},
+            || async {},
         )
         .await
     }
 
-    async fn complete_messages_stream_limited_inner<F, Fut, R, RFut>(
+    /// Stream with mid-stream restart hook (clear partial UI/draft before a full retry).
+    pub async fn complete_messages_stream_limited_restart<F, Fut, S, SFut>(
+        &self,
+        messages: Vec<ChatMessage>,
+        model: Option<&str>,
+        tools: Option<&[ToolSpec]>,
+        max_tokens: Option<u32>,
+        on_delta: F,
+        on_restart: S,
+    ) -> Result<CompletionResult>
+    where
+        F: FnMut(String) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+        S: FnMut() -> SFut,
+        SFut: std::future::Future<Output = ()>,
+    {
+        self.complete_messages_stream_limited_inner(
+            messages,
+            model,
+            tools,
+            max_tokens,
+            on_delta,
+            |_: String| async {},
+            on_restart,
+        )
+        .await
+    }
+
+    async fn complete_messages_stream_limited_inner<F, Fut, R, RFut, S, SFut>(
         &self,
         messages: Vec<ChatMessage>,
         model: Option<&str>,
@@ -1015,12 +1045,15 @@ impl LlmClient {
         max_tokens: Option<u32>,
         mut on_delta: F,
         mut on_reasoning: R,
+        mut on_restart: S,
     ) -> Result<CompletionResult>
     where
         F: FnMut(String) -> Fut,
         Fut: std::future::Future<Output = ()>,
         R: FnMut(String) -> RFut,
         RFut: std::future::Future<Output = ()>,
+        S: FnMut() -> SFut,
+        SFut: std::future::Future<Output = ()>,
     {
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1151,21 +1184,41 @@ impl LlmClient {
                 Ok(Ok(v)) => break v,
                 Ok(Err(e)) => {
                     let msg = format!("{e:#}");
-                    let can_retry = !emitted_any
-                        && attempt < max_retries
-                        && is_transient_llm_error(&msg);
+                    // Mid-stream transport blips: full restart (not continue-from-partial).
+                    // Callers use on_restart to clear draft/UI accumulators first.
+                    let can_retry =
+                        should_retry_llm_stream(attempt, max_retries, emitted_any, &msg);
                     if !can_retry {
                         return Err(e);
                     }
                     let delay = retry_delay_ms(attempt, retry_base, retry_max);
-                    tracing::warn!(
-                        %model,
-                        attempt = attempt + 1,
-                        max_retries,
-                        delay_ms = delay,
-                        error = %msg,
-                        "llm transient error before first token; retrying"
-                    );
+                    if emitted_any {
+                        // Marker for UI; callers' on_restart clears draft/UI accumulators.
+                        on_delta(format!(
+                            "\n⚠ 模型流中断，整段重试（{}/{}）…\n",
+                            attempt + 1,
+                            max_retries
+                        ))
+                        .await;
+                        on_restart().await;
+                        tracing::warn!(
+                            %model,
+                            attempt = attempt + 1,
+                            max_retries,
+                            delay_ms = delay,
+                            error = %msg,
+                            "llm mid-stream transient error; full restart retry"
+                        );
+                    } else {
+                        tracing::warn!(
+                            %model,
+                            attempt = attempt + 1,
+                            max_retries,
+                            delay_ms = delay,
+                            error = %msg,
+                            "llm transient error before first token; retrying"
+                        );
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                     attempt += 1;
                 }
@@ -1173,6 +1226,8 @@ impl LlmClient {
                     let msg = format!(
                         "llm stream timeout after {deadline_secs}s (model={model}, max_tokens={tokens})"
                     );
+                    // Hard wall-clock budget already spent with partial tokens — do not
+                    // burn another full creative call; only retry when nothing arrived.
                     let can_retry = !emitted_any && attempt < max_retries;
                     if !can_retry {
                         tracing::error!(
@@ -1400,41 +1455,73 @@ impl LlmClient {
         user: &str,
         model: Option<&str>,
         max_tokens: Option<u32>,
-        mut on_delta: F,
+        on_delta: F,
     ) -> Result<String>
     where
         F: FnMut(String) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
+        self.complete_stream_limited_restart(system, user, model, max_tokens, on_delta, || async {})
+            .await
+    }
+
+    /// Like [`Self::complete_stream_limited`], but `on_restart` runs before a mid-stream
+    /// full retry so callers can clear partial draft / UI buffers.
+    pub async fn complete_stream_limited_restart<F, Fut, S, SFut>(
+        &self,
+        system: &str,
+        user: &str,
+        model: Option<&str>,
+        max_tokens: Option<u32>,
+        mut on_delta: F,
+        on_restart: S,
+    ) -> Result<String>
+    where
+        F: FnMut(String) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+        S: FnMut() -> SFut,
+        SFut: std::future::Future<Output = ()>,
+    {
         let result = self
-            .complete_messages_stream_limited(
+            .complete_messages_stream_limited_restart(
                 vec![
                     ChatMessage {
                         role: "system".into(),
                         content: system.into(),
                         tool_call_id: None,
                         tool_calls: None,
-                    ..Default::default()
-                },
+                        ..Default::default()
+                    },
                     ChatMessage {
                         role: "user".into(),
                         content: user.into(),
                         tool_call_id: None,
                         tool_calls: None,
-                    ..Default::default()
-                },
+                        ..Default::default()
+                    },
                 ],
                 model,
                 None,
                 max_tokens,
                 |d| on_delta(d),
+                on_restart,
             )
             .await?;
         Ok(result.content)
     }
 }
 
-/// Transient transport / upstream faults worth retrying (before any stream token).
+/// Whether a stream attempt should be retried (including mid-stream transport faults).
+pub fn should_retry_llm_stream(
+    attempt: u32,
+    max_retries: u32,
+    _emitted_any: bool,
+    err: &str,
+) -> bool {
+    attempt < max_retries && is_transient_llm_error(err)
+}
+
+/// Transient transport / upstream faults worth retrying (incl. mid-stream chunk drops).
 pub fn is_transient_llm_error(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
     // Auth / client mistakes — never retry.
@@ -1462,8 +1549,7 @@ pub fn is_transient_llm_error(msg: &str) -> bool {
     {
         return true;
     }
-    // Network / connect / early timeouts (TTFT, connect). Mid-stream idle timeouts also
-    // match "timeout", but callers only retry when no token was emitted.
+    // Network / stream body faults (TTFT, idle, mid-stream chunk, reset).
     if m.contains("llm request")
         || m.contains("error sending request")
         || m.contains("connection")
@@ -1476,6 +1562,12 @@ pub fn is_transient_llm_error(msg: &str) -> bool {
         || m.contains("dns")
         || m.contains("temporarily unavailable")
         || m.contains("network")
+        || m.contains("stream chunk")
+        || m.contains("stream idle")
+        || m.contains("error decoding")
+        || m.contains("unexpected eof")
+        || m.contains("connection closed")
+        || (m.contains("body") && m.contains("error"))
     {
         return true;
     }
@@ -1828,6 +1920,12 @@ agents:
             "llm TTFT timeout after 60s (no first token; check API / rate limit)"
         ));
         assert!(is_transient_llm_error("connection reset by peer"));
+        assert!(is_transient_llm_error(
+            "llm stream chunk: error decoding response body"
+        ));
+        assert!(is_transient_llm_error(
+            "llm stream idle timeout after 120s (no chunks)"
+        ));
     }
 
     #[test]
@@ -1836,6 +1934,23 @@ agents:
         assert!(!is_transient_llm_error("llm http 400: invalid messages"));
         assert!(!is_transient_llm_error("missing api key"));
         assert!(!is_transient_llm_error("parse: bad json"));
+    }
+
+    #[test]
+    fn mid_stream_transient_is_retried() {
+        assert!(should_retry_llm_stream(
+            0,
+            3,
+            true,
+            "llm stream chunk: connection reset by peer"
+        ));
+        assert!(!should_retry_llm_stream(
+            3,
+            3,
+            true,
+            "llm stream chunk: connection reset by peer"
+        ));
+        assert!(!should_retry_llm_stream(0, 3, true, "llm http 401: bad key"));
     }
 
     #[test]

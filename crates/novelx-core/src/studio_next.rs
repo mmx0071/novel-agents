@@ -29,6 +29,8 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "confirm_setup",
     "sync_volume",
     "confirm_volume_memory",
+    "list_version_nodes",
+    "restore_version_node",
 ];
 
 pub const ALLOWED_RESOLVES: &[&str] = &[
@@ -300,6 +302,26 @@ pub fn contextual_fallback_options(
                 ],
             )
         }
+        StudioNextContext::PlotWrite { kind, title, .. } if kind == "missing_exit" => {
+            let label = if title.is_empty() {
+                "请 Agent 补全收束条件".into()
+            } else {
+                format!("请 Agent 补全「{title}」收束条件")
+            };
+            (
+                "进行中剧情卡缺少可检验的收束条件（模型未出卡）。请选择：".into(),
+                vec![
+                    opt_resolve("fb_complete_exit", &label, "continue_studio"),
+                    opt_tool(
+                        "fb_list_plots",
+                        "查看剧情卡",
+                        "list_plots",
+                        json!({ "project": project }),
+                    ),
+                    opt_resolve("fb_later", "暂不写作", "dismiss_gate"),
+                ],
+            )
+        }
         StudioNextContext::PlotWrite { title, .. } => {
             let label = if title.is_empty() {
                 "激活剧情卡并写章".into()
@@ -318,13 +340,29 @@ pub fn contextual_fallback_options(
             chapter,
             suggest_chapter,
         } => (
-            format!("第{chapter}章已有未发布正文（模型未出卡）。请选择："),
+            format!(
+                "第{chapter}章已有未发布正文（可能为中断的连写）。请选择："
+            ),
             vec![
                 opt_tool(
+                    "fb_batch",
+                    "审校本章并继续连写",
+                    "continue_writing_batch",
+                    json!({
+                        "project": project,
+                        "confirm_skip": true,
+                        "confirm_skip_expected": true,
+                    }),
+                ),
+                opt_tool(
                     "fb_audit",
-                    "审校本章",
+                    "仅审校本章",
                     "audit_chapter",
-                    json!({ "project": project, "chapter": chapter }),
+                    json!({
+                        "project": project,
+                        "chapter": chapter,
+                        "confirm_skip": true,
+                    }),
                 ),
                 opt_tool(
                     "fb_revise",
@@ -333,14 +371,19 @@ pub fn contextual_fallback_options(
                     json!({
                         "project": project,
                         "chapter": chapter,
+                        "confirm_skip": true,
                         "instructions": "在现有正文基础上修订本章：保持情节与设定一致，修补明显问题，便于审校发布。",
                     }),
                 ),
                 opt_tool(
                     "fb_next",
-                    &format!("写第{suggest_chapter}章"),
+                    &format!("跳过草稿写第{suggest_chapter}章"),
                     "continue_writing",
-                    json!({ "project": project, "chapter": suggest_chapter }),
+                    json!({
+                        "project": project,
+                        "chapter": suggest_chapter,
+                        "confirm_skip": true,
+                    }),
                 ),
                 opt_resolve("fb_later", "稍后", "dismiss_gate"),
             ],
@@ -500,13 +543,49 @@ mod tests {
     }
 
     #[test]
-    fn draft_fallback_offers_write_next() {
+    fn missing_exit_fallback_offers_complete_and_dismiss() {
+        let (prompt, opts) = contextual_fallback_options(
+            "demo",
+            &StudioNextContext::PlotWrite {
+                kind: "missing_exit".into(),
+                title: "样例卡".into(),
+                volume: 1,
+            },
+        );
+        assert!(prompt.contains("收束条件"), "{prompt}");
+        assert!(
+            opts.iter().any(|o| o.resolve.as_deref() == Some("continue_studio")),
+            "{opts:?}"
+        );
+        assert!(
+            opts.iter().any(|o| o.tool.as_deref() == Some("list_plots")),
+            "{opts:?}"
+        );
+        assert!(
+            opts.iter().any(|o| o.resolve.as_deref() == Some("dismiss_gate")),
+            "{opts:?}"
+        );
+        assert!(
+            !opts
+                .iter()
+                .any(|o| o.resolve.as_deref() == Some("activate_plot_write")),
+            "missing_exit must not offer activate: {opts:?}"
+        );
+    }
+
+    #[test]
+    fn draft_fallback_offers_batch_resume_first() {
         let (_, opts) = contextual_fallback_options(
             "demo",
             &StudioNextContext::DraftExists {
                 chapter: 3,
                 suggest_chapter: 4,
             },
+        );
+        assert_eq!(
+            opts[0].tool.as_deref(),
+            Some("continue_writing_batch"),
+            "{opts:?}"
         );
         assert!(opts.iter().any(|o| o.tool.as_deref() == Some("continue_writing")));
     }

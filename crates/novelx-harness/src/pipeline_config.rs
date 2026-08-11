@@ -50,13 +50,23 @@ pub struct PipelineConfig {
 
 impl PipelineConfig {
     pub fn load(config_root: &Path) -> Self {
-        let path = config_root.join("pipeline.yaml");
+        Self::load_for_mode(config_root, "longform")
+    }
+
+    /// Load `pipeline.yaml` (longform) or `pipeline-script.yaml` (short_drama).
+    pub fn load_for_mode(config_root: &Path, mode: &str) -> Self {
+        let file_name = match mode {
+            "short_drama" | "short-drama" | "script" => "pipeline-script.yaml",
+            _ => "pipeline.yaml",
+        };
+        let path = config_root.join(file_name);
         if !path.exists() {
             tracing::warn!(
                 path = %path.display(),
-                "pipeline.yaml missing; using embedded defaults"
+                mode,
+                "pipeline config missing; using embedded defaults for mode"
             );
-            return Self::defaults();
+            return Self::defaults_for_mode(mode);
         }
         match std::fs::read_to_string(&path) {
             Ok(raw) => match serde_yaml::from_str::<PipelineFile>(&raw) {
@@ -65,34 +75,45 @@ impl PipelineConfig {
                         order = file.order.len(),
                         mvp = file.mvp.len(),
                         handlers = file.handlers.len(),
+                        mode,
+                        file = file_name,
                         "pipeline config loaded"
                     );
                     Self {
-                        inner: Arc::new(normalize(file)),
+                        inner: Arc::new(normalize_for_mode(file, mode)),
                     }
                 }
                 Ok(_) => {
-                    tracing::warn!("pipeline.yaml has empty order; using embedded defaults");
-                    Self::defaults()
+                    tracing::warn!(file = file_name, "pipeline has empty order; using defaults");
+                    Self::defaults_for_mode(mode)
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "pipeline.yaml parse failed; using defaults");
-                    Self::defaults()
+                    tracing::warn!(error = %e, file = file_name, "pipeline parse failed; using defaults");
+                    Self::defaults_for_mode(mode)
                 }
             },
             Err(e) => {
-                tracing::warn!(error = %e, "pipeline.yaml read failed; using defaults");
-                Self::defaults()
+                tracing::warn!(error = %e, file = file_name, "pipeline read failed; using defaults");
+                Self::defaults_for_mode(mode)
             }
         }
     }
 
     pub fn defaults() -> Self {
-        let yaml = include_str!("../../../config/pipeline.yaml");
+        Self::defaults_for_mode("longform")
+    }
+
+    pub fn defaults_for_mode(mode: &str) -> Self {
+        let yaml = match mode {
+            "short_drama" | "short-drama" | "script" => {
+                include_str!("../../../config/pipeline-script.yaml")
+            }
+            _ => include_str!("../../../config/pipeline.yaml"),
+        };
         let file: PipelineFile =
-            serde_yaml::from_str(yaml).expect("embedded pipeline.yaml must parse");
+            serde_yaml::from_str(yaml).expect("embedded pipeline yaml must parse");
         Self {
-            inner: Arc::new(normalize(file)),
+            inner: Arc::new(normalize_for_mode(file, mode)),
         }
     }
 
@@ -121,14 +142,20 @@ impl PipelineConfig {
     }
 }
 
-fn default_handlers() -> HashMap<String, HandlerSpec> {
-    let yaml = include_str!("../../../config/pipeline.yaml");
+fn default_handlers_for_mode(mode: &str) -> HashMap<String, HandlerSpec> {
+    let yaml = match mode {
+        "short_drama" | "short-drama" | "script" => {
+            include_str!("../../../config/pipeline-script.yaml")
+        }
+        _ => include_str!("../../../config/pipeline.yaml"),
+    };
     let file: PipelineFile =
-        serde_yaml::from_str(yaml).expect("embedded pipeline.yaml must parse");
+        serde_yaml::from_str(yaml).expect("embedded pipeline yaml must parse");
     file.handlers
 }
 
-fn normalize(mut file: PipelineFile) -> PipelineFile {
+fn normalize_for_mode(mut file: PipelineFile, mode: &str) -> PipelineFile {
+    let short = matches!(mode, "short_drama" | "short-drama" | "script");
     if file.audit_only.is_empty() {
         file.audit_only = vec![
             "consistency_auditor".into(),
@@ -136,20 +163,30 @@ fn normalize(mut file: PipelineFile) -> PipelineFile {
         ];
     }
     if file.revise_default.is_empty() {
-        file.revise_default = vec![
-            "writer".into(),
-            "consistency_auditor".into(),
-            "pacing_reviewer".into(),
-            "summarizer".into(),
-            "plot_acceptor".into(),
-        ];
+        file.revise_default = if short {
+            vec![
+                "script_writer".into(),
+                "consistency_auditor".into(),
+                "pacing_reviewer".into(),
+                "summarizer".into(),
+                "beat_acceptor".into(),
+            ]
+        } else {
+            vec![
+                "writer".into(),
+                "consistency_auditor".into(),
+                "pacing_reviewer".into(),
+                "summarizer".into(),
+                "plot_acceptor".into(),
+            ]
+        };
     }
     if file.mvp.is_empty() {
         file.mvp = file.order.iter().take(7).cloned().collect();
     }
     // Merge defaults under user entries so a partial `handlers:` block cannot
     // silently drop writer/summarizer/etc. (user keys always win).
-    let defaults = default_handlers();
+    let defaults = default_handlers_for_mode(mode);
     if file.handlers.is_empty() {
         file.handlers = defaults;
     } else {
@@ -179,6 +216,16 @@ mod tests {
         assert!(p.mvp().iter().any(|a| a == "writer"));
         assert!(p.order().iter().any(|a| a == "lore_librarian"));
         assert_eq!(p.audit_only(), ["consistency_auditor", "pacing_reviewer"]);
+    }
+
+    #[test]
+    fn short_drama_defaults_include_script_writer() {
+        let p = PipelineConfig::defaults_for_mode("short_drama");
+        assert!(p.is_pipeline_agent("script_writer"));
+        assert!(p.is_pipeline_agent("episode_planner"));
+        assert!(p.mvp().iter().any(|a| a == "script_writer"));
+        assert!(p.handler_for("beat_acceptor").is_some());
+        assert!(!p.is_pipeline_agent("foreshadow_tracker"));
     }
 
     #[test]
@@ -231,7 +278,7 @@ handlers:
 "#;
         let file: PipelineFile = serde_yaml::from_str(yaml).unwrap();
         let p = PipelineConfig {
-            inner: Arc::new(normalize(file)),
+            inner: Arc::new(normalize_for_mode(file, "longform")),
         };
         assert_eq!(
             p.handler_for("dialogue_specialist").unwrap().focus.as_deref(),

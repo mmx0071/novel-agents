@@ -6,7 +6,8 @@ Harness 范式：`agents.yaml` 中的 `activation` 条件产生**建议**；本�
 
 按 `config/pipeline.yaml` 的 `order` 排序得到。建议会进入**本章流水线**，但不会自动写回 `state.active_agents`。
 
-> 说明：当前实现**没有**独立 Orchestrator LLM 输出 `pipeline` JSON 再执行；顺序以 `pipeline.yaml` 为准。
+> 说明：当前实现**没有**独立 Orchestrator LLM 输出 `pipeline` JSON 再执行；顺序以 `pipeline.yaml` 为准。  
+> **勿写 `depends_on`**（运行时不读）；**`tier: mvp` 勿挂 `activation`**（evaluate 会跳过，纳入只靠 `pipeline.mvp`）。
 
 ## MVP 核心 Agent（`pipeline.yaml` → `mvp`，每章通常包含）
 
@@ -57,14 +58,16 @@ chapter_planner → lore_librarian → writer
 | Agent | 何时考虑激活 |
 |-------|-------------|
 | world_architect | 尚无 Bible |
-| nomenclature_curator | 尚无名词表 / 有 Bible / 章纲有新实体 |
+| nomenclature_curator | 尚无名词表 / 章纲或正文有新实体提示（勿因仅有 Bible 每章必跑） |
 | dialogue_specialist | 对话密集 |
 | scene_specialist | 场景/动作高潮 |
-| foreshadow_tracker | 未收束伏笔 |
-| literary_editor | **非 MVP**。规则建议（近章审校失败率偏高）或 Studio `activate_agents`；用户点名润色时持久激活，勿每章必跑 |
+| foreshadow_tracker | 未收束伏笔；或已发布 >10 章（lean：无未收时奇数章跳过） |
+| literary_editor | **非 MVP**。规则建议或 Studio `activate_agents`；用户点名润色时持久激活，勿每章必跑。即时润色优先 `revise_chapter`；可选 `spawn_agent` 单步可观测（勿带整章 pipeline `mode`） |
 | master_planner / arc_planner | 尚无总纲/卷纲 |
 | expectation_reviewer | **不进章流水线**。由 Studio `review_expected_events` 在硬条件满足时调用；用户决策纳入/跳过 |
 | volume_auditor | **不进章流水线**。Studio `audit_volume` 摘要层复盘 + 建议深审章；深审再走 `audit_chapters` |
+| decision_council | **不进章流水线**。内容审校 FAIL 时**确定性 in-process** 聚合票（`decision_council.yaml`）；不 spawn SubAgent |
+| material_researcher | **不进章流水线**。仅剧情枯竭 / 需灵感时 `research_materials`；产出参考卡非 Canon；可走只读旁路 spawn |
 
 共享短文：`prose-pitfalls`（正文硬雷区）、`content-formats`（落盘格式）、`volume-lifecycle`（卷相位/衔接章）由运行时按 Agent 白名单前缀注入；勿在各 SKILL 内复制长文。
 
@@ -74,6 +77,16 @@ chapter_planner → lore_librarian → writer
 
 **仅当一致性审校未通过**（或基础设施失败重试、队列/卷审等系统已 `open_gate`）时，才出现审校决策卡。  
 内容审校失败时优先 **按 issue 决策**（Studio `offer_decisions`，或系统按 P0 兜底）。  
+当 `studio.decision_council` 开启时：内容审校 FAIL 先走评审团自动修订（不自动 accept P0）；死锁 / 基础设施失败 / 超重试才人审。  
+`studio.revise_plan`（默认开）在自动/门控 `steer_run` 修订前先选 `local`|`full`（见 `decision_council.yaml` → `revise_plan`）。  
+章通过后 `studio.seal_on_chapter_pass` 会切割 Studio 对话，下一章只吃落盘 CanonContext。  
 **审校已通过**（即使报告有 P1/P2）**不弹**审校门控；用户要改走 `revise_chapter`。
 
-静态门控模板见 `config/gates.yaml`；动态审校选项由 pending_audit.decision_options 生成。`steer_run` 支持 `issue_ids`。
+**无人值守**（`continue_writing_batch` / 评审团 `chapter_next_clean`）：默认按 `config/unattended.yaml` 跳过**软相位**——`volume_qa_phase=mid_due`、预期检阅、`foreshadow_phase=pressure_high`；硬门（setup / volume 交接 / 章序 / 剧情门 / 一致性 P0 / 字数硬门 / 草稿形状 / 卷末 sync 前 handoff 审）仍停。总开关 `studio.unattended_soft_skip`；批写可传 `respect_soft_gates=true` 保留软相位。
+
+**相位（量化→状态机）**：
+- `volume_qa_phase`：`ok` / `mid_due` / `handoff_required`（阈值章数达线无卷审 → mid_due；有人软卡，无人可跳）
+- `foreshadow_phase`：`clear` / `pressure_high` / `paydown`（近债超 cap → pressure_high；单章仅建议，批写软停，无人可跳）
+
+静态门控模板见 `config/gates.yaml`；动态审校选项由 pending_audit.decision_options 生成。`steer_run` 支持 `issue_ids`。  
+评审团与素材策略见 `config/decision_council.yaml`。

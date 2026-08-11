@@ -242,7 +242,12 @@ pub fn build_chapter_context(
         crate::plots::select_plots_for_chapter(project_dir, chapter, &haystack);
     hits.extend(plot_hits);
     if !plot_block.is_empty() {
-        sections.push(("相关剧情卡".into(), plot_block));
+        let guidance = "【章纲切片】剧情卡是跨章弧。规划本章时只把可写成约 5000–6000 字的推进点写入 \
+             plot_includes，其余走向与收束写入 plot_defers；禁止单章覆盖卡的完整概览与走向。";
+        sections.push((
+            "相关剧情卡".into(),
+            format!("{guidance}\n\n{plot_block}"),
+        ));
     }
     let index = crate::plots::load_plot_index(project_dir);
     if index.volumes.iter().any(|v| {
@@ -449,6 +454,10 @@ pub fn format_chapter_bridge(project_dir: &Path, chapter: u32) -> String {
     if parts.is_empty() {
         String::new()
     } else {
+        parts.push(
+            "时段承接：沿用上章章末叙事时刻线；开篇勿无交代假回跳；本章可只用钟点/倒计时或暂不写时段词。"
+                .into(),
+        );
         format!(
             "承接第{prev}章 → 第{chapter}章开篇必须接上列钩子/章末态势，禁止另起无关开局。\n{}",
             parts.join("\n")
@@ -1189,6 +1198,11 @@ mod tests {
         );
         assert!(pack.markdown.contains("章间衔接"));
         assert!(pack.markdown.contains("三声叩击"));
+        assert!(
+            pack.markdown.contains("时段承接"),
+            "bridge must include daypart handoff: {}",
+            pack.markdown.chars().take(400).collect::<String>()
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

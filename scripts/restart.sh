@@ -90,8 +90,8 @@ echo "== NovelX 重启 =="
 echo "  root: $ROOT"
 echo "  bind: $BIND"
 
-kill_port
-
+# Build first, then swap the listener. Killing :PORT before a long cargo/npm
+# build aborts any in-flight batch/continue mid-chapter.
 if [[ "$BUILD_CLI" -eq 1 ]]; then
   echo "→ cargo build -p novelx-cli ${PROFILE_FLAG}"
   # shellcheck disable=SC2086
@@ -115,6 +115,9 @@ if [[ "$BUILD_WEB" -eq 1 ]]; then
 else
   echo "→ 跳过前端构建"
 fi
+
+echo "→ 切换监听（此时才会中断进行中的请求）"
+kill_port
 
 mkdir -p "$ROOT/.novelx"
 LOG="$ROOT/.novelx/web.log"
