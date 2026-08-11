@@ -7,6 +7,7 @@ import {
   pickPrimaryApprovalOption,
   resolveApprovalChapter,
   resolveStudioCta,
+  stageOrderForMode,
 } from './studioPhase.js'
 
 describe('STAGE_ORDER', () => {
@@ -16,6 +17,15 @@ describe('STAGE_ORDER', () => {
       'volume',
       'chapter',
       'volume_end',
+    ])
+  })
+
+  it('uses series labels for short drama', () => {
+    expect(stageOrderForMode('short_drama').map((s) => s.label)).toEqual([
+      '立项',
+      '系列规划',
+      '写集',
+      '系列收束',
     ])
   })
 })
@@ -38,6 +48,16 @@ describe('buildCreateNovelMessage', () => {
   it('trims whitespace and ignores empty optional fields', () => {
     expect(buildCreateNovelMessage({ title: '  demo  ', genre: '  ', brief: '' }))
       .toBe('我想写一本小说，书名《demo》。请先帮我立项。')
+  })
+
+  it('short drama prompt stays author-facing', () => {
+    const msg = buildCreateNovelMessage({
+      title: 'demo',
+      mode: 'short_drama',
+    })
+    expect(msg).toContain('短剧')
+    expect(msg).not.toContain('create_novel')
+    expect(msg).not.toContain('project_mode')
   })
 })
 
@@ -83,7 +103,7 @@ describe('deriveStudioStage', () => {
     })
     expect(s.stageId).toBe('volume_end')
     expect(s.stageIndex).toBe(3)
-    expect(s.cta.message).toBe('同步设定库')
+    expect(s.cta.message).toBe('同步本卷设定')
   })
 
   it('maps awaiting_next_arc / awaiting_next_plot to volume planning', () => {
@@ -134,6 +154,40 @@ describe('deriveStudioStage', () => {
     })
     expect(s.cta.id).toBe('write_next')
     expect(s.cta.message).toBe('写第3章')
+  })
+
+  it('prefers mid-volume QA CTA when volume_qa_phase is mid_due', () => {
+    const s = deriveStudioStage({
+      setup_phase: 'ready',
+      volume_phase: 'drafting_volume',
+      has_arc_outline: true,
+      published_count: 2,
+      next_chapter: 3,
+      volume_qa_phase: 'mid_due',
+      chapters: [
+        { number: 1, has_draft: true, body_chars: 5000 },
+        { number: 2, has_draft: true, body_chars: 5200 },
+      ],
+    })
+    expect(s.cta.id).toBe('volume_mid_audit')
+    expect(s.detail).toContain('复盘')
+  })
+
+  it('mentions foreshadow pressure on write_next detail', () => {
+    const s = deriveStudioStage({
+      setup_phase: 'ready',
+      volume_phase: 'drafting_volume',
+      has_arc_outline: true,
+      published_count: 2,
+      next_chapter: 3,
+      foreshadow_phase: 'pressure_high',
+      chapters: [
+        { number: 1, has_draft: true, body_chars: 5000 },
+        { number: 2, has_draft: true, body_chars: 5200 },
+      ],
+    })
+    expect(s.cta.id).toBe('write_next')
+    expect(s.detail).toContain('伏笔')
   })
 
   it('treats published_count>=1 as setup ready even if phase missing', () => {

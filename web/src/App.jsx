@@ -9,23 +9,37 @@ import {
   workspaceKey,
 } from './studioCache'
 import NovelXChat from './components/NovelXChat'
+import SubAgentPage from './components/SubAgentPage'
+import {
+  foreshadowHealthLevel,
+  lengthHealthLevel,
+  longformTierLevel,
+  volumeHealthLevel,
+  worstHealthLevel,
+} from './healthLabels'
+import {
+  CreationStatusBar,
+  CreationStatusPage,
+  formatCostTop,
+} from './components/CreationStatus'
+import ChapterStrip from './components/ChapterStrip'
+import DangerConfirmModal from './components/DangerConfirmModal'
+import NewNovelModal from './components/NewNovelModal'
 import MarkdownView from './components/MarkdownView'
 import ConfigPanel from './components/ConfigPanel'
 import VolumeWorkspace from './components/VolumeWorkspace'
-import WritingPrefs from './components/WritingPrefs'
+import { normalizeSubAgent, upsertSubAgent } from './subAgents'
 import { buildVolumePlotGroups, sortPlotsByProgress } from './plotSort'
 import {
-  STAGE_ORDER,
   buildCreateNovelMessage,
   deriveStudioStage,
   resolveStudioCta,
 } from './studioPhase'
 import {
-  CHAPTER_WORD_HARD_MIN,
-  CHAPTER_WORD_MAX,
-  CHAPTER_WORD_MIN,
+  formatUnitTitle,
   wordProgressLabel,
   wordProgressTone,
+  wordTargetsForMode,
 } from './chapterTargets'
 import { pickActivePlot, summarizePlotForDesk } from './plotSummary'
 
@@ -61,13 +75,18 @@ async function api(path, options = {}) {
   return data
 }
 
-const ARTIFACT_LABELS = {
-  // Prefer `bible` when both exist (see artifactTabs filter).
-  world_architect: '世界观',
-  bible: '世界观',
-  // master_outline / master_planner → single reader tab「总纲」
-  // 卷纲：preview.arc_outlines → 单 Tab「卷纲」；其下挂靠同卷剧情卡
-}
+/**
+ * Approved reader artifact modules only.
+ * Unknown files under artifacts/ must NOT auto-create tabs (no `|| key` fallback).
+ * Add a row here only after product review — same layer as 总纲/卷纲, not a dump of disk stems.
+ */
+const READER_ART_MODULES = [
+  {
+    key: 'bible',
+    altKeys: ['world_architect'], // legacy dual-write → one「世界观」tab
+    label: '世界观',
+  },
+]
 
 const ENTITY_TAB_LABELS = {
   characters: '人物',
@@ -135,45 +154,55 @@ const EXPECTED_STATUS_LABELS = {
   dismissed: '已搁置',
 }
 
+const PLOT_STATUS_LABELS = {
+  active: '进行中',
+  in_progress: '进行中',
+  pending: '待开始',
+  completed: '已完成',
+  done: '已完成',
+  paused: '暂停',
+  archived: '已归档',
+}
+
 function formatExpectedConditions(c) {
-  if (!c || typeof c !== 'object') return '无硬条件（随时可检阅）'
+  if (!c || typeof c !== 'object') return '随时可检阅'
   const parts = []
-  if (c.min_chapter) parts.push(`≥第${c.min_chapter}章`)
-  if (c.max_chapter) parts.push(`≤第${c.max_chapter}章`)
-  if (c.volume) parts.push(`第${c.volume}卷`)
+  if (c.min_chapter) parts.push(`大约从第${c.min_chapter}章起`)
+  if (c.max_chapter) parts.push(`大约到第${c.max_chapter}章前`)
+  if (c.volume) parts.push(`适合第${c.volume}卷`)
   if (c.require_plot_id) {
-    parts.push(`剧情卡${c.require_plot_id}${c.require_plot_status ? `:${c.require_plot_status}` : ''}`)
+    const st = c.require_plot_status
+      ? `（${EXPECTED_STATUS_LABELS[c.require_plot_status] || '指定状态'}）`
+      : ''
+    parts.push(`需相关剧情推进${st}`)
   } else if (c.require_plot_status) {
-    parts.push(`剧情status=${c.require_plot_status}`)
+    parts.push(`需剧情处于「${EXPECTED_STATUS_LABELS[c.require_plot_status] || '指定状态'}」`)
   }
   if (c.require_entity) {
-    parts.push(`实体${c.require_entity}${c.require_entity_status ? `:${c.require_entity_status}` : ''}`)
+    parts.push(`涉及相关人物或设定`)
   }
-  if (c.after_event_id) parts.push(`依赖${c.after_event_id}`)
+  if (c.after_event_id) parts.push('需先完成前序预期')
   if (c.freeform) parts.push(String(c.freeform).slice(0, 80))
-  return parts.length ? parts.join(' · ') : '无硬条件（随时可检阅）'
+  return parts.length ? parts.join(' · ') : '随时可检阅'
 }
 
 function formatExpectedEvent(e) {
-  if (!e) return '（暂无预处理预期）'
-  const kind = EXPECTED_KIND_LABELS[e.kind] || e.kind || '其他'
-  const status = EXPECTED_STATUS_LABELS[e.status] || e.status || ''
+  if (!e) return '（还没有登记「以后想写的情节」）'
+  const kind = EXPECTED_KIND_LABELS[e.kind] || (/[\u4e00-\u9fff]/.test(String(e.kind || '')) ? e.kind : '其他')
+  const status = EXPECTED_STATUS_LABELS[e.status] || (/[\u4e00-\u9fff]/.test(String(e.status || '')) ? e.status : '待定')
   const elig = e.eligibility?.label || ''
-  const fit = e.last_review?.agent_fit || '—'
-  const reason = e.last_review?.reason || '—'
+  const reason = e.last_review?.reason || ''
   const suggestion = e.last_review?.suggestion || ''
   return (
     `# ${String(e.text || '未命名预期').slice(0, 80)}\n\n`
-    + `- **id**：\`${e.id || ''}\`\n`
     + `- **类型**：${kind}\n`
     + `- **状态**：${status}${elig ? `（${elig}）` : ''}\n`
     + `- **来源**：${e.source === 'reader' ? '读者' : '作者'}\n`
-    + (e.entity_ref ? `- **实体**：${e.entity_ref}\n` : '')
-    + `- **触发条件**：${formatExpectedConditions(e.conditions)}\n`
-    + `- **最近检阅**：拟合 ${fit} · ${reason}\n`
+    + `- **何时适合写**：${formatExpectedConditions(e.conditions)}\n`
+    + (reason ? `- **最近看法**：${reason}\n` : '')
     + (suggestion ? `- **建议做法**：${suggestion}\n` : '')
     + (e.notes ? `\n## 备注\n\n${e.notes}\n` : '')
-    + '\n> 只读展示。纳入或跳过请在右侧创作助手中选择；确认后再由设定/剧情工具落地。\n'
+    + '\n> 只读展示。是否纳入请在右侧创作助手中选择。\n'
   )
 }
 
@@ -190,6 +219,8 @@ function formatPlotCard(p) {
   const mark = p.complete ? '' : '（待补全）'
   const gaps = p.gaps?.length ? `\n> 缺口：${p.gaps.join('、')}` : ''
   const scope = '卷内局部'
+  const statusZh = PLOT_STATUS_LABELS[p.status]
+    || (/[\u4e00-\u9fff]/.test(String(p.status || '')) ? p.status : '')
   // 优先完整 markdown（与磁盘卡一致）；无则拼结构化预览
   if (p.markdown?.trim()) {
     return `${p.markdown.trim()}${gaps}${mark ? `\n${mark}` : ''}`
@@ -197,7 +228,7 @@ function formatPlotCard(p) {
   return (
     `# ${p.title || '未命名'}\n`
     + `${p.anchor || `${scope} · ${p.arc || ''} · ${p.chapter_range || ''}`}\n`
-    + `类型：${p.plot_type || ''} · 状态：${p.status || ''}\n\n`
+    + `类型：${p.plot_type || '剧情'} · 状态：${statusZh || '进行中'}\n\n`
     + `## 概览\n${p.overview || p.summary || '（无）'}\n\n`
     + `## 剧情走向\n${p.plot_direction || '（无）'}\n\n`
     + `## 出场人物\n${joinList(p.characters)}\n\n`
@@ -210,9 +241,12 @@ function formatPlotCard(p) {
 }
 
 export default function App() {
-  /** `library` = 书库；`prefs` = 写作偏好；引擎室用 engineOpen 抽屉 */
-  const [appMode, setAppMode] = useState('library')
+  /** Status / settings both open as right drawers (consistent chrome). */
+  const [statusOpen, setStatusOpen] = useState(false)
   const [engineOpen, setEngineOpen] = useState(false)
+  /** High-risk delete: { kind, name?, title, chapter?, unit? } */
+  const [dangerConfirm, setDangerConfirm] = useState(null)
+  const [dangerBusy, setDangerBusy] = useState(false)
   const [library, setLibrary] = useState([])
   const [novelRecord, setNovelRecord] = useState(null)
   const [project, setProject] = useState(initialProject)
@@ -240,7 +274,6 @@ export default function App() {
   const [deskPatches, setDeskPatches] = useState([])
   const [deskPatchFocus, setDeskPatchFocus] = useState(null)
   const [deskPatchHidden, setDeskPatchHidden] = useState(false)
-  const [plotRailOpen, setPlotRailOpen] = useState(false)
   const [auditState, setAuditState] = useState({
     todos: [],
     reports: [],
@@ -248,6 +281,9 @@ export default function App() {
     openApproval: null,
   })
   const [chatBusy, setChatBusy] = useState(false)
+  /** SubAgent dedicated page — null means main Studio (reader + chat). */
+  const [openSubAgent, setOpenSubAgent] = useState(null)
+  const [subAgents, setSubAgents] = useState([])
   const chatSendRef = useRef(null)
   const workspacesRef = useRef(initialCache.projectSessions || {})
   const currentProjectRef = useRef(initialProject)
@@ -284,19 +320,36 @@ export default function App() {
     setNovelRecord(null)
     setReaderTab('draft')
     setSelectedChapter(1)
+    setOpenSubAgent(null)
+    setSubAgents([])
   }, [persistCurrentWorkspace])
 
-  const deleteNovel = useCallback(async (name, displayTitle, event) => {
+  // Switching novels closes SubAgent page (child threads belong to prior root).
+  useEffect(() => {
+    setOpenSubAgent(null)
+  }, [project])
+
+  const requestDeleteNovel = useCallback((name, displayTitle, event) => {
     event?.stopPropagation()
     event?.preventDefault()
+    if (!name) return
     const title = displayTitle || name
-    if (!window.confirm(`确定删除《${title}》？\n项目文件将永久删除，不可恢复。`)) {
-      return
-    }
+    setDangerConfirm({
+      kind: 'novel',
+      name,
+      title,
+      confirmText: title,
+      dialogTitle: `删除《${title}》？`,
+      message: '项目文件将永久删除，不可恢复。请输入书名以二次确认。',
+    })
+  }, [])
+
+  const performDeleteNovel = useCallback(async (name) => {
+    if (!name) return false
     const data = await api(`/library/${encodeURIComponent(name)}`, { method: 'DELETE' })
-    if (data.error) {
-      window.alert(data.error)
-      return
+    if (data.error || data.ok === false) {
+      window.alert(data.error || '删除失败')
+      return false
     }
     delete workspacesRef.current[workspaceKey(name)]
     const wasActive = currentProjectRef.current === name
@@ -308,6 +361,7 @@ export default function App() {
       projectSessions: workspacesRef.current,
     })
     await refreshLibrary()
+    return true
   }, [clearToDraft, refreshLibrary])
 
   const fetchNovelPreview = useCallback(async (name, tabHint) => {
@@ -464,6 +518,36 @@ export default function App() {
     return chatSendRef.current(text, opts) !== false
   }, [])
 
+  const handleSubAgentsChange = useCallback((list) => {
+    const next = Array.isArray(list) ? list : []
+    setSubAgents(next)
+    setOpenSubAgent((cur) => {
+      if (!cur?.threadId) return cur
+      const fresh = next.find((a) => a.threadId === cur.threadId)
+      return fresh ? { ...cur, ...fresh } : cur
+    })
+  }, [])
+
+  const handleOpenSubAgent = useCallback((agent) => {
+    const next = normalizeSubAgent(agent)
+    if (!next?.threadId) return
+    setSubAgents((prev) => upsertSubAgent(prev, next))
+    setOpenSubAgent(next)
+  }, [])
+
+  const handleSubAgentUpdate = useCallback((agent) => {
+    const next = normalizeSubAgent(agent)
+    if (!next?.threadId) return
+    setSubAgents((prev) => upsertSubAgent(prev, next))
+    setOpenSubAgent((cur) => (
+      cur && cur.threadId === next.threadId ? { ...cur, ...next } : cur
+    ))
+  }, [])
+
+  const handleCloseSubAgent = useCallback(() => {
+    setOpenSubAgent(null)
+  }, [])
+
   const handleChatBusyChange = useCallback((busy) => {
     setChatBusy(Boolean(busy))
   }, [])
@@ -482,7 +566,6 @@ export default function App() {
     })
     if (project) clearToDraft()
     setNewNovelBusy(true)
-    setAppMode('library')
     setNewNovelTitle('')
     setNewNovelGenre('')
     setNewNovelBrief('')
@@ -562,27 +645,33 @@ export default function App() {
     }
   }, [selectProject])
 
-  const chapterMeta = preview?.chapters?.find((c) => c.number === selectedChapter)
+  const nextChapter = novelRecord?.next_chapter ?? (preview?.chapters?.length || 0) + 1
+  const chapterFocus = selectedChapter > 0 ? selectedChapter : nextChapter
+  const chapterMeta = preview?.chapters?.find((c) => c.number === chapterFocus)
   const chapterData = (() => {
-    const cached = chapterCache[selectedChapter]
+    const unit = preview?.project_mode === 'short_drama' ? '集' : '章'
+    const n = chapterFocus
+    if (!project || !(n > 0)) return null
+    const fallbackTitle = `第${n}${unit}`
+    const cached = chapterCache[n]
     if (cached) {
       return {
-        number: selectedChapter,
-        title: cached.title || chapterMeta?.title || `第${selectedChapter}章`,
+        number: n,
+        title: cached.title || chapterMeta?.title || fallbackTitle,
         draft: cached.draft || '',
         outline: cached.outline || '',
         body_chars: cached.body_chars ?? chapterMeta?.body_chars,
       }
     }
-    if (!chapterMeta) return null
     // Legacy: preview still embeds bodies (older servers).
-    if (chapterMeta.draft || chapterMeta.outline) return chapterMeta
+    if (chapterMeta?.draft || chapterMeta?.outline) return chapterMeta
+    // Keep 正文/章纲 tabs available even before the chapter file exists on disk.
     return {
-      number: selectedChapter,
-      title: chapterMeta.title || `第${selectedChapter}章`,
+      number: n,
+      title: chapterMeta?.title || fallbackTitle,
       draft: '',
       outline: '',
-      body_chars: chapterMeta.body_chars,
+      body_chars: chapterMeta?.body_chars || 0,
     }
   })()
 
@@ -634,38 +723,41 @@ export default function App() {
   }, [project])
 
   const storyOutline = preview?.story_outline
-  const nextChapter = novelRecord?.next_chapter ?? (preview?.chapters?.length || 0) + 1
   const publishedCount = Number(
     novelRecord?.published_count ?? preview?.published_count ?? 0,
   ) || 0
   const isChapterPublished = (n) => Number(n) > 0 && Number(n) <= publishedCount
-  // bible.md is canonical; world_architect.md is legacy dual-write — show one「世界观」tab.
-  // master_outline.md is the only「总纲」surface (story_outline.json is internal acts store).
-  // nomenclature overlaps 人物/物品/地点 entity cards — hide from reader.
+  // 总纲：master_outline.md；短剧 series_outline.md 为同层别名，不单独占 Tab。
+  // story_outline.json 仅存 acts，不对读者展示第二份总纲。
+  const isShortDrama = preview?.project_mode === 'short_drama'
   const arcOutlines = (Array.isArray(preview?.arc_outlines) ? preview.arc_outlines : [])
     .filter((a) => a?.volume >= 1 && String(a?.markdown || '').trim())
     .slice()
     .sort((a, b) => a.volume - b.volume)
-  const artifactTabs = Object.keys(preview?.artifacts || {}).filter((k) => {
-    if (k === 'world_architect' && preview?.artifacts?.bible) return false
-    if (
-      k === 'master_outline'
-      || k === 'master_planner'
-      || k === 'story_outline'
-      || k === 'relation_graph'
-      || k === 'nomenclature'
-      || k === 'arc_outline'
-      || k === 'arc_planner'
-    ) {
-      return false
+  const masterOutlineText = preview?.artifacts?.master_outline
+    || preview?.artifacts?.series_outline
+    || preview?.artifacts?.master_planner
+    || storyOutline?.markdown
+    || ''
+  const approvedArtTabs = READER_ART_MODULES.map((mod) => {
+    const text = preview?.artifacts?.[mod.key]
+      || (mod.altKeys || []).map((k) => preview?.artifacts?.[k]).find((v) => String(v || '').trim())
+      || ''
+    return {
+      id: `art:${mod.key}`,
+      label: mod.label,
+      show: Boolean(String(text).trim()),
+      text: String(text || ''),
     }
-    return true
-  })
+  }).filter((t) => t.show)
   const entities = preview?.entities || {}
   const plots = sortPlotsByProgress(preview?.plots || [])
   const entityGaps = preview?.entity_gaps || []
   const expectedEvents = preview?.expected_events || []
-  const volumeGroups = buildVolumePlotGroups(arcOutlines, plots)
+  // 短剧无卷相位：不挂「本卷 / 卷纲」工作台（剧情 beat 仍可由助手落地，不单独开未核定 Tab）
+  const volumeGroups = isShortDrama
+    ? []
+    : buildVolumePlotGroups(arcOutlines, plots)
   const isArcNav = readerTab === 'arcs' || readerTab === 'plots'
   const isExpectedNav = readerTab === 'expected'
   const isVolumeWorkspace = readerTab === 'volume'
@@ -753,6 +845,14 @@ export default function App() {
     if (readerTab === 'plots') setReaderTab('arcs')
   }, [readerTab])
 
+  // Short drama: leave longform-only modules if a stale tab was selected.
+  useEffect(() => {
+    if (!isShortDrama) return
+    if (readerTab === 'volume' || readerTab === 'arcs' || readerTab === 'plots') {
+      setReaderTab(chapterData ? 'draft' : 'master')
+    }
+  }, [isShortDrama, readerTab, chapterData])
+
   // Keep readerVolume in sync with available groups / selection.
   useEffect(() => {
     if (!isArcNav) return
@@ -818,8 +918,20 @@ export default function App() {
     const draft = String(chapterData?.draft || '')
     return draft ? Array.from(draft.replace(/\s+/g, '')).length || draft.length : 0
   })()
-  const wordTone = wordProgressTone(draftBodyChars)
-  const wordPct = Math.min(100, Math.round((draftBodyChars / CHAPTER_WORD_MIN) * 100))
+  const projectMode = preview?.project_mode || novelRecord?.project_mode || 'longform'
+  const wordBand = wordTargetsForMode(projectMode)
+  const wordTone = wordProgressTone(draftBodyChars, projectMode)
+  const wordLabel = wordProgressLabel(draftBodyChars, projectMode)
+  const unitWordChars = (() => {
+    if (readerTab === 'draft' && draftBodyChars > 0) return draftBodyChars
+    return Number(selectedChapterStatus?.bodyChars) || 0
+  })()
+  const readerUnitTitle = formatUnitTitle(
+    selectedChapter,
+    chapterData?.title,
+    projectMode,
+  )
+  const unitLabel = projectMode === 'short_drama' ? '集' : '章'
   const activePlotSummary = summarizePlotForDesk(pickActivePlot(plots))
   const visibleDeskPatches = deskPatches.filter((p) => (
     !selectedChapter || Number(p.chapter) === Number(selectedChapter)
@@ -836,94 +948,43 @@ export default function App() {
     return visibleDeskPatches[visibleDeskPatches.length - 1]
   })()
 
-  const progressLabel = (() => {
-    if (!novelRecord) return ''
-    const n = novelRecord.published_count || 0
-    const vol = novelRecord.current_volume
-    if (vol) return `已写 ${n} 章 · 当前卷：${vol}`
-    return `已写 ${n} 章`
-  })()
-
   const longformHealth = preview?.longform_health || null
   const foreshadowDebt = longformHealth?.foreshadow || null
   const volumeHealth = longformHealth?.volume || null
   const lengthHealth = longformHealth?.length || null
   const longformTier = longformHealth?.longform || null
-  const costByAgent = Array.isArray(preview?.cost_by_agent) ? preview.cost_by_agent : []
-  const costTop = costByAgent
-    .filter((c) => c?.agent && c.agent !== 'pipeline')
-    .slice(0, 4)
-    .map((c) => `${c.agent}≈${Math.round((c.approx_tokens || 0) / 1000)}k`)
-    .join(' · ')
+  const costTop = formatCostTop(preview?.cost_by_agent)
   const lengthChip = lengthHealth
-    ? `偏短率 ${Math.round((lengthHealth.soft_short_rate || 0) * 100)}%`
+    ? `近期偏短 ${Math.round((lengthHealth.soft_short_rate || 0) * 100)}%`
       + (lengthHealth.consecutive_soft_short
-        ? ` · 连短 ${lengthHealth.consecutive_soft_short}`
+        ? ` · 连续偏短 ${lengthHealth.consecutive_soft_short} 章`
         : '')
     : ''
 
-  // 长篇健康交通灯：ok 绿 / warn 黄 / bad 红（伏笔看压力近债，不看总量）
-  const foreshadowLevel = (() => {
-    const pressure = foreshadowDebt?.dangling_pressure ?? 0
-    const cold = foreshadowDebt?.open_cold ?? 0
-    if (pressure > 24 || cold > 40) return 'bad'
-    if (pressure > 8 || cold > 0) return 'warn'
-    return 'ok'
-  })()
-  const foreshadowDebtClassLabel = (c) => {
-    switch (String(c || '').toLowerCase()) {
-      case 'near':
-        return '近债'
-      case 'mid':
-        return '中期'
-      case 'far':
-        return '远期'
-      case 'fresh':
-        return '宽限'
-      default:
-        return ''
-    }
-  }
-  const volumeLevel = (() => {
-    if (!volumeHealth?.active_index) return 'warn'
-    if (volumeHealth.thick_volume_warning) return 'bad'
-    const ch = volumeHealth.chapters_in_volume || 0
-    const mid = volumeHealth.mid_audit_threshold || 0
-    if (mid > 0 && ch >= mid && !volumeHealth.has_audit_report) return 'warn'
-    return 'ok'
-  })()
-  const lengthLevel = (() => {
-    if (!lengthHealth) return 'ok'
-    const rate = lengthHealth.soft_short_rate || 0
-    const streak = lengthHealth.consecutive_soft_short || 0
-    const hard = lengthHealth.recent_hard_short || 0
-    if (streak >= 3 || rate > 0.4 || hard >= 2) return 'bad'
-    if (streak >= 1 || rate > 0.15 || hard >= 1) return 'warn'
-    return 'ok'
-  })()
-  const longformLevel = (() => {
-    if (!longformTier) return 'ok'
-    const q = String(longformTier.quality_tier || '').toLowerCase()
-    const impact = String(longformTier.impact_scan_mode || '').toLowerCase()
-    const drift = longformTier.drift_samples ?? 0
-    if (impact === 'all' || drift > 80) return 'bad'
-    if (q === 'economy' || drift > 20) return 'warn'
-    return 'ok'
-  })()
-  const healthLevelLabel = { ok: '正常', warn: '警告', bad: '异常' }
+  // 创作状态交通灯：ok 绿 / warn 黄 / bad 红（含相位字段 + 引擎档位）
+  const volumeQaPhase = preview?.volume_qa_phase || ''
+  const foreshadowPhase = preview?.foreshadow_phase || ''
+  const foreshadowLevel = foreshadowHealthLevel(foreshadowDebt, foreshadowPhase)
+  const volumeLevel = volumeHealthLevel(volumeHealth, volumeQaPhase)
+  const lengthLevel = lengthHealthLevel(lengthHealth)
+  const longformLevel = longformTierLevel(longformTier)
+  const overallHealthLevel = worstHealthLevel(
+    foreshadowLevel,
+    volumeLevel,
+    lengthLevel,
+    longformLevel,
+  )
 
   const hasReaderMaterial = Boolean(
     chapterList.length
-    || artifactTabs.length
+    || approvedArtTabs.length
     || arcOutlines.length
     || volumeGroups.length
     || entities.characters?.length
     || entities.items?.length
     || entities.locations?.length
     || plots.length
-    || preview?.artifacts?.master_outline
-    || preview?.artifacts?.master_planner
-    || storyOutline?.markdown
+    || masterOutlineText
     || storyOutline?.acts?.length
     || project
   )
@@ -932,22 +993,19 @@ export default function App() {
     if (readerTab === 'volume') return ''
     if (readerTab === 'draft') {
       if (chapterLoading && !chapterData?.draft) return '（加载正文中…）'
-      return chapterData?.draft
+      return chapterData?.draft || '（尚无正文）'
     }
     if (readerTab === 'outline') {
       if (chapterLoading && !chapterData?.outline) return '（加载章纲中…）'
-      return chapterData?.outline
+      return chapterData?.outline || (isShortDrama ? '（尚无集纲）' : '（尚无章纲）')
     }
     if (readerTab === 'master') {
-      return preview?.artifacts?.master_outline
-        || preview?.artifacts?.master_planner
-        || storyOutline?.markdown
-        || '（尚无总纲）'
+      return masterOutlineText || '（尚无总纲）'
     }
     if (readerTab === 'entity_gaps') {
       return preview?.entity_gaps_display
         || (entityGaps.length
-          ? '（软提示·不阻断写章）待补全：\n\n' + entityGaps.map((g) => `- ${g}`).join('\n')
+          ? '待补全（不妨碍继续写）：\n\n' + entityGaps.map((g) => `- ${g}`).join('\n')
           : '设定卡与世界观暂无明显缺口。')
     }
     if (isExpectedNav) {
@@ -967,7 +1025,13 @@ export default function App() {
       if (!readerCardList.length) return `（暂无${label}设定卡）`
       return formatEntityCard(selectedReaderCard, label)
     }
-    if (readerTab.startsWith('art:')) return preview?.artifacts?.[readerTab.slice(4)] || ''
+    if (readerTab.startsWith('art:')) {
+      const key = readerTab.slice(4)
+      const approved = approvedArtTabs.find((t) => t.id === `art:${key}`)
+      if (approved) return approved.text
+      // Not on allowlist — never render arbitrary disk stems as modules.
+      return ''
+    }
     return ''
   })()
 
@@ -1011,28 +1075,35 @@ export default function App() {
     }
   }, [readerTab, selectedChapter])
 
+  // First-class reader modules only. New surfaces require an entry here / in READER_ART_MODULES.
   const readerTabs = [
     {
       id: 'volume',
       label: '本卷',
-      show: Boolean(volumeGroups.length || project),
+      title: '当前卷的写作台：进度、剧情与写下一章',
+      show: !isShortDrama && Boolean(volumeGroups.length || project),
     },
-    { id: 'draft', label: preview?.project_mode === 'short_drama' ? '剧本' : '正文', show: Boolean(chapterData) },
-    { id: 'outline', label: preview?.project_mode === 'short_drama' ? '集纲' : '章纲', show: Boolean(chapterData) },
+    {
+      id: 'draft',
+      label: isShortDrama ? '剧本' : '正文',
+      // Always offer the body surface once a project is open (empty state is fine).
+      show: Boolean(project),
+    },
+    {
+      id: 'outline',
+      label: isShortDrama ? '集纲' : '章纲',
+      show: Boolean(project),
+    },
     {
       id: 'master',
       label: '总纲',
-      show: Boolean(
-        preview?.artifacts?.master_outline
-        || preview?.artifacts?.master_planner
-        || storyOutline?.markdown
-        || project,
-      ),
+      show: Boolean(masterOutlineText || project),
     },
     {
       id: 'arcs',
       label: '卷纲',
-      show: Boolean(arcOutlines.length || plots.length),
+      title: '卷结构与剧情卡树：看整卷怎么排',
+      show: !isShortDrama && Boolean(arcOutlines.length || plots.length),
     },
     ...Object.entries(ENTITY_TAB_LABELS).map(([key, label]) => ({
       id: `ent:${key}`,
@@ -1041,9 +1112,7 @@ export default function App() {
     })),
     { id: 'entity_gaps', label: '设定缺口', show: Boolean(entityGaps.length) },
     { id: 'expected', label: '预期', show: Boolean(expectedEvents.length) },
-    ...artifactTabs.map((k) => ({
-      id: `art:${k}`, label: ARTIFACT_LABELS[k] || k, show: true,
-    })),
+    ...approvedArtTabs.map(({ id, label, show }) => ({ id, label, show })),
   ].filter((t) => t.show)
 
   const readerCanEdit = Boolean(
@@ -1132,20 +1201,23 @@ export default function App() {
     if (cta.message) sendChatMessage(cta.message, { busy: 'ignore' })
   }
 
-  // Esc closes engine drawer; lock body scroll while open.
+  // Esc closes status/settings drawer; lock body scroll while open.
   useEffect(() => {
-    if (!engineOpen) return undefined
+    if (!engineOpen && !statusOpen) return undefined
     const prev = document.body.style.overflow
     document.body.style.overflow = 'hidden'
     const onKey = (e) => {
-      if (e.key === 'Escape') setEngineOpen(false)
+      if (e.key === 'Escape') {
+        setEngineOpen(false)
+        setStatusOpen(false)
+      }
     }
     window.addEventListener('keydown', onKey)
     return () => {
       document.body.style.overflow = prev
       window.removeEventListener('keydown', onKey)
     }
-  }, [engineOpen])
+  }, [engineOpen, statusOpen])
 
   const beginReaderEdit = () => {
     setReaderEditError('')
@@ -1235,14 +1307,27 @@ export default function App() {
     setReaderCardKey(key)
   }
 
-  const deleteChapter = useCallback(async (chapter) => {
+  const requestDeleteChapter = useCallback((chapter) => {
     const proj = currentProjectRef.current || project
     if (!proj || !chapter) return
+    const mode = preview?.project_mode || 'longform'
+    const unit = mode === 'short_drama' ? '集' : '章'
     const title = preview?.chapters?.find((c) => c.number === chapter)?.title
-    const label = title ? `第${chapter}章「${title}」` : `第${chapter}章`
-    if (!window.confirm(`确定删除${label}？\n章节目录将永久删除，不可恢复。`)) {
-      return
-    }
+    const label = formatUnitTitle(chapter, title, mode)
+    setDangerConfirm({
+      kind: 'chapter',
+      project: proj,
+      chapter,
+      unit,
+      title: label,
+      dialogTitle: `删除${label}？`,
+      confirmText: String(chapter),
+      message: `${unit}目录将永久删除，不可恢复。请输入章节号 ${chapter} 以二次确认。`,
+    })
+  }, [project, preview])
+
+  const performDeleteChapter = useCallback(async (proj, chapter) => {
+    if (!proj || !chapter) return false
     if (readerEditing) {
       setReaderEditing(false)
       setReaderEditText('')
@@ -1254,7 +1339,7 @@ export default function App() {
     )
     if (data.error) {
       window.alert(data.error)
-      return
+      return false
     }
     if (data.preview) {
       setPreview(data.preview)
@@ -1280,409 +1365,229 @@ export default function App() {
     const lib = await api(`/library/${encodeURIComponent(proj)}`)
     if (!lib.error) setNovelRecord(lib.novel)
     refreshLibrary()
-  }, [
-    project,
-    preview,
-    readerEditing,
-    refreshLibrary,
-    selectedChapter,
-  ])
+    return true
+  }, [readerEditing, refreshLibrary, selectedChapter])
+
+  const runDangerConfirm = useCallback(async () => {
+    if (!dangerConfirm || dangerBusy) return
+    setDangerBusy(true)
+    try {
+      let ok = false
+      if (dangerConfirm.kind === 'novel') {
+        ok = await performDeleteNovel(dangerConfirm.name)
+      } else if (dangerConfirm.kind === 'chapter') {
+        ok = await performDeleteChapter(dangerConfirm.project, dangerConfirm.chapter)
+      }
+      if (ok) setDangerConfirm(null)
+    } finally {
+      setDangerBusy(false)
+    }
+  }, [dangerConfirm, dangerBusy, performDeleteNovel, performDeleteChapter])
 
   return (
     <div className="studio">
       <header className="studio-header">
         <div className="studio-header-left">
           <h1>NovelX</h1>
-          {project && (
-            <div className="header-meta">
-              <span>{novelRecord?.display_title || project}</span>
-              {novelRecord && progressLabel && (
-                <span className="progress-chip">{progressLabel}</span>
-              )}
-            </div>
-          )}
+          <div className="header-novel" role="group" aria-label="作品">
+            <select
+              className="header-novel-select"
+              value={project || ''}
+              onChange={(e) => {
+                const id = e.target.value
+                if (id) loadNovel(id)
+              }}
+              aria-label="切换小说"
+              disabled={newNovelBusy}
+            >
+              {!project ? (
+                <option value="" disabled>
+                  {library.length ? '选择小说…' : '暂无小说'}
+                </option>
+              ) : null}
+              {project && !library.some((n) => n.id === project) ? (
+                <option value={project}>
+                  {novelRecord?.display_title || project}
+                </option>
+              ) : null}
+              {library.map((n) => (
+                <option key={n.id} value={n.id}>
+                  {n.display_title || n.id}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              className={`header-icon-btn header-icon-btn--primary${showNewNovelForm ? ' is-active' : ''}`}
+              onClick={() => setShowNewNovelForm((v) => !v)}
+              disabled={newNovelBusy}
+              title={showNewNovelForm ? '收起新建' : '新建小说'}
+              aria-label={showNewNovelForm ? '收起新建' : '新建小说'}
+              aria-expanded={showNewNovelForm}
+            >
+              <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+                <path
+                  fill="currentColor"
+                  d="M8 1.5a.5.5 0 0 1 .5.5v5.5H14a.5.5 0 0 1 0 1H8.5V14a.5.5 0 0 1-1 0V8.5H2a.5.5 0 0 1 0-1h5.5V2a.5.5 0 0 1 .5-.5z"
+                />
+              </svg>
+            </button>
+            {project ? (
+              <button
+                type="button"
+                className="header-icon-btn"
+                title="删除当前小说"
+                aria-label="删除当前小说"
+                onClick={(e) => requestDeleteNovel(
+                  project,
+                  novelRecord?.display_title || project,
+                  e,
+                )}
+              >
+                <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+                  <path
+                    fill="currentColor"
+                    d="M5.5 2a.5.5 0 0 1 .5-.5h4a.5.5 0 0 1 .5.5V3h3a.5.5 0 0 1 0 1h-.55l-.7 9.1A1.5 1.5 0 0 1 10.76 14H5.24a1.5 1.5 0 0 1-1.49-1.4L3.05 4H2.5a.5.5 0 0 1 0-1h3V2zm1 .5V3h3v-.5h-3zM4.06 4l.68 8.9a.5.5 0 0 0 .5.45h5.52a.5.5 0 0 0 .5-.45L11.94 4H4.06z"
+                  />
+                </svg>
+              </button>
+            ) : null}
+          </div>
         </div>
         {project && preview ? (
-          <nav className="stage-strip" aria-label="创作阶段">
-            {STAGE_ORDER.map((s, idx) => {
-              const active = studioStage.stageIndex === idx
-              const done = studioStage.stageIndex > idx
-              return (
-                <span
-                  key={s.id}
-                  className={[
-                    'stage-chip',
-                    active ? 'is-active' : '',
-                    done ? 'is-done' : '',
-                  ].filter(Boolean).join(' ')}
-                  title={active ? studioStage.detail : s.label}
-                >
-                  {s.label}
-                </span>
-              )
-            })}
+          <nav className="stage-strip" aria-label="下一步推荐">
             {studioStage.detail ? (
-              <span className="stage-detail">{studioStage.detail}</span>
+              <span className="stage-detail" title={studioStage.detail}>
+                {studioStage.detail}
+              </span>
+            ) : null}
+            {showNextCta ? (
+              <button
+                type="button"
+                className="btn-primary btn-inline stage-next-btn"
+                onClick={runStudioCta}
+                disabled={chatBusy}
+                aria-busy={chatBusy}
+                title={
+                  chatBusy
+                    ? '助手进行中，完成后可再点'
+                    : (studioStage.cta.hint || studioStage.cta.label)
+                }
+              >
+                {chatBusy ? '进行中…' : studioStage.cta.label}
+              </button>
             ) : null}
           </nav>
-        ) : null}
+        ) : (
+          <nav className="stage-strip" aria-label="下一步推荐">
+            <span className="stage-detail">选择或新建一本小说开始</span>
+          </nav>
+        )}
       </header>
 
+      <NewNovelModal
+        open={showNewNovelForm}
+        title={newNovelTitle}
+        genre={newNovelGenre}
+        brief={newNovelBrief}
+        mode={newNovelMode}
+        busy={newNovelBusy}
+        onTitleChange={setNewNovelTitle}
+        onGenreChange={setNewNovelGenre}
+        onBriefChange={setNewNovelBrief}
+        onModeChange={setNewNovelMode}
+        onCancel={() => {
+          if (!newNovelBusy) setShowNewNovelForm(false)
+        }}
+        onSubmit={submitNewNovel}
+      />
+
       <div className="studio-grid">
-        <section className="panel side-panel">
-          <div className="panel-tabs side-mode-tabs" role="tablist" aria-label="侧栏模式">
-            <button
-              type="button"
-              role="tab"
-              aria-selected={appMode === 'library'}
-              className={appMode === 'library' ? 'active' : ''}
-              onClick={() => setAppMode('library')}
-            >
-              书库
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={appMode === 'prefs'}
-              className={appMode === 'prefs' ? 'active' : ''}
-              onClick={() => setAppMode('prefs')}
-            >
-              偏好
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={engineOpen}
-              className={engineOpen ? 'active' : ''}
-              onClick={() => setEngineOpen(true)}
-            >
-              引擎
-            </button>
-          </div>
-          {appMode === 'prefs' ? (
-            <WritingPrefs
-              project={project}
-              longformHealth={longformHealth}
-              publishedCount={publishedCount}
-              nextChapter={nextChapter}
-              onOpenEngine={() => setEngineOpen(true)}
-              onAuditChapter={(ch) => {
-                setSelectedChapter(ch)
-                setReaderTab('draft')
-                sendChatMessage(`审校第${ch}章`, { busy: 'ignore' })
-              }}
+        <div className="work-area">
+          {openSubAgent ? (
+            <SubAgentPage
+              agent={openSubAgent}
+              agents={subAgents}
+              onClose={handleCloseSubAgent}
+              onSelectAgent={handleOpenSubAgent}
+              onAgentUpdate={handleSubAgentUpdate}
             />
           ) : null}
-          {appMode === 'library' ? (
-            <>
-              <div className="side-library-head">
-                <h2 className="side-title">我的</h2>
-                <button
-                  type="button"
-                  className="btn-primary btn-inline btn-new-novel"
-                  onClick={() => setShowNewNovelForm((v) => !v)}
-                  disabled={newNovelBusy}
-                >
-                  {showNewNovelForm ? '收起' : '新建小说'}
-                </button>
-              </div>
-              <p className="side-hint">每本小说独立创作助手会话，可切换并行创作</p>
-              {showNewNovelForm ? (
-                <form
-                  className="new-novel-form"
-                  onSubmit={(e) => {
-                    e.preventDefault()
-                    submitNewNovel()
-                  }}
-                >
-                  <label className="new-novel-field">
-                    <span>书名</span>
-                    <input
-                      type="text"
-                      value={newNovelTitle}
-                      onChange={(e) => setNewNovelTitle(e.target.value)}
-                      placeholder="必填"
-                      autoFocus
-                      disabled={newNovelBusy}
-                    />
-                  </label>
-                  <label className="new-novel-field">
-                    <span>题材</span>
-                    <input
-                      type="text"
-                      value={newNovelGenre}
-                      onChange={(e) => setNewNovelGenre(e.target.value)}
-                      placeholder="可选，如未定"
-                      disabled={newNovelBusy}
-                    />
-                  </label>
-                  <label className="new-novel-field">
-                    <span>创作模式</span>
-                    <select
-                      value={newNovelMode}
-                      onChange={(e) => setNewNovelMode(e.target.value)}
-                      disabled={newNovelBusy}
-                    >
-                      <option value="longform">超长篇小说</option>
-                      <option value="short_drama">AI 漫剧短篇（剧本）</option>
-                    </select>
-                  </label>
-                  <label className="new-novel-field">
-                    <span>灵感</span>
-                    <textarea
-                      value={newNovelBrief}
-                      onChange={(e) => setNewNovelBrief(e.target.value)}
-                      placeholder="一两句卖点或设定方向（可选）"
-                      rows={3}
-                      disabled={newNovelBusy}
-                    />
-                  </label>
-                  <button
-                    type="submit"
-                    className="btn-primary btn-inline"
-                    disabled={newNovelBusy || !newNovelTitle.trim()}
-                  >
-                    {newNovelBusy ? '创建中…' : '开始立项'}
-                  </button>
-                </form>
-              ) : null}
-              <ul className="novel-list">
-                {library.length === 0 ? (
-                  <li className="empty-list">暂无小说，点「新建小说」或对创作助手说「我想写一本小说」</li>
-                ) : (
-                  library.map((n) => (
-                    <li key={n.id} className={project === n.id ? 'selected' : ''} onClick={() => loadNovel(n.id)}>
-                      <div className="novel-row">
-                        <div className="novel-info">
-                          <div className="novel-title">{n.display_title || n.id}</div>
-                          <div className="novel-meta">
-                            {n.current_volume
-                              ? `已写 ${n.published_count || 0} 章 · ${n.current_volume}`
-                              : `已写 ${n.published_count || 0} 章`}
-                            {n.genre ? ` · ${n.genre}` : ''}
-                          </div>
-                        </div>
-                        <button
-                          type="button"
-                          className="novel-delete"
-                          title="删除小说"
-                          aria-label={`删除 ${n.display_title || n.id}`}
-                          onClick={(e) => deleteNovel(n.id, n.display_title, e)}
-                        >
-                          删除
-                        </button>
-                      </div>
-                    </li>
-                  ))
-                )}
-              </ul>
-              {project && longformHealth && (
-                <div className="side-health" aria-label="超长篇健康">
-                  <h2 className="side-title">长篇健康</h2>
-                  <p className="side-hint">伏笔与卷况，不占写作台</p>
-                  <div className="longform-health longform-health--side">
-                    <div
-                      className={`longform-health-card longform-health-card--foreshadow level-${foreshadowLevel}${
-                        foreshadowDebtExpanded ? ' is-expanded' : ''
-                      }`}
-                    >
-                      <div className="longform-health-title">
-                        <span>伏笔债务</span>
-                        <span className={`longform-health-badge level-${foreshadowLevel}`}>
-                          {healthLevelLabel[foreshadowLevel]}
-                        </span>
-                      </div>
-                      <div className="longform-health-body">
-                        总量 {foreshadowDebt?.dangling_total ?? 0}
-                        {foreshadowDebt?.dangling_pressure != null
-                          ? ` · 近债 ${foreshadowDebt.dangling_pressure}`
-                          : ''}
-                        {foreshadowDebt?.open_cold ? ` · 冷档 ${foreshadowDebt.open_cold}` : ''}
-                      </div>
-                      <div className="longform-health-sub">
-                        宽限 {foreshadowDebt?.dangling_fresh ?? 0}
-                        {' · '}中期 {foreshadowDebt?.dangling_mid ?? 0}
-                        {' · '}远期 {foreshadowDebt?.dangling_far ?? 0}
-                        <span className="longform-health-debt-hint">
-                          （批写只拦近债/中期压力）
-                        </span>
-                      </div>
-                      {Array.isArray(foreshadowDebt?.oldest) && foreshadowDebt.oldest.length > 0 && (
-                        <>
-                          <ul
-                            className={`longform-health-list${
-                              foreshadowDebtExpanded ? ' is-expanded' : ''
-                            }`}
-                          >
-                            {(foreshadowDebtExpanded
-                              ? foreshadowDebt.oldest
-                              : foreshadowDebt.oldest.slice(0, 5)
-                            ).map((t) => {
-                              const cls = foreshadowDebtClassLabel(t.debt_class)
-                              return (
-                                <li key={t.id || `${t.planted_chapter}-${t.text}`}>
-                                  {cls ? (
-                                    <span
-                                      className={`longform-debt-tag debt-${t.debt_class || 'fresh'}`}
-                                    >
-                                      {cls}
-                                    </span>
-                                  ) : null}
-                                  第{t.planted_chapter || '?'}章 · {t.text}
-                                </li>
-                              )
-                            })}
-                          </ul>
-                          {foreshadowDebt.oldest.length > 5 && (
-                            <button
-                              type="button"
-                              className="longform-health-more"
-                              onClick={() => setForeshadowDebtExpanded((v) => !v)}
-                            >
-                              {foreshadowDebtExpanded
-                                ? '收起'
-                                : `展开全部 ${foreshadowDebt.dangling_total ?? foreshadowDebt.oldest.length}`}
-                            </button>
-                          )}
-                        </>
-                      )}
-                    </div>
-                    <div className={`longform-health-card level-${volumeLevel}`}>
-                      <div className="longform-health-title">
-                        <span>卷健康</span>
-                        <span className={`longform-health-badge level-${volumeLevel}`}>
-                          {healthLevelLabel[volumeLevel]}
-                        </span>
-                      </div>
-                      <div className="longform-health-body">
-                        {volumeHealth?.active_index
-                          ? `第${volumeHealth.active_index}卷 · ${volumeHealth.chapters_in_volume || 0}章`
-                          : '尚无进行中卷'}
-                        {volumeHealth?.has_audit_report ? ' · 已复盘' : ''}
-                        {volumeHealth?.thick_volume_warning ? ' · 厚卷' : ''}
-                      </div>
-                      <div className="longform-health-sub">
-                        rollup {volumeHealth?.rollup_total ?? 0}
-                        {volumeHealth?.mid_audit_threshold
-                          ? ` · 中卷审≥${volumeHealth.mid_audit_threshold}章`
-                          : ''}
-                      </div>
-                    </div>
-                    {lengthHealth ? (
-                      <div className={`longform-health-card level-${lengthLevel}`}>
-                        <div className="longform-health-title">
-                          <span>篇幅</span>
-                          <span className={`longform-health-badge level-${lengthLevel}`}>
-                            {healthLevelLabel[lengthLevel]}
-                          </span>
-                        </div>
-                        <div className="longform-health-body">
-                          {lengthChip || '—'}
-                          {lengthHealth.word_hard_min
-                            ? ` · 硬门 ${lengthHealth.word_hard_min}`
-                            : ''}
-                        </div>
-                        <div className="longform-health-sub">
-                          目标 {lengthHealth.word_min}–{lengthHealth.word_max}
-                          {lengthHealth.target_chapters
-                            ? ` · 规划 ${lengthHealth.target_chapters} 章`
-                            : ''}
-                        </div>
-                      </div>
-                    ) : null}
-                    {longformTier ? (
-                      <div className={`longform-health-card level-${longformLevel}`}>
-                        <div className="longform-health-title">
-                          <span>长篇档</span>
-                          <span className={`longform-health-badge level-${longformLevel}`}>
-                            {healthLevelLabel[longformLevel]}
-                          </span>
-                        </div>
-                        <div className="longform-health-body">
-                          {longformTier.quality_tier || '—'}
-                          {longformTier.audit_tier ? ` · 审 ${longformTier.audit_tier}` : ''}
-                        </div>
-                        <div className="longform-health-sub">
-                          impact {longformTier.impact_scan_mode || '—'}
-                          {longformTier.drift_samples != null
-                            ? ` · 漂移抽样 ${longformTier.drift_samples}`
-                            : ''}
-                        </div>
-                      </div>
-                    ) : null}
-                    {costTop ? (
-                      <div className="longform-health-card level-ok">
-                        <div className="longform-health-title">
-                          <span>成本（近录）</span>
-                          <span className="longform-health-badge level-ok">参考</span>
-                        </div>
-                        <div className="longform-health-body longform-health-cost">{costTop}</div>
-                      </div>
-                    ) : null}
-                  </div>
-                </div>
-              )}
-            </>
-          ) : null}
-        </section>
-
-        <div className="work-area">
-          <section className="panel reader-panel">
+          <section className={`panel reader-panel${openSubAgent ? ' is-parked' : ''}`}>
           <div className="reader-head">
             <h2>写作台</h2>
-            {chapterList.length > 0 && (
-              <div className="chapter-strip" role="tablist" aria-label="章节">
-                {chapterList.map((ch) => (
-                  <button
-                    key={ch.number}
-                    type="button"
-                    role="tab"
-                    aria-selected={selectedChapter === ch.number}
-                    className={[
-                      'ch-pill',
-                      selectedChapter === ch.number ? 'active' : '',
-                      ch.status === 'published' ? 'published' : '',
-                      ch.status === 'draft' ? 'draft' : '',
-                      ch.status === 'outline' ? 'outline' : '',
-                      ch.status === 'next' || ch.number === nextChapter ? 'next' : '',
-                    ].join(' ')}
-                    onClick={() => {
-                      if (readerEditing) {
-                        if (!window.confirm('正在编辑，切换章节将丢弃未保存修改，继续？')) return
-                        cancelReaderEdit()
-                      }
-                      setSelectedChapter(ch.number)
-                      setReaderTab(ch.hasDraft || ch.status === 'published' ? 'draft' : 'master')
-                    }}
-                    title={`${ch.title || `第${ch.number}章`} · ${ch.statusLabel}${
-                      ch.bodyChars ? ` · ${ch.bodyChars}字` : ''
-                    }`}
-                  >
-                    {ch.number}
-                  </button>
-                ))}
-              </div>
-            )}
+            {chapterList.length > 0 ? (
+              <ChapterStrip
+                chapterList={chapterList}
+                selectedChapter={selectedChapter}
+                nextChapter={nextChapter}
+                projectMode={projectMode}
+                unitLabel={unitLabel}
+                onSelect={(ch) => {
+                  if (readerEditing) {
+                    if (!window.confirm('正在编辑，切换章节将丢弃未保存修改，继续？')) return
+                    cancelReaderEdit()
+                  }
+                  setSelectedChapter(ch.number)
+                  setReaderTab(ch.hasDraft || ch.status === 'published' ? 'draft' : 'master')
+                }}
+              />
+            ) : null}
           </div>
 
           {!hasReaderMaterial ? (
-            <div className="empty small">在 NovelX 创建项目后，大纲、设定卡与正文/剧本将显示在此</div>
+            <div className="empty small">建好作品后，大纲、设定和章节会出现在这里</div>
           ) : (
             <>
               <div className="reader-meta">
                 <div className="reader-meta-row">
                   {chapterList.length > 0 && selectedChapter > 0 ? (
                     <span className="reader-ch-title">
-                      第{selectedChapter}章
-                      {chapterData?.title ? ` · ${chapterData.title}` : ''}
+                      <span className="reader-unit-name">{readerUnitTitle}</span>
+                      {activePlotSummary ? (
+                        <button
+                          type="button"
+                          className={`reader-plot-inline${isShortDrama ? ' is-static' : ''}`}
+                          title={activePlotSummary.body}
+                          onClick={() => {
+                            if (isShortDrama) return
+                            setReaderTab('arcs')
+                            const key = plotCardKey(pickActivePlot(plots))
+                            if (key) setReaderCardKey(key)
+                          }}
+                        >
+                          <span className="reader-plot-key">当前剧情</span>
+                          <span className="reader-plot-sep">：</span>
+                          <span className="reader-plot-value">{activePlotSummary.title}</span>
+                          <span className="desk-plot-status">{activePlotSummary.statusLabel}</span>
+                        </button>
+                      ) : null}
                       {selectedChapterStatus ? (
                         <span
-                          className={`ch-status-badge ch-status-${selectedChapterStatus.status}`}
+                          className={[
+                            'ch-status-badge',
+                            `ch-status-${selectedChapterStatus.status}`,
+                            readerTab === 'draft' ? `word-tone-${wordTone}` : '',
+                          ].filter(Boolean).join(' ')}
+                          title={
+                            readerTab === 'draft'
+                              ? `目标 ${wordBand.min}–${wordBand.max} 字 · 发布至少 ${wordBand.hardMin} 字`
+                              : undefined
+                          }
                         >
                           {selectedChapterStatus.statusLabel}
-                          {selectedChapterStatus.bodyChars
-                            ? ` · ${selectedChapterStatus.bodyChars}字`
-                            : ''}
+                          {unitWordChars > 0 ? ` · ${unitWordChars}字` : ''}
+                          {readerTab === 'draft' ? (
+                            <>
+                              <span className="ch-word-sep"> · </span>
+                              <span className="ch-word-target">
+                                {wordBand.min}–{wordBand.max}
+                              </span>
+                              {wordTone !== 'ok' && wordTone !== 'empty' ? (
+                                <span className="ch-word-hint"> · {wordLabel}</span>
+                              ) : null}
+                            </>
+                          ) : null}
                         </span>
                       ) : null}
                     </span>
@@ -1704,10 +1609,10 @@ export default function App() {
                       <button
                         type="button"
                         className="btn-ghost btn-inline chapter-delete-btn"
-                        onClick={() => deleteChapter(selectedChapter)}
-                        title="删除当前章节"
+                        onClick={() => requestDeleteChapter(selectedChapter)}
+                        title={`删除当前${unitLabel}`}
                       >
-                        删除本章
+                        {`删除本${unitLabel}`}
                       </button>
                     )}
                     {readerEditing && (
@@ -1738,6 +1643,7 @@ export default function App() {
                       key={t.id}
                       type="button"
                       className={readerTab === t.id ? 'active' : ''}
+                      title={t.title || t.label}
                       onClick={() => switchReaderTab(t.id)}
                     >
                       {t.label}
@@ -1747,29 +1653,6 @@ export default function App() {
               </div>
               {readerEditError ? (
                 <div className="reader-edit-error">{readerEditError}</div>
-              ) : null}
-              {showNextCta ? (
-                <div className="next-cta-bar" role="region" aria-label="下一步">
-                  <div className="next-cta-copy">
-                    <strong>下一步 · {studioStage.cta.label}</strong>
-                    <span>
-                      {chatBusy
-                        ? '助手进行中，完成后可再点'
-                        : (studioStage.cta.hint || studioStage.detail)}
-                    </span>
-                  </div>
-                  <div className="next-cta-actions">
-                    <button
-                      type="button"
-                      className="btn-primary btn-inline"
-                      onClick={runStudioCta}
-                      disabled={chatBusy}
-                      aria-busy={chatBusy}
-                    >
-                      {chatBusy ? '进行中…' : studioStage.cta.label}
-                    </button>
-                  </div>
-                </div>
               ) : null}
               {showSetupConfirmBar && (
                 <div className="setup-confirm-bar" role="region" aria-label="定稿确认">
@@ -1890,63 +1773,6 @@ export default function App() {
                   })}
                 </div>
               )}
-              {readerTab === 'draft' && selectedChapter > 0 ? (
-                <div className="desk-word-bar" aria-label="字数进度">
-                  <div className="desk-word-meta">
-                    <span>
-                      {draftBodyChars}
-                      <span className="desk-word-sep">/</span>
-                      {CHAPTER_WORD_MIN}–{CHAPTER_WORD_MAX} 字
-                    </span>
-                    <span className={`desk-word-tone tone-${wordTone}`}>
-                      {wordProgressLabel(draftBodyChars)}
-                    </span>
-                    <span className="desk-word-hard">硬门 ≥{CHAPTER_WORD_HARD_MIN}</span>
-                  </div>
-                  <div className="desk-word-track" aria-hidden="true">
-                    <div
-                      className={`desk-word-fill tone-${wordTone}`}
-                      style={{ width: `${wordPct}%` }}
-                    />
-                    <span
-                      className="desk-word-mark hard"
-                      style={{ left: `${Math.min(100, (CHAPTER_WORD_HARD_MIN / CHAPTER_WORD_MIN) * 100)}%` }}
-                    />
-                  </div>
-                </div>
-              ) : null}
-              {readerTab === 'draft' && activePlotSummary ? (
-                <div className={`desk-plot-rail${plotRailOpen ? '' : ' is-collapsed'}`}>
-                  <button
-                    type="button"
-                    className="desk-plot-rail-head"
-                    onClick={() => setPlotRailOpen((v) => !v)}
-                    aria-expanded={plotRailOpen}
-                  >
-                    <span className="desk-plot-rail-title">
-                      当前剧情 · {activePlotSummary.title}
-                      <span className="desk-plot-status">{activePlotSummary.statusLabel}</span>
-                    </span>
-                    <span className="desk-plot-rail-chevron">{plotRailOpen ? '▾' : '▸'}</span>
-                  </button>
-                  {plotRailOpen ? (
-                    <div className="desk-plot-rail-body">
-                      <p>{activePlotSummary.body}</p>
-                      <button
-                        type="button"
-                        className="btn-ghost btn-inline"
-                        onClick={() => {
-                          setReaderTab('arcs')
-                          const key = plotCardKey(pickActivePlot(plots))
-                          if (key) setReaderCardKey(key)
-                        }}
-                      >
-                        打开完整剧情卡
-                      </button>
-                    </div>
-                  ) : null}
-                </div>
-              ) : null}
               {!deskPatchHidden && activeDeskPatch && readerTab === 'draft' ? (
                 <div className="desk-patch-dock" role="region" aria-label="修订对照">
                   <div className="desk-patch-dock-head">
@@ -2069,56 +1895,143 @@ export default function App() {
                   />
                 )}
               </div>
-              {(readerTab === 'draft' || readerTab === 'outline')
-                && selectedChapter > 0
-                && selectedChapterStatus ? (
-                <div className="reader-publish-foot" aria-label="章节发布状态">
-                  <span>
-                    第{selectedChapter}章 · {selectedChapterStatus.statusLabel}
-                    {selectedChapterStatus.bodyChars
-                      ? ` · ${selectedChapterStatus.bodyChars}字`
-                      : ''}
-                  </span>
-                  <span className="reader-publish-foot-meta">
-                    {selectedChapterStatus.status === 'published'
-                      ? '已计入已写章节'
-                      : selectedChapterStatus.status === 'draft'
-                        ? '草稿未计入已发布'
-                        : `下一章目标：第${nextChapter}章`}
-                  </span>
-                </div>
-              ) : null}
             </>
           )}
         </section>
 
-        <NovelXChat
-          project={project}
-          sendRef={chatSendRef}
-          onSetupGateChange={setChatSetupGateOpen}
-          onBusyChange={handleChatBusyChange}
-          onPreviewRefresh={handleChatPreviewRefresh}
-          onProjectBound={handleProjectBound}
-          onDraftPatchesChange={handleDraftPatchesChange}
-          onAuditStateChange={handleAuditStateChange}
-          compactDraftPatches={deskPatchDockVisible}
-        />
+        <div className={`agent-chat-host${openSubAgent ? ' is-parked' : ''}`}>
+          <NovelXChat
+            project={project}
+            displayTitle={novelRecord?.display_title || project}
+            sendRef={chatSendRef}
+            onSetupGateChange={setChatSetupGateOpen}
+            onBusyChange={handleChatBusyChange}
+            onPreviewRefresh={handleChatPreviewRefresh}
+            onProjectBound={handleProjectBound}
+            onDraftPatchesChange={handleDraftPatchesChange}
+            onAuditStateChange={handleAuditStateChange}
+            onSubAgentsChange={handleSubAgentsChange}
+            onOpenSubAgent={handleOpenSubAgent}
+            openSubAgentId={openSubAgent?.threadId || ''}
+            compactDraftPatches={deskPatchDockVisible}
+            statusOpen={statusOpen}
+            onOpenStatus={() => {
+              setEngineOpen(false)
+              setStatusOpen(true)
+            }}
+            engineOpen={engineOpen}
+            onOpenEngine={() => {
+              setStatusOpen(false)
+              setEngineOpen(true)
+            }}
+          />
+        </div>
         </div>
       </div>
 
-      {engineOpen ? (
-        <div className="engine-drawer-root" role="dialog" aria-label="引擎室">
+      <CreationStatusBar
+        visible={Boolean(project && (isShortDrama || longformHealth))}
+        isShortDrama={isShortDrama}
+        overallLevel={overallHealthLevel}
+        foreshadowDebt={foreshadowDebt}
+        foreshadowLevel={foreshadowLevel}
+        volumeHealth={volumeHealth}
+        volumeLevel={volumeLevel}
+        lengthLevel={lengthLevel}
+        lengthChip={lengthChip}
+        progressLabel={
+          novelRecord
+            ? `已写 ${novelRecord.published_count || 0} ${isShortDrama ? '集' : '章'}`
+            : ''
+        }
+        nextEpisodeLabel={isShortDrama ? `第 ${nextChapter || 1} 集` : ''}
+        onOpenDetail={() => {
+          setEngineOpen(false)
+          setStatusOpen(true)
+        }}
+      />
+
+      {statusOpen ? (
+        <div className="engine-drawer-root" role="dialog" aria-label="创作状态">
           <button
             type="button"
             className="engine-drawer-backdrop"
-            aria-label="关闭引擎室"
-            onClick={() => setEngineOpen(false)}
+            aria-label="关闭创作状态"
+            onClick={() => setStatusOpen(false)}
           />
           <div className="engine-drawer">
-            <ConfigPanel onClose={() => setEngineOpen(false)} title="引擎室" />
+            <div className="drawer-chrome">
+              <h2 className="drawer-chrome-title">创作状态</h2>
+              <button
+                type="button"
+                className="btn-ghost btn-inline"
+                onClick={() => setStatusOpen(false)}
+              >
+                关闭
+              </button>
+            </div>
+            <CreationStatusPage
+              showHeading={false}
+              project={project}
+              isShortDrama={isShortDrama}
+              foreshadowDebt={foreshadowDebt}
+              foreshadowLevel={foreshadowLevel}
+              foreshadowPhase={foreshadowPhase}
+              foreshadowDebtExpanded={foreshadowDebtExpanded}
+              onToggleForeshadowExpanded={() => setForeshadowDebtExpanded((v) => !v)}
+              volumeHealth={volumeHealth}
+              volumeLevel={volumeLevel}
+              volumeQaPhase={volumeQaPhase}
+              lengthHealth={lengthHealth}
+              lengthLevel={lengthLevel}
+              lengthChip={lengthChip}
+              longformTier={longformTier}
+              longformLevel={longformLevel}
+              costTop={costTop}
+              publishedCount={publishedCount}
+              nextChapter={nextChapter}
+              onOpenEngine={() => {
+                setStatusOpen(false)
+                setEngineOpen(true)
+              }}
+              onAuditChapter={(ch) => {
+                setStatusOpen(false)
+                setSelectedChapter(ch)
+                setReaderTab('draft')
+                const unit = isShortDrama ? '集' : '章'
+                sendChatMessage(`审校第${ch}${unit}`, { busy: 'ignore' })
+              }}
+            />
           </div>
         </div>
       ) : null}
+
+      {engineOpen ? (
+        <div className="engine-drawer-root" role="dialog" aria-label="设置">
+          <button
+            type="button"
+            className="engine-drawer-backdrop"
+            aria-label="关闭设置"
+            onClick={() => setEngineOpen(false)}
+          />
+          <div className="engine-drawer">
+            <ConfigPanel onClose={() => setEngineOpen(false)} title="设置" />
+          </div>
+        </div>
+      ) : null}
+
+      <DangerConfirmModal
+        open={Boolean(dangerConfirm)}
+        title={dangerConfirm?.dialogTitle || '确认删除'}
+        message={dangerConfirm?.message || ''}
+        confirmText={dangerConfirm?.confirmText || ''}
+        confirmLabel="确认删除"
+        busy={dangerBusy}
+        onCancel={() => {
+          if (!dangerBusy) setDangerConfirm(null)
+        }}
+        onConfirm={runDangerConfirm}
+      />
     </div>
   )
 }

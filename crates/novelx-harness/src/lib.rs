@@ -10,6 +10,9 @@ pub mod naming_rules;
 pub mod pipeline_config;
 pub mod policies;
 pub mod review_priority;
+pub mod revise_plan;
+pub mod script_shape;
+pub mod unattended;
 
 pub use activation::{
     collect_signals, evaluate_activation, resolve_pipeline_agents, resolve_pipeline_agents_filtered,
@@ -18,6 +21,7 @@ pub use activation::{
 pub use chapter_budget::{
     consecutive_soft_short_from_meta, set_consecutive_soft_short, ChapterBudget, LengthAssessment,
 };
+pub use script_shape::ScriptShapeConfig;
 pub use longform::{
     AuditTier, ForeshadowDebtConfig, ImpactScanMode, LongformConfig, QualityTier,
 };
@@ -33,10 +37,15 @@ pub use gates::{
 pub use naming_rules::NamingRules;
 pub use pipeline_config::{HandlerKind, HandlerSpec, PipelineConfig};
 pub use policies::StudioPolicies;
+pub use unattended::{BatchSoftSkips, SoftSkipPolicy, UnattendedPolicy};
 pub use review_priority::{
     filter_issues_by_ids, has_timeline_p0, issue_fingerprint, issue_priority, issue_type,
     merge_verify_audit, normalize_consistency_issues, normalize_priority, partition_issues,
     with_issue_ids, AUTO_FIX_PRIORITIES,
+};
+pub use revise_plan::{
+    apply_plan_to_steer_args, build_revise_plan, hard_gate_ids_from_violations,
+    load_revise_streak, persist_revise_context, RevisePlan, RevisePlanConfig, ReviseScope,
 };
 
 /// Full-rewrite detection from `config/policies.yaml` (embedded defaults).

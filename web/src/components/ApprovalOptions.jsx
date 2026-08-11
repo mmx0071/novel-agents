@@ -1,5 +1,10 @@
 import MarkdownView from './MarkdownView'
 
+/**
+ * variant:
+ *   - default: standalone decision card (non-todo turns)
+ *   - embedded: nested under current todo inside「处理中/待选择」work card
+ */
 export default function ApprovalOptions({
   prompt,
   options,
@@ -10,10 +15,12 @@ export default function ApprovalOptions({
   onOtherSubmit,
   showOther,
   setShowOther,
+  variant = 'default',
 }) {
   const opts = options || []
+  const embedded = variant === 'embedded'
   return (
-    <div className="nx-card nx-approval">
+    <div className={embedded ? 'nx-approval nx-approval-embed' : 'nx-card nx-approval'}>
       {prompt ? (
         <MarkdownView
           className="nx-approval-prompt"
@@ -22,7 +29,9 @@ export default function ApprovalOptions({
         />
       ) : null}
       <div className="chat-option-list" role="group" aria-label="请选择下一步">
-        <div className="chat-option-hint">请选择下一步（也可输入序号）</div>
+        {!embedded ? (
+          <div className="chat-option-hint">请选择下一步（也可输入序号）</div>
+        ) : null}
         {opts.map((opt, i) => (
           <button
             key={opt.id || i}

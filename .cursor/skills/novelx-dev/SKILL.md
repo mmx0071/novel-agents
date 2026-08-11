@@ -85,7 +85,7 @@ description: >-
 
 ## 超长篇约束（800–1000 章 × 5–6k）
 
-- 批写：`continue_writing_batch` / `--batch`；上限 `longform.batch_max_chapters`；遇硬门即停。
+- 批写：`continue_writing_batch` / `--batch`；上限 `longform.batch_max_chapters`；遇硬门即停；软门默认见 `unattended.yaml`。
 - `audit_tier: layered`：常规章轻量一致性上下文；高潮/奇数章/复审 full。
 - `quality_tier` + `pipeline.longform_lean`：专改/伏笔过滤。
 - 字数：目标 5000–6000；硬门默认 ≥4500；连续 SoftShort 可升格阻断。

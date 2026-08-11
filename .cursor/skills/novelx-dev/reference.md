@@ -16,6 +16,9 @@
 | `gates.yaml` 选项 id 与 audit 裸 `"1"/"2"/"3"` 冲突 | 用稳定前缀 id（见 `gates.yaml` 注释） |
 | 把 `audit_infra` 当正文问题局部修订 | 走 `audit_infra` 重试门控 |
 | 审校已通过仍弹审校卡或称「未通过」 | P1/P2 是可改进项；用户要改直接 `revise_chapter` |
+| 多章 `audit_chapters` 因软 `needs_user_choice`（形状等）停在一章，却说「复审通过/继续创作」 | 队列仅在一致性失败或硬规则/字数硬门停；通过后自动推进；队列未结束勿开 chapter_next「继续创作」 |
+| 评审团 AutoRevise 后只调 `audit_chapter`，队列停在第 1 章 | 有活跃队列时必须 `audit_chapters continue`；通过则继续后续章，勿 `drain_council_auto_continue` 写下一章 |
+| 多步任务只口头报进度、不推 To-dos | 递进任务用 `progressive_todo_list` + `emit_todos` / `PipelineEvent::TodoList`（审阅队列、批写等）；完成一项勾一项 |
 
 ### Studio 编排
 
@@ -26,7 +29,8 @@
 | 一张剧情卡塞整卷 | `design_plot` 只切卷内一段；卷纲终止条件 ≥2 |
 | `plot_acceptor` 改写收束条件来 pass | 对照卡面原文；`pass=true` 且发布成功才 `completed` |
 | 单步 spawn 子 Agent 后推进 `next_chapter` | 发布收尾只在完整章流水线末尾一次 |
-| 润色 Agent 每章必跑 | `literary_editor` 靠 activation 建议或 Studio `activate_agents` |
+| 用 `spawn_agent(mode=continue\|revise\|audit_only)` 写章/审校 | 整章走 `continue_writing` / `revise_chapter` / `audit_*`（进程内流水线）；spawn 仅单步专精/只读旁路 |
+| 润色 Agent 每章必跑 | `literary_editor` 靠 activation 建议或 Studio `activate_agents`；即时润色优先 `revise_chapter` |
 
 ### 格式与 Web
 
@@ -65,6 +69,8 @@
 | mutation 预览/确认 | `novelx-tools` mutation + features |
 | studio_next 情境卡 | `novelx-core::studio_next` + `studio_next_gates` |
 | 批写循环 | `novelx-pipeline::batch` |
+| 无人值守软相位 | `config/unattended.yaml` + `studio.unattended_soft_skip`；`novelx-harness::UnattendedPolicy` |
+| 卷 QA / 伏笔相位 | `volume_qa_phase` / `foreshadow_phase`（`novelx-pipeline::volume_qa` / `foreshadow_phase`） |
 | body_state 板 | `novelx-pipeline::body_state` |
 | 阅读 API / display | `novelx-app-server` + `schemas::display_*` |
 | Web 章缓存/懒加载 | `web/src/App.jsx` |

@@ -1,6 +1,5 @@
 //! Soft/hard gates requiring volume_audit before mid-volume continue or sync.
 
-use crate::volume::{active_volume_for_chapter, volume_chapter_span};
 use crate::volume_audit::volume_has_audit_report;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -102,68 +101,32 @@ fn feature_enabled(config_root: &Path, key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-fn mid_audit_chapter_threshold(config_root: &Path) -> u32 {
-    let n = load_volume_config(config_root).mid_audit_chapter_threshold;
-    if n == 0 {
-        DEFAULT_MID_AUDIT_CHAPTER_THRESHOLD
-    } else {
-        n
-    }
-}
-
-fn chapters_in_volume(project_dir: &Path, chapter: u32) -> Option<(u32, u32)> {
-    let vol = active_volume_for_chapter(project_dir, chapter)?;
-    let (from, to) = volume_chapter_span(&vol, chapter);
-    // Count chapters that actually have content (draft/summary), not bare span width.
-    let mut count = 0u32;
-    if from <= to {
-        for ch in from..=to {
-            let dir = project_dir.join("chapters").join(format!("{ch:03}"));
-            let has = dir.join("summary.json").exists()
-                || dir.join("draft.md").exists()
-                || dir.join("draft.md.gz").exists();
-            if has {
-                count += 1;
-            }
-        }
-    }
-    Some((vol.volume_index, count))
-}
-
-/// Soft-block continue_writing when mid-volume and no audit report yet.
+/// Soft-block continue_writing when volume QA phase is `mid_due` (unless skip).
+/// Ephemeral skip by default (`persist_skip=false`) so unattended does not permanently dismiss mid_due.
 pub fn check_volume_audit_for_continue(
     config_root: &Path,
     project_dir: &Path,
     chapter: u32,
     skip: bool,
 ) -> Option<VolumeAuditGateBlock> {
-    if skip {
-        return None;
-    }
-    if crate::project::is_short_drama(project_dir) {
-        return None;
-    }
-    if !feature_enabled(config_root, "studio.require_volume_audit_mid", true) {
-        return None;
-    }
-    let (volume_index, count) = chapters_in_volume(project_dir, chapter)?;
-    let threshold = mid_audit_chapter_threshold(config_root);
-    if count < threshold {
-        return None;
-    }
-    if volume_has_audit_report(project_dir, volume_index) {
-        return None;
-    }
-    Some(VolumeAuditGateBlock {
-        reason: "need_volume_audit_mid".into(),
-        kind: "mid",
-        volume_index,
-        message: format!(
-            "本卷第{volume_index}卷已写约 {count} 章（≥{threshold}），尚未做整卷摘要复盘。\n\
-             - 先审：audit_volume(volume={volume_index})\n\
-             - 跳过本次：continue_writing 传 confirm_skip_volume_audit=true"
-        ),
-    })
+    crate::volume_qa::check_volume_qa_for_continue(config_root, project_dir, chapter, skip, false)
+}
+
+/// Like [`check_volume_audit_for_continue`], with optional permanent mid-skip for the volume.
+pub fn check_volume_audit_for_continue_ex(
+    config_root: &Path,
+    project_dir: &Path,
+    chapter: u32,
+    skip: bool,
+    persist_skip: bool,
+) -> Option<VolumeAuditGateBlock> {
+    crate::volume_qa::check_volume_qa_for_continue(
+        config_root,
+        project_dir,
+        chapter,
+        skip,
+        persist_skip,
+    )
 }
 
 /// Block sync_volume when handoff gate enabled and no audit report.

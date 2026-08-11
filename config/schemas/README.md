@@ -17,14 +17,16 @@
 | 入口 | 策略 |
 |------|------|
 | Web `PUT /content` / 手工编辑 | **硬拒**：不合 schema 不写入 |
-| 流水线 `writer` | **先保留再修正**：落盘 → 归一 → 必要时修形 → 仍不合则拦发布 |
-| 发布门控 | 正文须通过 `validate_draft`（结构）+ `chapter.yaml` 字数硬门（默认 ≥4500、≤11000）+ 一致性/硬规则；超长可 `split_chapter` |
+| 流水线 `writer` / `script_writer` | **先保留再修正**：落盘 → 归一 → 必要时修形 → 仍不合则拦发布 |
+| 发布门控（长篇） | 正文须通过 `validate_draft`（结构）+ `chapter.yaml` 字数硬门（默认 ≥4500、≤11000）+ 一致性/硬规则；超长可 `split_chapter` |
+| 发布门控（短剧） | 剧本须通过 `validate_script`（标题/`## 场`/`【画面】`/`【钩子】`）+ `script.yaml` 字数与形状旋钮；散文无画面不可发布 |
 
 ## 各页签格式
 
 | 页签 | 落盘 | 格式要点 |
 |------|------|----------|
 | 正文 | `chapters/NNN/draft.md` | 首行 `# 第N章 …`；结构校验见 `validate_draft`；发布字数见 `chapter.yaml`（默认硬门 ≥4500）；禁止整篇 \`\`\`json |
+| 剧本（短剧） | `episodes/NNN/script.md` | 首行 `# 第N集 …`；≥2 个 `## 场`；每场≥1 条`【画面】`（总数门槛见 `script.yaml`）；须有`【钩子】`；标题禁 \`\`\`/`markdown`；见 `validate_script` / `content-formats-script` |
 | 章纲 | `chapters/NNN/outline.json` | JSON 必填见 content-formats；推荐 `plot_includes[]`/`plot_defers[]`/`items[]`/`locations[]`；新生成 `key_events`≤4，旧稿可读可 Web 保存；Web 由 `display_chapter_outline` 渲染；Agent 用 `revise_outline` 修订（预览确认） |
 | 总纲 | `artifacts/master_outline.md` | H2：`一句话卖点`、`三幕结构`/`分卷`、`主角弧`、`主线冲突` |
 | 剧情卡 | `plots/*.md` | FM：`title, scope=local, plot_type, status, needs_bridge`；H2：概览/剧情走向/冲突与赌注/出场人物/收束条件 |

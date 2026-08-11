@@ -13,7 +13,8 @@
 | `llm.yaml` | Web「模型」结构化表单或手工编辑 | Provider / 任务模型 / profile / 重试；PUT 后热重载 |
 | `gates.yaml` / `features.yaml` / `intents.yaml` | 磁盘编辑（本期无表单） | 门控、特性开关（含 `pipeline.auto_split_hard_long`）、意图路由 |
 | `mutation_policy.yaml` | 磁盘编辑 | 改盘严重度：routine 自确认 / high 人审；低风险 impact 自动级联；配合 `studio.mutation_severity_policy` |
-| `decision_council.yaml` | 磁盘编辑 | 评审团自动决策、章边界密封、按需素材 Agent；配合 `studio.decision_council` / `studio.seal_on_chapter_pass`；`chapter_next_clean` 干净发布自动续写 |
+| `decision_council.yaml` | 磁盘编辑 | 评审团自动决策（`max_auto_retries` / `same_type_streak_limit` 防同章空转）、`revise_plan`（Plan→Execute 选局部/整章）、章边界密封、按需素材 Agent；配合 `studio.decision_council` / `studio.revise_plan` / `studio.seal_on_chapter_pass` / `studio.auto_reaudit_after_steer`；`chapter_next_clean` 干净发布自动续写 |
+| `unattended.yaml` | 磁盘编辑 | 无人值守软相位跳过（批写 / council：`volume_qa mid_due`、预期检阅、伏笔 `pressure_high`）；总开关 `studio.unattended_soft_skip`；硬门不变 |
 | `chapter.yaml` | 磁盘编辑 | 章长目标 / 软硬上下限（`word_hard_max`→HardLong 可拆章）/ 连续偏短升格 |
 | `longform.yaml`；短剧另见 `script.yaml` / `pipeline-script.yaml`（`project_mode=short_drama`） | 磁盘编辑 | 超长篇：`quality_tier` / `audit_tier` / `impact_scan_mode` / `batch_max_chapters`（成功发布上限）/ `foreshadow_debt`（近债分级：宽限与远期不挡批写）；`audit_tier: layered` 常规章用轻量一致性上下文（高潮/奇数章/复审仍 full），省 token，偶发漏检风险略高于 `full` |
 | `continuity.yaml` / `volume.yaml` | 磁盘编辑 | CanonContext 预算、薄卷阈值 |
@@ -64,3 +65,6 @@ API Key 只写入仓库根 `.env`（gitignore），**不进** `llm.yaml`。`GET 
 - 仍人审：真 P0 审校、Setup 定稿、卷交接、设定 BLOCKER、删实体 / 总纲卷纲 / Bible upsert、高风险 impact。
 - 低风险 impact：命中数 ≤ `impact.auto_max_hits` 且无 draft 目标、源非 bible/master_outline → 自动级联。
 - `decision_council.chapter_next_clean`：干净发布后自动续写（`config/decision_council.yaml` 现为 `enabled: true`；缺省文件时 Rust defaults 仍为 false）。
+- `studio.unattended_soft_skip` + `unattended.yaml`：批写与 council 默认跳过卷 QA `mid_due`、预期检阅、伏笔 `pressure_high`；`respect_soft_gates=true` 或关总开关可保留。硬门（setup/volume 交接/章序/一致性 P0/字数 hard 等）仍停。
+- `volume_qa_phase` / `foreshadow_phase`：量化阈值收成状态机（`state.meta` + resolve）；见 `get_project_status` / preview API；Web 创作状态与桌面 CTA 会消费这两个字段。
+- `studio.revise_plan`（features）是总闸：关则不建 Plan；开时仍受 `decision_council.yaml` → `revise_plan.enabled` 约束。`studio.decision_council` 磁盘默认为 true，无配置文件时 Rust `FeatureFlags::defaults()` 仍为 false（测试/裸跑更安全）。

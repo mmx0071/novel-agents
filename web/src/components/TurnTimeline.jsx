@@ -4,16 +4,28 @@ import DraftPatchCard from './DraftPatchCard'
 import MutationPreviewCard from './MutationPreviewCard'
 import ApprovalOptions from './ApprovalOptions'
 import MarkdownView from './MarkdownView'
+import WorkedForGroup from './WorkedForGroup'
 import { stripToolMarkup } from './toolMarkup'
-import { stepLabelZh, toolVerbZh } from './toolLabels'
+import { skillLabelZh, stepLabelZh, toolVerbZh } from './toolLabels'
+import {
+  looksLikeAuditQueueLaunchProse,
+  orderTurnItemsForDisplay,
+  prepareChatAgentProse,
+} from '../chatProse'
+import { effectiveToolDisplayStatus } from '../auditQueueStatus.js'
+import { groupTurnItemsForWorked } from '../workedFor.js'
+import { pickTodoHostSegment, workItemsHostTodos } from '../flowLayout.js'
+import { resolveWorkTodos } from '../auditTodos.js'
 
 export default function TurnTimeline({
   turns,
   loading,
   project,
   liveTurnId,
+  todos = [],
   onReaderJump,
   onOpenPatchInDesk,
+  onOpenSubAgent,
   compactDraftPatches = false,
   onPickOption,
   otherText,
@@ -25,8 +37,12 @@ export default function TurnTimeline({
   if (!turns?.length) {
     return (
       <div className="empty tiny nx-empty-hint">
-        <div>向 NovelX 下指令，这里会展示写作进度、工具步骤与正文摘要。</div>
-        <div className="nx-muted">试试：审阅第1–5章 · 或输入 $ 选择能力</div>
+        <div>说说你想写什么，进度和正文摘要会出现在这里。</div>
+        <div className="nx-muted">
+          {project
+            ? '试试：写下一章 · 或点「常用动作」快速开始'
+            : '先在顶部选择或新建小说，再说「我想写一本小说」'}
+        </div>
       </div>
     )
   }
@@ -41,48 +57,132 @@ export default function TurnTimeline({
           ? turn.id === liveTurnId
           : (idx === turns.length - 1
             && (turn.status === 'running' || turn.status === 'awaiting')))
+        const turnAwaiting = turn.status === 'awaiting' || !!turn.approval
         const running = isLiveTurn
-          && (turn.status === 'running' || turn.status === 'awaiting' || loading)
+          && !turnAwaiting
+          && (turn.status === 'running' || loading)
         const hasToolOrSkill = (turn.items || []).some(
           (it) => it.type === 'tool_call' || it.type === 'skill_load' || it.type === 'pipeline_step',
         )
         const visibleItems = (turn.items || []).filter((it) => itemHasVisibleBody(it))
         const showPending = running && !visibleItems.length && !turn.approval
+        const displayItems = orderTurnItemsForDisplay(turn.items || [])
+        const turnActive = isLiveTurn && !turnAwaiting && (turn.status === 'running' || loading)
+        const segments = groupTurnItemsForWorked(displayItems)
+        const hostSegIdx = pickHostSegIdx(segments, todos, isLiveTurn || idx === turns.length - 1)
+        const hostSeg = hostSegIdx >= 0 ? segments[hostSegIdx] : null
+        const hostTodos = hostSeg
+          ? resolveWorkTodos(todos, hostSeg.items)
+          : (todos?.length ? todos : [])
+        const showHostTodos = !!(hostTodos && hostTodos.length
+          && (isLiveTurn || idx === turns.length - 1))
+        const embeddedApproval = !!(showHostTodos && turn.approval?.options?.length)
+        const turnHasTodos = showHostTodos || !!(todos?.length)
         return (
         <div key={turn.id || `turn-${idx}`} className={`nx-turn nx-turn-${turn.status || 'running'}`}>
           <TurnSep
             index={idx}
             running={running}
+            awaiting={turnAwaiting && isLiveTurn}
             aborted={turn.status === 'aborted'}
           />
           <div className="nx-turn-items">
-            {(turn.items || []).map((item, itemIdx) => (
-              <TurnItemView
-                key={item.id || item._key || `${turn.id}:${itemIdx}`}
-                item={item}
-                turnItems={turn.items}
-                itemIndex={itemIdx}
-                project={project}
-                onReaderJump={onReaderJump}
-                onOpenPatchInDesk={onOpenPatchInDesk}
-                compactDraftPatches={compactDraftPatches}
-                turnActive={isLiveTurn && (turn.status === 'running' || loading)}
-                suppressCaret={hasToolOrSkill}
-                isStreamTip={isLiveTurn && isAgentStreamTip(turn.items, itemIdx)}
-                hideAsPrefix={isAgentPrefixOfLater(turn.items, itemIdx)}
-              />
-            ))}
+            {segments.map((seg, segIdx) => {
+              if (seg.kind === 'worked') {
+                const isHost = showHostTodos && segIdx === hostSegIdx
+                const nestApproval = !!(isHost && embeddedApproval)
+                return (
+                  <WorkedForGroup
+                    key={`worked:${turn.id || idx}:${segIdx}:${seg.indices[0]}`}
+                    items={seg.items}
+                    running={seg.running && !turnAwaiting}
+                    durationMs={seg.durationMs}
+                    turnActive={turnActive && seg.running && !turnAwaiting}
+                    awaiting={turnAwaiting && isHost}
+                    todos={isHost ? hostTodos : null}
+                    approval={nestApproval ? turn.approval : null}
+                    approvalDisabled={loading && !turn.approval?.options?.length}
+                    onPickOption={onPickOption}
+                    otherText={otherText}
+                    setOtherText={setOtherText}
+                    showOther={showOther}
+                    setShowOther={setShowOther}
+                    onOtherSubmit={onOtherSubmit}
+                  >
+                    {isHost ? null : seg.items.map((item, j) => {
+                      const itemIdx = seg.indices[j]
+                      const progressHost = item?.type === 'tool_call'
+                        && (
+                          item.name === 'audit_chapters'
+                          || item.name === 'audit_chapter'
+                          || item.name === 'continue_writing_batch'
+                          || item.name === 'steer_run'
+                        )
+                      return (
+                        <TurnItemView
+                          key={item.id || item._key || `${turn.id}:w:${itemIdx}`}
+                          item={item}
+                          turnItems={displayItems}
+                          itemIndex={itemIdx}
+                          project={project}
+                          todos={todos}
+                          omitQueueProgress={progressHost}
+                          compactTool
+                          hideStructuredProgress={progressHost && turnHasTodos}
+                          onReaderJump={onReaderJump}
+                          onOpenPatchInDesk={onOpenPatchInDesk}
+                          onOpenSubAgent={onOpenSubAgent}
+                          compactDraftPatches={compactDraftPatches}
+                          turnActive={turnActive}
+                          suppressCaret={hasToolOrSkill}
+                          isStreamTip={isLiveTurn && isAgentStreamTip(displayItems, itemIdx)}
+                          hideAsPrefix={
+                            isAgentPrefixOfLater(displayItems, itemIdx)
+                            || isMirroredProgressWithTools(displayItems, itemIdx)
+                          }
+                        />
+                      )
+                    })}
+                  </WorkedForGroup>
+                )
+              }
+              const item = seg.item
+              const itemIdx = seg.index
+              return (
+                <TurnItemView
+                  key={item.id || item._key || `${turn.id}:${itemIdx}`}
+                  item={item}
+                  turnItems={displayItems}
+                  itemIndex={itemIdx}
+                  project={project}
+                  todos={todos}
+                  onReaderJump={onReaderJump}
+                  onOpenPatchInDesk={onOpenPatchInDesk}
+                  onOpenSubAgent={onOpenSubAgent}
+                  compactDraftPatches={compactDraftPatches}
+                  turnActive={turnActive}
+                  suppressCaret={hasToolOrSkill}
+                  isStreamTip={isLiveTurn && isAgentStreamTip(displayItems, itemIdx)}
+                  hideAsPrefix={
+                    isAgentPrefixOfLater(displayItems, itemIdx)
+                    || isMirroredProgressWithTools(displayItems, itemIdx)
+                    || (turnHasTodos && looksLikeAuditQueueLaunchProse(item.type === 'agent_message' ? item.text : ''))
+                    || (turnAwaiting && item.type === 'agent_message'
+                      && agentDuplicatesApproval(item.text, turn.approval?.prompt))
+                  }
+                />
+              )
+            })}
             {showPending ? (
               <div className="nx-turn-pending" aria-live="polite">
                 <span className="nx-toolcell-spin" aria-hidden="true" />
                 <span>正在处理…</span>
               </div>
             ) : null}
-            {turn.approval && (
+            {turn.approval && !embeddedApproval ? (
               <ApprovalOptions
                 prompt={turn.approval.prompt}
                 options={turn.approval.options}
-                // Gate cards must stay clickable even if a late tick left loading=true.
                 disabled={loading && !turn.approval?.options?.length}
                 onPick={onPickOption}
                 otherText={otherText}
@@ -91,7 +191,7 @@ export default function TurnTimeline({
                 setShowOther={setShowOther}
                 onOtherSubmit={onOtherSubmit}
               />
-            )}
+            ) : null}
           </div>
         </div>
         )
@@ -101,13 +201,13 @@ export default function TurnTimeline({
 }
 
 /** Isolated so tool-output re-renders don't repaint the separator text. */
-const TurnSep = memo(function TurnSep({ index, running, aborted }) {
+const TurnSep = memo(function TurnSep({ index, running, awaiting = false, aborted }) {
   return (
     <div className="nx-turn-sep">
       <span className="nx-turn-sep-line" />
       <span className="nx-turn-sep-label">
         本轮 {index + 1}
-        {running ? ' · 进行中' : aborted ? ' · 已中断' : ''}
+        {awaiting ? ' · 待选择' : running ? ' · 进行中' : aborted ? ' · 已中断' : ''}
       </span>
       <span className="nx-turn-sep-line" />
     </div>
@@ -120,7 +220,12 @@ function itemHasVisibleBody(item) {
   if (item.type === 'agent_message' || item.type === 'reasoning') {
     return !!String(item.text || '').trim()
   }
-  if (item.type === 'tool_call' || item.type === 'skill_load' || item.type === 'pipeline_step') {
+  if (
+    item.type === 'tool_call'
+    || item.type === 'skill_load'
+    || item.type === 'pipeline_step'
+    || item.type === 'agent_spawn'
+  ) {
     return true
   }
   if (item.type === 'draft_patch' || item.type === 'mutation_preview' || item.type === 'audit_report') {
@@ -156,6 +261,15 @@ function isAgentPrefixOfLater(items, index) {
   return false
 }
 
+/** Hide pipeline heartbeats mirrored into NovelX bubbles when tool cards already show them. */
+function isMirroredProgressWithTools(items, index) {
+  const cur = items?.[index]
+  if (!cur || cur.type !== 'agent_message') return false
+  const text = stripToolMarkup(cur.text || '')
+  if (!looksLikeMirroredProgress(text)) return false
+  return (items || []).some((it) => it?.type === 'tool_call')
+}
+
 /**
  * Drop agent-bubble lines that already appear as a sibling tool_call output
  * (legacy: mutation apply echoed「已写入设定卡 …」in both places).
@@ -182,10 +296,15 @@ const TurnItemView = memo(function TurnItemView({
   turnItems,
   itemIndex,
   project,
+  todos = [],
+  omitQueueProgress = false,
+  compactTool = false,
+  hideStructuredProgress = false,
   onReaderJump,
   onOpenPatchInDesk,
+  onOpenSubAgent,
   compactDraftPatches = false,
-  turnActive,
+  turnActive = false,
   suppressCaret,
   isStreamTip,
   hideAsPrefix,
@@ -200,18 +319,23 @@ const TurnItemView = memo(function TurnItemView({
       )
     case 'agent_message': {
       if (hideAsPrefix) return null
-      const text = dedupeAgentTextAgainstTools(
+      const raw = dedupeAgentTextAgainstTools(
         turnItems,
         itemIndex,
         stripToolMarkup(item.text),
       )
-      if (!text) return null
-      // Never leave carets on ack/progress once a tool card follows / turn paused.
+      if (!raw) return null
+      const reasoningTexts = (turnItems || [])
+        .filter((it) => it?.type === 'reasoning')
+        .map((it) => it.text)
+      // While streaming, keep raw text so the caret doesn't jump; structure on settle.
       const streaming = turnActive
         && !suppressCaret
         && item.status === 'in_progress'
         && isStreamTip
-        && !looksLikeMirroredProgress(text)
+        && !looksLikeMirroredProgress(raw)
+      const text = streaming ? raw : prepareChatAgentProse(raw, reasoningTexts)
+      if (!text) return null
       return (
         <div className="nx-msg nx-msg-agent">
           <div className="nx-msg-role">NovelX</div>
@@ -226,10 +350,15 @@ const TurnItemView = memo(function TurnItemView({
     case 'reasoning': {
       const text = stripToolMarkup(item.text)
       if (!text) return null
+      const live = item.status === 'in_progress' && turnActive
+      const preview = text.replace(/\s+/g, ' ').trim().slice(0, 42)
       return (
-        <details className="nx-card nx-reasoning" open={item.status === 'in_progress'}>
+        <details className="nx-card nx-reasoning" open={live}>
           <summary className="nx-card-head">
             <span className="nx-card-kind">思考</span>
+            {!live && preview ? (
+              <span className="nx-reasoning-preview">{preview}{text.length > 42 ? '…' : ''}</span>
+            ) : null}
           </summary>
           <MarkdownView className="nx-card-output" source={text} variant="chat" />
         </details>
@@ -240,14 +369,27 @@ const TurnItemView = memo(function TurnItemView({
         <div className={`nx-skillcell nx-status-${item.status}`}>
           <span className="nx-toolcell-bullet">{item.status === 'completed' ? '✓' : '•'}</span>
           <span className="nx-toolcell-verb">
-            {item.status === 'completed' ? '已加载技能' : '加载技能中'}
+            {item.status === 'completed' ? '已加载写作指南' : '加载写作指南'}
           </span>
-          <span className="nx-skillcell-name">${item.name}</span>
-          {item.path ? <span className="nx-toolcell-args">· {shortPath(item.path)}</span> : null}
+          <span className="nx-skillcell-name">{skillLabelZh(item.name)}</span>
         </div>
       )
-    case 'tool_call':
-      return <ToolCallCard item={item} project={project} onReaderJump={onReaderJump} />
+    case 'tool_call': {
+      const displayStatus = effectiveToolDisplayStatus(item, { turnItems, todos })
+      const displayItem = displayStatus === item.status
+        ? item
+        : { ...item, status: displayStatus }
+      return (
+        <ToolCallCard
+          item={displayItem}
+          project={project}
+          onReaderJump={onReaderJump}
+          omitQueueProgress={omitQueueProgress}
+          compact={compactTool}
+          hideStructuredProgress={hideStructuredProgress}
+        />
+      )
+    }
     case 'draft_patch':
       return (
         <DraftPatchCard
@@ -289,6 +431,38 @@ const TurnItemView = memo(function TurnItemView({
           <MarkdownView className="nx-card-output" source={item.report} variant="chat" />
         </div>
       )
+    case 'agent_spawn': {
+      const childId = item.child_thread_id || item.childThreadId || ''
+      const role = item.role || ''
+      const path = item.agent_path || item.agentPath || ''
+      const label = stepLabelZh(role) || '协作角色'
+      return (
+        <div className={`nx-toolcell nx-agent-spawn nx-toolcell-${item.status === 'completed' ? 'completed' : 'in_progress'}`}>
+          <div className="nx-toolcell-head static">
+            <span className="nx-toolcell-bullet">✓</span>
+            <span className="nx-toolcell-verb">已启动协作</span>
+            <span className="nx-toolcell-name">{label}</span>
+          </div>
+          {childId && typeof onOpenSubAgent === 'function' ? (
+            <div className="nx-toolcell-body">
+              <button
+                type="button"
+                className="btn-ghost btn-inline nx-open-subagent"
+                onClick={() => onOpenSubAgent({
+                  threadId: childId,
+                  role,
+                  agentPath: path,
+                  lifecycle: 'running',
+                  summary: '',
+                })}
+              >
+                查看进度
+              </button>
+            </div>
+          ) : null}
+        </div>
+      )
+    }
     default:
       return null
   }
@@ -303,8 +477,30 @@ function looksLikeMirroredProgress(text) {
     || t.includes('已确认，正在应用')
 }
 
-function shortPath(p) {
-  if (!p) return ''
-  const parts = String(p).split(/[/\\]/)
-  return parts.slice(-3).join('/')
+function pickHostSegIdx(segments, todos, allowHost) {
+  if (!allowHost) return -1
+  if (todos?.length) {
+    const picked = pickTodoHostSegment(segments, todos)
+    if (picked >= 0) return picked
+  }
+  for (let i = segments.length - 1; i >= 0; i -= 1) {
+    if (segments[i]?.kind === 'worked' && workItemsHostTodos(segments[i].items)) {
+      return i
+    }
+  }
+  if (todos?.length) {
+    for (let i = segments.length - 1; i >= 0; i -= 1) {
+      if (segments[i]?.kind === 'worked') return i
+    }
+  }
+  return -1
+}
+
+function agentDuplicatesApproval(text, prompt) {
+  const a = String(text || '').replace(/\s+/g, ' ').trim()
+  const b = String(prompt || '').replace(/\s+/g, ' ').trim()
+  if (a.length < 12 || b.length < 12) return false
+  const aHead = a.slice(0, 48)
+  const bHead = b.slice(0, 48)
+  return a.includes(bHead) || b.includes(aHead)
 }

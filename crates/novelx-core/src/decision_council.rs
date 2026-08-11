@@ -2,7 +2,7 @@
 //!
 //! Config: `config/decision_council.yaml`. Feature: `studio.decision_council`.
 
-use novelx_harness::issue_priority;
+use novelx_harness::{issue_priority, issue_type};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -81,6 +81,9 @@ pub struct KindConfig {
     pub enabled: bool,
     #[serde(default = "default_max_retries")]
     pub max_auto_retries: u32,
+    /// Consecutive council evaluations with overlapping P0 types → escalate.
+    #[serde(default = "default_same_type_streak")]
+    pub same_type_streak_limit: u32,
     #[serde(default = "default_min_score")]
     min_score: u32,
     #[serde(default = "default_epsilon")]
@@ -122,6 +125,9 @@ fn default_true() -> bool {
     true
 }
 fn default_max_retries() -> u32 {
+    1
+}
+fn default_same_type_streak() -> u32 {
     2
 }
 fn default_min_score() -> u32 {
@@ -148,6 +154,7 @@ impl Default for KindConfig {
         Self {
             enabled: true,
             max_auto_retries: default_max_retries(),
+            same_type_streak_limit: default_same_type_streak(),
             min_score: default_min_score(),
             deadlock_epsilon: default_epsilon(),
             allow_auto_accept_p0: false,
@@ -263,6 +270,35 @@ impl DecisionCouncilConfig {
 /// True when any issue has priority P0.
 pub fn has_true_p0(issues: &[Value]) -> bool {
     issues.iter().any(|i| issue_priority(i) == "P0")
+}
+
+/// Sorted unique P0 issue types (uppercase).
+pub fn p0_issue_types(issues: &[Value]) -> Vec<String> {
+    let mut types: Vec<String> = issues
+        .iter()
+        .filter(|i| issue_priority(i) == "P0")
+        .map(issue_type)
+        .filter(|t| !t.is_empty())
+        .collect();
+    types.sort();
+    types.dedup();
+    types
+}
+
+/// Advance streak when current P0 types overlap previous look; else reset to 1 (or 0 if none).
+pub fn next_same_type_streak(prev_types: &[String], current_types: &[String], prev_streak: u32) -> u32 {
+    if current_types.is_empty() {
+        return 0;
+    }
+    if prev_types.is_empty() {
+        return 1;
+    }
+    let overlap = current_types.iter().any(|t| prev_types.iter().any(|p| p == t));
+    if overlap {
+        prev_streak.saturating_add(1).max(2)
+    } else {
+        1
+    }
 }
 
 /// Adapt consistency audit JSON into a chair ballot.
@@ -388,6 +424,10 @@ pub fn aggregate_audit(
     project: &str,
     chapter: u32,
     retry_count: u32,
+    same_type_streak: u32,
+    config_root: Option<&Path>,
+    violations: &[Value],
+    use_revise_plan: bool,
 ) -> CouncilVerdict {
     let p0 = has_true_p0(issues);
     if retry_count >= cfg.max_auto_retries {
@@ -395,6 +435,16 @@ pub fn aggregate_audit(
             ballots,
             retry_count,
             format!("自动修订已达上限 {}", cfg.max_auto_retries),
+        );
+    }
+    let streak_limit = cfg.same_type_streak_limit.max(1);
+    if p0 && same_type_streak >= streak_limit {
+        return escalate(
+            ballots,
+            retry_count,
+            format!(
+                "同类 P0 连续未消除（streak={same_type_streak}≥{streak_limit}），停止自动修订"
+            ),
         );
     }
 
@@ -429,7 +479,18 @@ pub fn aggregate_audit(
                     ),
                 );
             }
-            return auto_revise(ballots, issues, project, chapter, retry_count, revise_score);
+            return auto_revise(
+                ballots,
+                issues,
+                project,
+                chapter,
+                retry_count,
+                revise_score,
+                same_type_streak,
+                config_root,
+                violations,
+                use_revise_plan,
+            );
         }
         return escalate(
             ballots,
@@ -456,7 +517,18 @@ pub fn aggregate_audit(
         );
     }
     if revise_score >= cfg.min_score as f64 && revise_score > approve_score {
-        return auto_revise(ballots, issues, project, chapter, retry_count, revise_score);
+        return auto_revise(
+            ballots,
+            issues,
+            project,
+            chapter,
+            retry_count,
+            revise_score,
+            same_type_streak,
+            config_root,
+            violations,
+            use_revise_plan,
+        );
     }
     escalate(
         ballots,
@@ -495,6 +567,10 @@ fn auto_revise(
     chapter: u32,
     retry_count: u32,
     score: f64,
+    same_type_streak: u32,
+    config_root: Option<&Path>,
+    violations: &[Value],
+    use_revise_plan: bool,
 ) -> CouncilVerdict {
     let p0_ids: Vec<String> = issues
         .iter()
@@ -509,17 +585,45 @@ fn auto_revise(
     } else {
         p0_ids
     };
+    let mut args = json!({
+        "project": project,
+        "chapter": chapter,
+        "choice": "revise",
+        "issue_ids": issue_ids,
+    });
+    let mut rationale = format!("评审团共识自动修订（加权分 {score:.0}）");
+
+    if use_revise_plan {
+        let plan_cfg = match config_root {
+            Some(root) => crate::revise_plan::RevisePlanConfig::load(root),
+            None => crate::revise_plan::RevisePlanConfig::default(),
+        };
+        let plan = crate::revise_plan::build_revise_plan(
+            &plan_cfg,
+            issues,
+            violations,
+            same_type_streak,
+        );
+        if plan.scope == crate::revise_plan::ReviseScope::Escalate {
+            return escalate(
+                ballots,
+                retry_count,
+                format!("RevisePlan 升人机：{}", plan.rationale),
+            );
+        }
+        crate::revise_plan::apply_plan_to_steer_args(&mut args, &plan);
+        rationale = format!(
+            "评审团共识自动修订（加权分 {score:.0}）· {}",
+            plan.summary_line()
+        );
+    }
+
     CouncilVerdict {
         action: CouncilAction::AutoRevise,
         tool: "steer_run".into(),
-        args: json!({
-            "project": project,
-            "chapter": chapter,
-            "choice": "revise",
-            "issue_ids": issue_ids,
-        }),
+        args,
         ballots,
-        rationale: format!("评审团共识自动修订（加权分 {score:.0}）"),
+        rationale,
         retry_count,
     }
 }
@@ -543,6 +647,8 @@ pub fn evaluate_audit_content(
     data: &Value,
     issues: &[Value],
     retry_count: u32,
+    same_type_streak: u32,
+    use_revise_plan: bool,
 ) -> CouncilVerdict {
     let cfg = DecisionCouncilConfig::load(config_root);
     let kind = cfg.audit_kind();
@@ -559,7 +665,23 @@ pub fn evaluate_audit_content(
             ballots.push(ballot_from_plot_acceptor(data));
         }
     }
-    aggregate_audit(&kind, ballots, issues, project, chapter, retry_count)
+    let violations = data
+        .get("content_rule_violations")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    aggregate_audit(
+        &kind,
+        ballots,
+        issues,
+        project,
+        chapter,
+        retry_count,
+        same_type_streak,
+        Some(config_root),
+        &violations,
+        use_revise_plan,
+    )
 }
 
 pub fn verdict_journal_data(verdict: &CouncilVerdict) -> Value {
@@ -570,6 +692,8 @@ pub fn verdict_journal_data(verdict: &CouncilVerdict) -> Value {
         "retry_count": verdict.retry_count,
         "tool": verdict.tool,
         "ballots": verdict.ballots,
+        "revise_plan": verdict.args.get("revise_plan"),
+        "revise_scope": verdict.args.get("revise_scope"),
     })
 }
 
@@ -598,12 +722,16 @@ mod tests {
             ballot_from_pacing(&json!({"pacing_passed": true})),
             ballot_from_plot_acceptor(&json!({})),
         ];
-        let v = aggregate_audit(&cfg, ballots, &issues, "sample-novel", 6, 0);
+        let v = aggregate_audit(
+            &cfg, ballots, &issues, "sample-novel", 6, 0, 1, None, &[], true,
+        );
         assert_eq!(v.action, CouncilAction::AutoRevise);
         assert_eq!(v.tool, "steer_run");
         assert_eq!(v.args["choice"], "revise");
         let ids = v.args["issue_ids"].as_array().unwrap();
         assert_eq!(ids.len(), 2);
+        assert_eq!(v.args["revise_scope"], "full");
+        assert!(!v.args["instructions"].as_str().unwrap_or("").is_empty());
     }
 
     #[test]
@@ -614,10 +742,11 @@ mod tests {
         // No yaml → defaults; evaluate with P0 should not need advisors.
         let issues = vec![p0_issue("only")];
         let data = json!({"consistency_passed": false, "pacing_passed": false});
-        let v = evaluate_audit_content(&dir, "demo", 1, &data, &issues, 0);
+        let v = evaluate_audit_content(&dir, "demo", 1, &data, &issues, 0, 1, true);
         assert_eq!(v.action, CouncilAction::AutoRevise);
         assert_eq!(v.ballots.len(), 1);
         assert_eq!(v.ballots[0].agent, "consistency_auditor");
+        assert_eq!(v.args["revise_scope"], "full");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -627,9 +756,30 @@ mod tests {
         let issues = vec![p0_issue("i1")];
         let data = json!({"consistency_passed": false});
         let ballots = vec![ballot_from_consistency(&data, &issues)];
-        let v = aggregate_audit(&cfg, ballots, &issues, "demo", 1, 2);
+        let v = aggregate_audit(
+            &cfg, ballots, &issues, "demo", 1, 1, 1, None, &[], false,
+        );
         assert_eq!(v.action, CouncilAction::EscalateHuman);
         assert!(v.rationale.contains("上限"));
+    }
+
+    #[test]
+    fn same_type_streak_escalates() {
+        let cfg = KindConfig::default();
+        let issues = vec![p0_issue("i1")];
+        let data = json!({"consistency_passed": false});
+        let ballots = vec![ballot_from_consistency(&data, &issues)];
+        let v = aggregate_audit(
+            &cfg, ballots, &issues, "demo", 1, 0, 2, None, &[], false,
+        );
+        assert_eq!(v.action, CouncilAction::EscalateHuman);
+        assert!(v.rationale.contains("同类"));
+        let streak = next_same_type_streak(
+            &["TIMELINE".into()],
+            &["TIMELINE".into()],
+            1,
+        );
+        assert_eq!(streak, 2);
     }
 
     #[test]
@@ -649,7 +799,9 @@ mod tests {
             reasons: vec![],
             issue_refs: vec![],
         }];
-        let v = aggregate_audit(&cfg, ballots, &issues, "demo", 1, 0);
+        let v = aggregate_audit(
+            &cfg, ballots, &issues, "demo", 1, 0, 1, None, &[], true,
+        );
         assert_ne!(v.action, CouncilAction::AutoContinue);
         if v.action == CouncilAction::AutoRevise {
             assert_ne!(v.args["choice"], "accept");
@@ -693,7 +845,9 @@ mod tests {
                 issue_refs: vec![],
             },
         ];
-        let v = aggregate_audit(&cfg, ballots, &issues, "demo", 1, 0);
+        let v = aggregate_audit(
+            &cfg, ballots, &issues, "demo", 1, 0, 1, None, &[], false,
+        );
         // With high epsilon, revise vs escalate may deadlock → escalate human.
         assert!(
             matches!(
@@ -703,5 +857,33 @@ mod tests {
             "{:?}",
             v.action
         );
+    }
+
+    #[test]
+    fn body_state_hard_gate_sets_full_revise_plan() {
+        let cfg = KindConfig::default();
+        let issues = vec![json!({
+            "id": "s1",
+            "type": "STYLE",
+            "priority": "P0",
+            "message": "文风",
+        })];
+        let data = json!({"consistency_passed": false});
+        let ballots = vec![ballot_from_consistency(&data, &issues)];
+        let viol = vec![json!({
+            "rule": "body_state_side",
+            "message": "侧别冲突",
+            "blocking": true
+        })];
+        let v = aggregate_audit(
+            &cfg, ballots, &issues, "demo", 1, 0, 1, None, &viol, true,
+        );
+        assert_eq!(v.action, CouncilAction::AutoRevise);
+        assert_eq!(v.args["revise_scope"], "full");
+        assert_eq!(v.args["prefer_local_patch"], false);
+        assert!(v.args["instructions"]
+            .as_str()
+            .unwrap_or("")
+            .contains("状态板"));
     }
 }

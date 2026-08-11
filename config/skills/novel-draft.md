@@ -28,5 +28,5 @@ description: >-
 - 用户指定新书名 → `project_id` 跟书名，勿沿用左侧旧项目
 - 「三卷左右」→ expected_volumes；「仅大纲」→ outline_only；「先写三章」→ through_chapter=3
 - 工具顺序：`create_novel` / `init_novel` → `lock_brief` → 总纲/卷纲 → Bible → `confirm_setup`
-- **短剧**（`project_mode=short_drama`）：`lock_brief` → `design_master_outline`（系列大纲）→ Bible → `confirm_setup`（**不要求卷纲**）→ `design_plot`（beat）→ `continue_episode`
-- 短剧禁用：`continue_writing_batch` / `sync_volume` / `audit_volume` / `split_chapter`
+- **短剧**（`project_mode=short_drama`）：`lock_brief` → `design_master_outline`（系列大纲）→ Bible → `confirm_setup`（**不要求卷纲**）→ `design_plot`（beat）→ `continue_episode` / `continue_writing_batch`
+- 短剧禁用：`sync_volume` / `audit_volume` / `split_chapter`（连写请用 `continue_writing_batch`）

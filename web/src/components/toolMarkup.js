@@ -1,3 +1,5 @@
+import { stepLabelZh } from './toolLabels'
+
 /** Strip model-emitted pseudo tool markup (defense in depth). */
 export function stripToolMarkup(text) {
   if (!text) return ''
@@ -45,14 +47,92 @@ function normalizeArgKey(key) {
   if (['project_id', 'project_name', 'novel', 'name'].includes(key)) return 'project'
   if (['chapter_number', 'chapter_num', 'ch', 'n'].includes(key)) return 'chapter'
   if (['user_instructions', 'instruction', 'msg', 'message'].includes(key)) return 'instructions'
+  if (['max_chapters', 'batch_size'].includes(key)) return 'count'
+  if (['from_chapter', 'start_chapter', 'from'].includes(key)) return 'from'
+  if (['to_chapter', 'end_chapter', 'to'].includes(key)) return 'to'
+  if (['mode', 'pipeline_mode'].includes(key)) return 'mode'
+  if (['role', 'agent_role'].includes(key)) return 'role'
   return key
+}
+
+const ARG_LABEL_ZH = {
+  project: '作品',
+  chapter: '章节',
+  instructions: '要求',
+  count: '数量',
+  from: '从',
+  to: '到',
+  mode: '方式',
+  role: '角色',
+  title: '标题',
+  kind: '类型',
+  query: '关键词',
+  apply: '应用',
+}
+
+const HIDDEN_ARG_KEYS = new Set([
+  'project_id',
+  'mutation_id',
+  'thread_id',
+  'agent_path',
+  'parent_thread_id',
+])
+
+function formatArgValue(key, value) {
+  if (value == null) return ''
+  if (key === 'chapter' && (typeof value === 'number' || /^\d+$/.test(String(value)))) {
+    return `第${value}章`
+  }
+  if (key === 'from' || key === 'to') {
+    if (typeof value === 'number' || /^\d+$/.test(String(value))) return `第${value}章`
+  }
+  if (key === 'role' && typeof value === 'string') {
+    return stepLabelZh(value) || value
+  }
+  if (key === 'mode' && typeof value === 'string') {
+    const modes = {
+      continue: '续写',
+      revise: '修订',
+      audit_only: '仅审校',
+      batch: '批量',
+    }
+    return modes[value] || stepLabelZh(value) || value
+  }
+  if (typeof value === 'boolean') return value ? '是' : '否'
+  if (typeof value === 'string') {
+    const s = value.trim()
+    if (!s) return ''
+    return s.length > 40 ? `${s.slice(0, 40)}…` : s
+  }
+  try {
+    const s = JSON.stringify(value)
+    return s.length > 40 ? `${s.slice(0, 40)}…` : s
+  } catch {
+    return String(value).slice(0, 40)
+  }
 }
 
 export function formatArgsSummary(args) {
   if (!args) return ''
   const obj = typeof args === 'string' ? safeParse(args) : args
   if (!obj || typeof obj !== 'object') return String(args).slice(0, 120)
-  const parts = Object.entries(obj).map(([k, v]) => `${k}=${typeof v === 'string' ? v : JSON.stringify(v)}`)
+  const parts = []
+  for (const [rawKey, rawVal] of Object.entries(obj)) {
+    if (HIDDEN_ARG_KEYS.has(rawKey)) continue
+    if (rawVal == null || rawVal === '') continue
+    const key = normalizeArgKey(rawKey)
+    if (HIDDEN_ARG_KEYS.has(key)) continue
+    const label = ARG_LABEL_ZH[key] || (/[\u4e00-\u9fff]/.test(key) ? key : null)
+    const shown = formatArgValue(key, rawVal)
+    if (!shown) continue
+    if (key === 'chapter') {
+      parts.push(shown)
+      continue
+    }
+    if (!label) continue // drop unmapped snake_case noise
+    parts.push(`${label} ${shown}`)
+    if (parts.length >= 4) break
+  }
   return parts.join(' · ').slice(0, 160)
 }
 

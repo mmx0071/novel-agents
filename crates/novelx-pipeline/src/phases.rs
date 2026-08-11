@@ -632,6 +632,13 @@ mod tests {
         )
         .unwrap();
         let _ = maybe_advance_setup_after_outlines(&dir);
+        // init_project writes a schema-valid bible stub → Confirm (not NeedBible).
+        assert_eq!(
+            resolve_setup_next_step(&dir),
+            Some(SetupNextStep::Confirm)
+        );
+        // Invalidate stub → NeedBible; restore full bible → Confirm again.
+        fs::write(dir.join("artifacts/bible.md"), "# 不完整\n\n缺节。\n").unwrap();
         assert_eq!(
             resolve_setup_next_step(&dir),
             Some(SetupNextStep::NeedBible)
@@ -688,6 +695,8 @@ mod tests {
             SetupPhase::AwaitingConfirm
         );
         assert!(setup_write_block_reason(&dir).is_some());
+        // Stub bible from init is schema-valid; corrupt it to exercise the hard gate.
+        fs::write(dir.join("artifacts/bible.md"), "# 世界观\n\n只有标题。\n").unwrap();
         assert!(confirm_setup_approve(&dir).is_err(), "bible incomplete must block");
         fs::write(
             dir.join("artifacts/bible.md"),
@@ -731,6 +740,8 @@ mod tests {
         )
         .unwrap();
         maybe_advance_setup_after_outlines(&dir).unwrap();
+        // Replace init stub with invalid content (missing required sections).
+        fs::write(dir.join("artifacts/bible.md"), "# 世界观 Bible\n\n片段。\n").unwrap();
         let err = confirm_setup_approve(&dir).unwrap_err().to_string();
         assert!(err.contains("Bible") || err.contains("世界观"));
         assert!(!has_valid_bible(&dir));

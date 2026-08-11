@@ -388,6 +388,41 @@ pub struct TodoItem {
     pub status: TodoStatus,
 }
 
+/// Build a Codex-style progressive checklist for any multi-step job
+/// (audit queue, batch write, setup ladder, …).
+///
+/// - `current_index` is `in_progress` (clamped)
+/// - items before it are `completed`
+/// - items after it are `pending`
+/// - when `finished`, every item is `completed`
+pub fn progressive_todo_list(
+    labels: &[impl AsRef<str>],
+    current_index: usize,
+    finished: bool,
+) -> Vec<TodoItem> {
+    if labels.is_empty() {
+        return Vec::new();
+    }
+    let cur = current_index.min(labels.len().saturating_sub(1));
+    labels
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            let status = if finished || i < cur {
+                TodoStatus::Completed
+            } else if i == cur && !finished {
+                TodoStatus::InProgress
+            } else {
+                TodoStatus::Pending
+            };
+            TodoItem {
+                content: label.as_ref().to_string(),
+                status,
+            }
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserInputOption {
@@ -646,6 +681,17 @@ impl EventMsg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progressive_todo_list_marks_one_in_progress() {
+        let labels = ["写第1章", "写第2章", "写第3章"];
+        let mid = progressive_todo_list(&labels, 1, false);
+        assert_eq!(mid[0].status, TodoStatus::Completed);
+        assert_eq!(mid[1].status, TodoStatus::InProgress);
+        assert_eq!(mid[2].status, TodoStatus::Pending);
+        let done = progressive_todo_list(&labels, 2, true);
+        assert!(done.iter().all(|t| t.status == TodoStatus::Completed));
+    }
 
     #[test]
     fn event_roundtrip() {

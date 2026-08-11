@@ -3,39 +3,80 @@
 use serde_json::Value;
 
 /// Pipeline step / tool id → Chinese label for progress lines & tool cards.
+/// Unknown English ids fall back to a generic phrase (never leak snake_case to UI).
 pub fn agent_label_zh(id: &str) -> &str {
     match id {
-        "chapter_planner" => "章纲规划",
-        "lore_librarian" => "设定检索",
-        "writer" => "正文写作",
+        "chapter_planner" => "规划章纲",
+        "lore_librarian" => "查阅设定",
+        "writer" => "撰写正文",
         "continue_writing" => "继续创作",
-        "local_reviser" => "局部修订",
-        "scene_specialist" => "场景专改",
-        "dialogue_specialist" => "对话专改",
-        "consistency_auditor" => "一致性审计",
-        "foreshadow_tracker" => "伏笔追踪",
-        "pacing_reviewer" => "节奏审查",
-        "literary_editor" => "文学润色",
-        "nomenclature_curator" => "名词管理",
-        "summarizer" => "章节摘要",
-        "plot_acceptor" => "剧情验收",
-        "autofix" => "自动修复",
+        "continue_writing_batch" => "批量续写",
+        "continue_episode" => "续写短剧",
+        "local_reviser" => "局部改稿",
+        "scene_specialist" => "打磨场景",
+        "dialogue_specialist" => "打磨对白",
+        "consistency_auditor" => "核对前后文",
+        "foreshadow_tracker" => "梳理伏笔",
+        "pacing_reviewer" => "检查节奏",
+        "literary_editor" => "润色文笔",
+        "nomenclature_curator" => "统一用词",
+        "summarizer" => "整理章摘要",
+        "plot_acceptor" => "核对剧情进度",
+        "autofix" => "自动修正",
         "revise_chapter" => "修订章节",
+        "revise_local" => "局部改稿",
+        "revise_outline" => "修订章纲",
+        "revise_episode" => "修订短剧",
         "split_chapter" => "拆成两章",
+        "apply_draft_patch" => "局部改稿",
+        "replan_volume" => "重排本卷计划",
         "audit_chapter" => "审校章节",
         "audit_chapters" => "审阅队列",
         "audit_volume" => "整卷复盘",
-        "research_materials" => "素材研究",
-        "steer_run" => "门控续作",
-        "offer_decisions" => "提出决策",
-        "expectation_reviewer" => "预期检阅",
+        "research_materials" => "搜集素材",
+        "read_chapter" => "阅读章节",
+        "read_episode" => "阅读短剧",
+        "steer_run" => "按你的选择继续",
+        "offer_decisions" => "请你选择下一步",
+        "expectation_reviewer" => "检阅预期",
         "enqueue_expected_event" => "登记预期",
         "update_expected_event" => "更新预期",
-        "list_expected_events" => "预期列表",
+        "list_expected_events" => "查看预期列表",
         "review_expected_events" => "检阅预期",
         "resolve_expected_event" => "处理预期",
+        "query_lore" => "查询设定",
+        "query_memory" => "查阅记忆",
+        "list_entities" => "浏览设定卡",
+        "list_plots" => "查看剧情进度",
+        "get_project_status" => "查看项目进度",
+        "design_entity" => "设计设定卡",
+        "design_plot" => "设计剧情卡",
+        "update_plot" => "更新剧情卡",
+        "design_master_outline" => "设计总纲",
+        "design_arc_outline" => "设计卷纲",
+        "sync_volume" => "同步设定库",
+        "confirm_volume_memory" => "确认卷记忆",
+        "create_novel" | "init_novel" => "创建小说",
+        "lock_brief" => "锁定灵感",
+        "confirm_setup" => "确认定稿",
+        "spawn_agent" => "启动协作角色",
+        "wait_agent" => "等待协作角色",
+        "list_agents" => "查看协作角色",
+        "interrupt_agent" => "中断协作角色",
+        "activate_agents" => "启用写作角色",
+        other if looks_like_internal_id(other) => "后台步骤",
         other => other,
     }
+}
+
+fn looks_like_internal_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    id.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Tools whose full payload should not be streamed into the chat timeline.
@@ -227,15 +268,17 @@ mod tests {
 
     #[test]
     fn agent_labels_are_chinese() {
-        assert_eq!(agent_label_zh("chapter_planner"), "章纲规划");
-        assert_eq!(agent_label_zh("lore_librarian"), "设定检索");
-        assert_eq!(agent_label_zh("writer"), "正文写作");
+        assert_eq!(agent_label_zh("chapter_planner"), "规划章纲");
+        assert_eq!(agent_label_zh("lore_librarian"), "查阅设定");
+        assert_eq!(agent_label_zh("writer"), "撰写正文");
         assert_eq!(agent_label_zh("continue_writing"), "继续创作");
-        assert_eq!(agent_label_zh("scene_specialist"), "场景专改");
-        assert_eq!(agent_label_zh("consistency_auditor"), "一致性审计");
-        assert_eq!(agent_label_zh("foreshadow_tracker"), "伏笔追踪");
-        assert_eq!(agent_label_zh("autofix"), "自动修复");
-        assert_eq!(agent_label_zh("pacing_reviewer"), "节奏审查");
-        assert_eq!(agent_label_zh("literary_editor"), "文学润色");
+        assert_eq!(agent_label_zh("continue_writing_batch"), "批量续写");
+        assert_eq!(agent_label_zh("scene_specialist"), "打磨场景");
+        assert_eq!(agent_label_zh("consistency_auditor"), "核对前后文");
+        assert_eq!(agent_label_zh("foreshadow_tracker"), "梳理伏笔");
+        assert_eq!(agent_label_zh("autofix"), "自动修正");
+        assert_eq!(agent_label_zh("pacing_reviewer"), "检查节奏");
+        assert_eq!(agent_label_zh("literary_editor"), "润色文笔");
+        assert_eq!(agent_label_zh("unknown_snake_tool"), "后台步骤");
     }
 }

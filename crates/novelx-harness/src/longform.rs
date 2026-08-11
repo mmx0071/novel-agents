@@ -147,13 +147,14 @@ fn default_batch_max() -> u32 {
     20
 }
 fn default_batch_max_auto_revise() -> u32 {
-    2
+    1
 }
 fn default_soft_short_streak() -> u32 {
     3
 }
+/// 0 = foreshadow pressure phase off (aligned with config/longform.yaml).
 fn default_batch_max_dangling() -> u32 {
-    40
+    0
 }
 
 impl Default for LongformConfig {
@@ -210,8 +211,9 @@ mod tests {
         assert_eq!(c.audit_tier, AuditTier::Layered);
         assert_eq!(c.impact_scan_mode, ImpactScanMode::Indexed);
         assert_eq!(c.batch_max_chapters, 20);
-        assert_eq!(c.batch_max_auto_revise, 2);
+        assert_eq!(c.batch_max_auto_revise, 1);
         assert_eq!(c.soft_short_auto_revise_after, 3);
+        assert_eq!(c.batch_max_dangling_foreshadow, 0);
         assert_eq!(c.foreshadow_debt.grace_chapters, 6);
         assert_eq!(c.foreshadow_debt.far_after_chapters, 40);
         assert!(c.foreshadow_debt.batch_count_mid);

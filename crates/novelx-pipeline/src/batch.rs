@@ -8,15 +8,20 @@ use crate::phases::{
 use crate::plots::{
     check_plot_write_gate_with, ensure_bridge_plot_active, PlotWriteGate, PlotWriteMode,
 };
-use crate::project::{load_project_state, project_dir, read_chapter_draft};
+use crate::project::{
+    is_short_drama, load_project_state, project_dir, read_chapter_draft,
+};
 use crate::run::{execute_pipeline, PipelineRun, RevisionOptions, RunMode};
 use crate::schemas::draft_body_chars;
 use crate::volume_audit_gate::check_volume_audit_for_continue;
 use anyhow::Result;
-use novelx_harness::{ChapterBudget, LengthAssessment, LongformConfig};
+use novelx_harness::{
+    build_revise_plan, ChapterBudget, LengthAssessment, LongformConfig, RevisePlanConfig,
+    ReviseScope,
+};
 use novelx_llm::LlmClient;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -36,6 +41,13 @@ pub struct BatchContinueOpts {
     /// Skip expected-events review gate (same as continue_writing confirm_skip_expected).
     #[serde(default)]
     pub confirm_skip_expected: bool,
+    /// Skip foreshadow `pressure_high` soft phase (batch soft-stop).
+    #[serde(default)]
+    pub confirm_skip_foreshadow: bool,
+    /// When true: do not apply `unattended.yaml` soft-skip defaults (keep mid-audit /
+    /// expected / foreshadow soft phases unless explicitly skipped above).
+    #[serde(default)]
+    pub respect_soft_gates: bool,
     /// When length HardShort / SoftShort-escalate blocks publish, try auto expand;
     /// HardLong → auto-split once into chapter + chapter+1.
     #[serde(default = "default_true")]
@@ -54,9 +66,27 @@ impl Default for BatchContinueOpts {
             until_chapter: None,
             confirm_skip_volume_audit: false,
             confirm_skip_expected: false,
+            confirm_skip_foreshadow: false,
+            respect_soft_gates: false,
             auto_length_revise: true,
         }
     }
+}
+
+/// Apply `config/unattended.yaml` soft-skip defaults for batch (unless respect_soft_gates).
+pub fn apply_unattended_batch_policy(config_root: &Path, opts: &mut BatchContinueOpts) -> bool {
+    let policy = novelx_harness::UnattendedPolicy::load_from_config_root(config_root);
+    let skips = policy.resolve_batch_skips(
+        config_root,
+        opts.respect_soft_gates,
+        opts.confirm_skip_volume_audit,
+        opts.confirm_skip_expected,
+        opts.confirm_skip_foreshadow,
+    );
+    opts.confirm_skip_volume_audit = skips.skip_volume_audit;
+    opts.confirm_skip_expected = skips.skip_expected;
+    opts.confirm_skip_foreshadow = skips.skip_foreshadow_pressure;
+    skips.applied_by_policy
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +109,10 @@ pub struct BatchChapterResult {
     pub run: Option<PipelineRun>,
 }
 
+fn default_batch_unit() -> String {
+    "章".into()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchContinueResult {
     pub project: String,
@@ -87,6 +121,15 @@ pub struct BatchContinueResult {
     pub chapters_published: u32,
     pub stopped_reason: String,
     pub results: Vec<BatchChapterResult>,
+    /// Display unit: `章` (longform) or `集` (short_drama).
+    #[serde(default = "default_batch_unit")]
+    pub unit: String,
+    /// Soft gates (mid volume audit / expected review) were auto-skipped by unattended policy.
+    #[serde(default)]
+    pub soft_gates_skipped_by_policy: bool,
+    /// Progressive checklist snapshot at batch end (also streamed live via PipelineEvent::TodoList).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub todos: Vec<novelx_protocol::TodoItem>,
 }
 
 fn expected_gate_message(
@@ -254,6 +297,19 @@ pub(crate) fn build_batch_revise_instructions(
 
     if need_hard {
         let detail: String = run.message.chars().take(400).collect();
+        let violations: Vec<Value> = run
+            .content_rule_violations
+            .iter()
+            .filter(|v| v.blocking)
+            .map(|v| {
+                json!({
+                    "rule": v.rule,
+                    "message": v.message,
+                    "blocking": true,
+                })
+            })
+            .collect();
+        let plan = build_revise_plan(&RevisePlanConfig::default(), &[], &violations, 0);
         let hard_blob = format!(
             "{detail} {}",
             run.content_rule_violations
@@ -262,11 +318,15 @@ pub(crate) fn build_batch_revise_instructions(
                 .collect::<Vec<_>>()
                 .join(" ")
         );
-        if looks_like_timeline_issue(&hard_blob) {
+        if plan.scope == ReviseScope::Full || looks_like_timeline_issue(&hard_blob) {
             force_full = true;
-            parts.push(format!(
-                "消除时段/时间线硬规则违规；整章理顺日夜顺序与时段锚点，勿只改违规句。参考：{detail}"
-            ));
+            if plan.scope == ReviseScope::Full && !plan.instructions.is_empty() {
+                parts.push(plan.instructions);
+            } else {
+                parts.push(format!(
+                    "消除时段/时间线硬规则违规；整章理顺日夜顺序与时段锚点，勿只改违规句。参考：{detail}"
+                ));
+            }
         } else {
             parts.push(format!(
                 "消除正文硬规则违规；只改违规句，勿整章重写。参考：{detail}"
@@ -293,6 +353,22 @@ pub(crate) fn build_batch_revise_instructions(
     }
 
     (parts.join("\n"), force_full)
+}
+
+fn emit_batch_todos(
+    tx: &Option<mpsc::UnboundedSender<PipelineEvent>>,
+    labels: &[String],
+    current_index: usize,
+    finished: bool,
+) {
+    let Some(tx) = tx else {
+        return;
+    };
+    if labels.is_empty() {
+        return;
+    }
+    let todos = novelx_protocol::progressive_todo_list(labels, current_index, finished);
+    let _ = tx.send(PipelineEvent::TodoList { todos });
 }
 
 fn emit_batch(tx: &Option<mpsc::UnboundedSender<PipelineEvent>>, message: impl Into<String>) {
@@ -528,10 +604,11 @@ async fn batch_auto_revise_until_publish(
 pub async fn run_continue_batch(
     projects_root: &Path,
     config_root: &Path,
-    opts: BatchContinueOpts,
+    mut opts: BatchContinueOpts,
     llm: Arc<LlmClient>,
     tx: Option<mpsc::UnboundedSender<PipelineEvent>>,
 ) -> Result<BatchContinueResult> {
+    let soft_gates_skipped_by_policy = apply_unattended_batch_policy(config_root, &mut opts);
     let lf = LongformConfig::load_from_config_root(config_root);
     let max = opts
         .max_chapters
@@ -540,6 +617,7 @@ pub async fn run_continue_batch(
         .min(100);
     let max_auto_revise = lf.batch_max_auto_revise.max(1);
     let dir = project_dir(projects_root, &opts.project);
+    let unit = if is_short_drama(&dir) { "集" } else { "章" };
     let state0 = load_project_state(&dir)?;
     let started = state0.next_chapter.max(1);
     let until = resolve_batch_until(opts.until_chapter, state0.target_chapters);
@@ -552,11 +630,30 @@ pub async fn run_continue_batch(
     let safety_cap = max.saturating_mul(3).max(max + 5);
 
     let until_label = until
-        .map(|u| format!("，写到第{u}章为止"))
+        .map(|u| format!("，写到第{u}{unit}为止"))
         .unwrap_or_default();
+    let soft_note = if soft_gates_skipped_by_policy {
+        "；已按无人值守策略跳过卷 QA mid_due / 预期检阅 / 伏笔近债软相位"
+    } else {
+        ""
+    };
+    // Progressive To-dos for the planned publish span (Codex-style checklist).
+    let plan_end = {
+        let by_max = started.saturating_add(max).saturating_sub(1);
+        match until {
+            Some(u) => u.min(by_max).max(started),
+            None => by_max,
+        }
+    };
+    let todo_labels: Vec<String> = (started..=plan_end)
+        .map(|c| format!("撰写第{c}{unit}"))
+        .collect();
+    emit_batch_todos(&tx, &todo_labels, 0, false);
     emit_batch(
         &tx,
-        format!("▶ 开始连写到卡点（最多成功发布 {max} 章{until_label}，自第{started}章）"),
+        format!(
+            "▶ 开始连写到卡点（最多成功发布 {max} {unit}{until_label}，自第{started}{unit}）{soft_note}"
+        ),
     );
 
     while published_n < max && attempted < safety_cap {
@@ -565,16 +662,19 @@ pub async fn run_continue_batch(
         if let Some(u) = until {
             if chapter > u {
                 stopped = format!("until_chapter({u})");
+                emit_batch_todos(&tx, &todo_labels, 0, true);
                 emit_batch(&tx, format!("✓ 已写到 until_chapter({u})，批写结束"));
                 break;
             }
         }
 
         attempted += 1;
+        let todo_idx = (chapter.saturating_sub(started)) as usize;
+        emit_batch_todos(&tx, &todo_labels, todo_idx, false);
         emit_batch(
             &tx,
             format!(
-                "▶ 批写第{chapter}章（本批已发布 {published_n}/{max}，第 {attempted} 次尝试）"
+                "▶ 批写第{chapter}{unit}（本批已发布 {published_n}/{max}，第 {attempted} 次尝试）"
             ),
         );
 
@@ -586,7 +686,7 @@ pub async fn run_continue_batch(
         ) {
             emit_batch(
                 &tx,
-                format!("⛔ 第{chapter}章拦截·卷审：{}", block.message),
+                format!("⛔ 第{chapter}{unit}拦截·卷审：{}", block.message),
             );
             results.push(BatchChapterResult {
                 chapter,
@@ -607,7 +707,7 @@ pub async fn run_continue_batch(
         if let Some((reason, message)) =
             expected_gate_message(&dir, chapter, opts.confirm_skip_expected)
         {
-            emit_batch(&tx, format!("⛔ 第{chapter}章拦截·预期检阅：{message}"));
+            emit_batch(&tx, format!("⛔ 第{chapter}{unit}拦截·预期检阅：{message}"));
             results.push(BatchChapterResult {
                 chapter,
                 published: false,
@@ -629,7 +729,7 @@ pub async fn run_continue_batch(
             if let Some(block) = check_chapter_order(&dir, chapter) {
                 emit_batch(
                     &tx,
-                    format!("⛔ 第{chapter}章拦截·章序：{}", block.message),
+                    format!("⛔ 第{chapter}{unit}拦截·序：{}", block.message),
                 );
                 results.push(BatchChapterResult {
                     chapter,
@@ -650,7 +750,7 @@ pub async fn run_continue_batch(
 
         match check_plot_write_gate_with(&dir, enforce) {
             PlotWriteGate::Block { message, reason, .. } => {
-                emit_batch(&tx, format!("⛔ 第{chapter}章拦截·剧情门：{message}"));
+                emit_batch(&tx, format!("⛔ 第{chapter}{unit}拦截·剧情门：{message}"));
                 results.push(BatchChapterResult {
                     chapter,
                     published: false,
@@ -675,37 +775,16 @@ pub async fn run_continue_batch(
             }
         }
 
-        // Foreshadow *pressure* debt brake (not total dangling / not far-horizon).
-        let debt_cap = lf.batch_max_dangling_foreshadow;
-        if debt_cap > 0 {
-            let health = crate::memory::longform_health_snapshot(&dir);
-            let pressure = health
-                .pointer("/foreshadow/dangling_pressure")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32;
-            let total = health
-                .pointer("/foreshadow/dangling_total")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32;
-            let fresh = health
-                .pointer("/foreshadow/dangling_fresh")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32;
-            let far = health
-                .pointer("/foreshadow/dangling_far")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32;
-            if pressure > debt_cap {
-                let message = format!(
-                    "伏笔近债过高（压力债 {pressure} 条 > 上限 {debt_cap}；总量 {total}，宽限内 {fresh}，远期 {far}）。\
-                     批写暂停；请先兑现近期应回收的伏笔，或将长线标为 horizon=far。"
-                );
+        // ForeshadowPhase pressure_high → batch soft-stop (unless skip / unattended).
+        if !opts.confirm_skip_foreshadow {
+            let snap = crate::foreshadow_phase::resolve_foreshadow_phase(config_root, &dir);
+            if let Some(message) = crate::foreshadow_phase::foreshadow_batch_block_message(&snap) {
                 emit_batch(&tx, format!("⛔ {message}"));
                 results.push(BatchChapterResult {
                     chapter,
                     published: false,
                     blocked: true,
-                    reason: Some("foreshadow_debt".into()),
+                    reason: Some("foreshadow_pressure_high".into()),
                     needs_user_choice: true,
                     message,
                     length_auto_revised: false,
@@ -713,7 +792,7 @@ pub async fn run_continue_batch(
                     consistency_auto_revised: false,
                     run: None,
                 });
-                stopped = "foreshadow_debt".into();
+                stopped = "foreshadow_pressure_high".into();
                 break;
             }
         }
@@ -725,7 +804,7 @@ pub async fn run_continue_batch(
             emit_batch(
                 &tx,
                 format!(
-                    "⚙ 第{chapter}章已有未发布正文（约 {} 字），先尝试审校发布…",
+                    "⚙ 第{chapter}{unit}已有未发布正文（约 {} 字），先尝试审校发布…",
                     existing.chars().count()
                 ),
             );
@@ -772,9 +851,14 @@ pub async fn run_continue_batch(
             let consistency_auto_revised = revise_flags.consistency;
             if audit_run.published {
                 published_n += 1;
+                let next_idx = (chapter.saturating_sub(started).saturating_add(1)) as usize;
+                let finished = published_n >= max || next_idx >= todo_labels.len();
+                emit_batch_todos(&tx, &todo_labels, next_idx, finished);
                 emit_batch(
                     &tx,
-                    format!("✓ 第{chapter}章已有草稿经审校发布（本批累计 {published_n}/{max} 章）"),
+                    format!(
+                        "✓ 第{chapter}{unit}已有草稿经审校发布（本批累计 {published_n}/{max} {unit}）"
+                    ),
                 );
                 results.push(BatchChapterResult {
                     chapter,
@@ -790,8 +874,13 @@ pub async fn run_continue_batch(
                 });
                 continue;
             }
+            let revise_hint = if unit == "集" {
+                "revise_episode"
+            } else {
+                "revise_chapter"
+            };
             let message = format!(
-                "第{chapter}章已有未发布正文（约 {} 字），审校/自动修订后仍未发布。批写暂停；请 revise_chapter 或按审批卡修正。",
+                "第{chapter}{unit}已有未发布正文（约 {} 字），审校/自动修订后仍未发布。批写暂停；请 {revise_hint} 或按审批卡修正。",
                 existing.chars().count()
             );
             emit_batch(&tx, format!("⛔ {message}"));
@@ -875,15 +964,24 @@ pub async fn run_continue_batch(
 
         if run.published {
             published_n += 1;
+            let next_idx = (chapter.saturating_sub(started).saturating_add(1)) as usize;
+            let finished = published_n >= max || next_idx >= todo_labels.len();
+            emit_batch_todos(&tx, &todo_labels, next_idx, finished);
             emit_batch(
                 &tx,
-                format!("✓ 第{chapter}章已发布（本批累计 {published_n}/{max} 章）"),
+                format!("✓ 第{chapter}{unit}已发布（本批累计 {published_n}/{max} {unit}）"),
             );
         } else if blocked {
             let why = reason.as_deref().unwrap_or("gate");
+            emit_batch_todos(
+                &tx,
+                &todo_labels,
+                (chapter.saturating_sub(started)) as usize,
+                false,
+            );
             emit_batch(
                 &tx,
-                format!("⛔ 第{chapter}章未发布（{why}），批写暂停"),
+                format!("⛔ 第{chapter}{unit}未发布（{why}），批写暂停"),
             );
         }
 
@@ -928,6 +1026,7 @@ pub async fn run_continue_batch(
 
     if published_n >= max && stopped == "completed" {
         stopped = format!("max_chapters({max})");
+        emit_batch_todos(&tx, &todo_labels, 0, true);
         emit_batch(&tx, format!("✓ 已达批写成功发布上限 max_chapters({max})"));
     } else if attempted >= safety_cap && stopped == "completed" {
         stopped = format!("safety_cap({safety_cap})");
@@ -936,8 +1035,20 @@ pub async fn run_continue_batch(
             format!("⏸ 达到尝试安全上限 {safety_cap}（成功发布 {published_n}/{max}）"),
         );
     } else if stopped == "completed" {
+        emit_batch_todos(&tx, &todo_labels, 0, true);
         emit_batch(&tx, "✓ 批写循环正常结束");
     }
+
+    let todos = novelx_protocol::progressive_todo_list(
+        &todo_labels,
+        published_n as usize,
+        matches!(
+            stopped.as_str(),
+            s if s.starts_with("max_chapters")
+                || s.starts_with("until_chapter")
+                || s == "completed"
+        ) || published_n as usize >= todo_labels.len(),
+    );
 
     Ok(BatchContinueResult {
         project: opts.project,
@@ -946,6 +1057,9 @@ pub async fn run_continue_batch(
         chapters_published: published_n,
         stopped_reason: stopped,
         results,
+        unit: unit.to_string(),
+        soft_gates_skipped_by_policy,
+        todos,
     })
 }
 
@@ -955,10 +1069,21 @@ impl BatchContinueResult {
     }
 
     pub fn summary_text(&self) -> String {
+        let unit = if self.unit.is_empty() {
+            "章"
+        } else {
+            self.unit.as_str()
+        };
         let mut lines = vec![format!(
-            "批写完成：尝试 {} 章，发布 {} 章，停止原因：{}",
+            "批写完成：尝试 {} {unit}，发布 {} {unit}，停止原因：{}",
             self.chapters_attempted, self.chapters_published, self.stopped_reason
         )];
+        if self.soft_gates_skipped_by_policy {
+            lines.push(
+                "（无人值守：已跳过卷 QA mid_due / 预期检阅 / 伏笔近债软相位；硬门控仍会停）"
+                    .into(),
+            );
+        }
         for r in &self.results {
             let flag = if r.published {
                 "✓发布"
@@ -979,7 +1104,7 @@ impl BatchContinueResult {
                 _ => "",
             };
             lines.push(format!(
-                "- 第{}章 {flag}{} {}",
+                "- 第{}{unit} {flag}{} {}",
                 r.chapter,
                 auto,
                 r.reason.as_deref().unwrap_or("")
@@ -1061,10 +1186,79 @@ mod tests {
                 consistency_auto_revised: false,
                 run: None,
             }],
+            unit: "章".into(),
+            soft_gates_skipped_by_policy: false,
+            todos: vec![],
         };
         let s = r.summary_text();
         assert!(s.contains("draft_exists"));
         assert!(s.contains("⛔拦截"));
+    }
+
+    #[test]
+    fn unattended_policy_fills_soft_skips() {
+        let root = tmp("unattended-batch");
+        let config = root.join("config");
+        fs::create_dir_all(&config).unwrap();
+        fs::write(
+            config.join("features.yaml"),
+            "features:\n  studio.unattended_soft_skip: true\n",
+        )
+        .unwrap();
+        fs::write(
+            config.join("unattended.yaml"),
+            "version: 1\nbatch:\n  skip_volume_audit_mid: true\n  skip_expected_review: true\n  skip_foreshadow_pressure: true\n",
+        )
+        .unwrap();
+        let mut opts = BatchContinueOpts::default();
+        assert!(apply_unattended_batch_policy(&config, &mut opts));
+        assert!(opts.confirm_skip_volume_audit);
+        assert!(opts.confirm_skip_expected);
+        assert!(opts.confirm_skip_foreshadow);
+        let mut respected = BatchContinueOpts {
+            respect_soft_gates: true,
+            ..Default::default()
+        };
+        assert!(!apply_unattended_batch_policy(&config, &mut respected));
+        assert!(!respected.confirm_skip_volume_audit);
+        assert!(!respected.confirm_skip_foreshadow);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn short_drama_batch_enters_loop_until_gate() {
+        let root = tmp("sd-batch");
+        let _dir = crate::project::init_project_with_mode(
+            &root,
+            "demo",
+            "未定",
+            12,
+            crate::project::ProjectMode::ShortDrama,
+        )
+        .unwrap();
+        let config = root.join("config");
+        fs::create_dir_all(&config).unwrap();
+        let llm = Arc::new(LlmClient::new(novelx_llm::LlmConfig::default()));
+        let result = run_continue_batch(
+            &root,
+            &config,
+            BatchContinueOpts {
+                project: "demo".into(),
+                max_chapters: Some(2),
+                ..Default::default()
+            },
+            llm,
+            None,
+        )
+        .await
+        .expect("short_drama batch should run");
+        assert_eq!(result.unit, "集");
+        assert_ne!(result.stopped_reason, "short_drama_no_batch");
+        assert!(
+            result.chapters_attempted >= 1 || result.results.iter().any(|r| r.blocked),
+            "batch should attempt at least one unit or block at a gate: {result:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1196,6 +1390,30 @@ mod tests {
             build_batch_revise_instructions(&run, false, true, false, &budget);
         assert!(force_full, "timeline hard rule should force full rewrite");
         assert!(instr.contains("整章"));
+    }
+
+    #[test]
+    fn body_state_hard_rule_forces_full_rewrite() {
+        let mut run = sample_run();
+        run.message = "身体状态板侧别冲突".into();
+        run.content_rule_blocked = true;
+        run.content_rule_violations = vec![novelx_harness::ContentRuleViolation {
+            rule: "body_state_side".into(),
+            message: "侧别冲突".into(),
+            blocking: true,
+        }];
+        let budget = ChapterBudget::load_from_config_root(std::path::Path::new("config"));
+        let (instr, force_full) =
+            build_batch_revise_instructions(&run, false, true, false, &budget);
+        assert!(force_full, "body_state_side should force full rewrite");
+        assert!(
+            instr.contains("状态板") || instr.contains("整章"),
+            "expected body/full plan wording: {instr}"
+        );
+        assert!(
+            !instr.contains("只改违规句，勿整章重写"),
+            "must not keep local-only hard-rule wording: {instr}"
+        );
     }
 
     #[test]

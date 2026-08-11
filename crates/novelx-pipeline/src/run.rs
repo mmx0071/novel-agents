@@ -10,6 +10,7 @@ use novelx_harness::{
     consistency_human_option_labels, merge_verify_audit, normalize_consistency_issues,
     on_consistency_result, on_pacing_result, with_issue_ids, should_publish,
     ChapterBudget, GateDecision, HandlerKind, LengthAssessment, NamingRules, PipelineConfig,
+    ScriptShapeConfig,
 };
 use novelx_llm::LlmClient;
 use novelx_skills::{build_skill_injections, load_skills, SkillScope};
@@ -171,6 +172,10 @@ pub enum PipelineEvent {
     AutoFixStarted { reason: String },
     /// Batch continue banner / chapter outcome (tool-card progress).
     BatchProgress { message: String },
+    /// Progressive Codex-style checklist (batch write, multi-step jobs).
+    TodoList {
+        todos: Vec<novelx_protocol::TodoItem>,
+    },
     RunCompleted { run_id: String, message: String },
     Error { message: String },
 }
@@ -360,9 +365,10 @@ fn normalize_unit_body_best_effort(
     project_dir: &Path,
     unit: u32,
     text: &str,
+    script_shape: &ScriptShapeConfig,
 ) -> (String, Vec<String>) {
     if crate::project::is_short_drama(project_dir) {
-        normalize_script_best_effort(unit, text)
+        normalize_script_best_effort(unit, text, script_shape)
     } else {
         normalize_draft_best_effort(unit, text)
     }
@@ -372,9 +378,10 @@ fn validate_unit_body(
     project_dir: &Path,
     unit: u32,
     text: &str,
+    script_shape: &ScriptShapeConfig,
 ) -> Result<String, crate::schemas::SchemaError> {
     if crate::project::is_short_drama(project_dir) {
-        validate_script(unit, text)
+        validate_script(unit, text, script_shape)
     } else {
         validate_draft(unit, text)
     }
@@ -520,6 +527,7 @@ pub async fn execute_pipeline_with_steps(
     let mode_key = project_mode.as_str();
     let short_drama = project_mode == crate::project::ProjectMode::ShortDrama;
     let chapter_budget = ChapterBudget::load_for_mode(config_root, mode_key);
+    let script_shape = ScriptShapeConfig::load_from_config_root(config_root);
     let pipe = PipelineConfig::load_for_mode(config_root, mode_key);
 
     let mut draft = existing_draft.clone();
@@ -764,7 +772,12 @@ pub async fn execute_pipeline_with_steps(
                     .unwrap_or(draft);
                 }
                 // Save-first: never discard a non-empty generation on schema mismatch.
-                let (shaped, mut shape_issues) = normalize_unit_body_best_effort(&project_dir, chapter, &draft);
+                let (shaped, mut shape_issues) = normalize_unit_body_best_effort(
+                    &project_dir,
+                    chapter,
+                    &draft,
+                    &script_shape,
+                );
                 if shaped.trim().is_empty() {
                     anyhow::bail!("writer 产出为空，无法保留");
                 }
@@ -784,8 +797,12 @@ pub async fn execute_pipeline_with_steps(
                     match run_draft_shape_fix(&llm, chapter, &draft, &shape_issues, &tx).await
                     {
                         Ok(fixed) => {
-                            let (again, issues2) =
-                                normalize_draft_best_effort(chapter, &fixed);
+                            let (again, issues2) = normalize_unit_body_best_effort(
+                                &project_dir,
+                                chapter,
+                                &fixed,
+                                &script_shape,
+                            );
                             if !again.trim().is_empty() {
                                 draft = again;
                                 write_chapter_draft(&project_dir, chapter, &draft)?;
@@ -803,7 +820,9 @@ pub async fn execute_pipeline_with_steps(
                 }
 
                 if shape_issues.is_empty() {
-                    if let Ok(ok) = validate_unit_body(&project_dir, chapter, &draft) {
+                    if let Ok(ok) =
+                        validate_unit_body(&project_dir, chapter, &draft, &script_shape)
+                    {
                         draft = ok;
                         write_chapter_draft(&project_dir, chapter, &draft)?;
                     }
@@ -1624,7 +1643,7 @@ pub async fn execute_pipeline_with_steps(
     // Final shape gate: specialists / AutoFix may drop title — coerce then hard-block.
     if allow_publish && !draft.trim().is_empty() {
         let (shaped, shape_issues) = if short_drama {
-            normalize_script_best_effort(chapter, &draft)
+            normalize_script_best_effort(chapter, &draft, &script_shape)
         } else {
             normalize_draft_best_effort(chapter, &draft)
         };
@@ -1633,7 +1652,7 @@ pub async fn execute_pipeline_with_steps(
             let _ = write_chapter_draft(&project_dir, chapter, &draft);
         }
         let shape_err = if short_drama {
-            validate_script(chapter, &draft).err()
+            validate_script(chapter, &draft, &script_shape).err()
         } else {
             validate_draft(chapter, &draft).err()
         };

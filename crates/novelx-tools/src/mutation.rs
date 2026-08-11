@@ -16,6 +16,16 @@ pub fn wants_apply(args: &Value) -> bool {
     args.get("apply").and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
+/// Bool from JSON bool or gate-template string `"true"` / `"1"`.
+pub fn json_bool_arg(args: &Value, key: &str) -> Option<bool> {
+    args.get(key).and_then(|v| {
+        v.as_bool().or_else(|| {
+            v.as_str()
+                .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        })
+    })
+}
+
 /// Human gate already confirmed intent (e.g. chapter_order → continue_writing).
 /// Skips a second mutation confirm card; still subject to hard gates.
 pub fn confirm_skipped(args: &Value) -> bool {

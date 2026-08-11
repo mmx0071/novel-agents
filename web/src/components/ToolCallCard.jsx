@@ -1,47 +1,59 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   formatArgsSummary,
   getBulkReadNav,
   isBulkContextTool,
 } from './toolMarkup'
 import { toolLabelZh, toolVerbZh } from './toolLabels'
+import ToolProgressList from './ToolProgressList'
+import { parseToolProgress, summarizeToolProgress } from '../toolProgress.js'
 
 /**
- * Codex-like tool cell.
- * Bulk-read tools show「正在阅读《书》」+ clickable jumps (世界观 / 第N章·正文 …).
- * Pipeline tools auto-scroll their output pane as steps append.
+ * Codex/Cursor-like tool cell.
+ * Pipeline tools lift ▶/✓ streams into a nested step list (not a raw wall of text).
  */
-export default function ToolCallCard({ item, project, onReaderJump }) {
+export default function ToolCallCard({
+  item,
+  project,
+  onReaderJump,
+  omitQueueProgress = false,
+  compact = false,
+  /** When To-dos own micro steps, hide this tool's structured progress entirely. */
+  hideStructuredProgress = false,
+}) {
   const status = normalizeStatus(item.status)
   const bulk = isBulkContextTool(item.name)
   const nav = bulk
     ? getBulkReadNav(item.name, item.arguments, item.output, project)
     : null
-  // Always allow a body while running — otherwise mid-tool turns only show a
-  // header spinner and the "回合 N" separator looks like the only activity.
+  const parsed = useMemo(
+    () => (bulk
+      ? { entries: [], structured: false }
+      : parseToolProgress(item.output, { omitQueue: omitQueueProgress })),
+    [bulk, item.output, omitQueueProgress],
+  )
+  const stepSummary = useMemo(
+    () => summarizeToolProgress(parsed.entries),
+    [parsed.entries],
+  )
   const showExpandableBody = !bulk && (
     status === 'in_progress'
     || status === 'failed'
+    || parsed.structured
     || !!(item.output || formatArgsSummary(item.arguments))
   )
-  const [open, setOpen] = useState(
-    !bulk
-      && (status === 'in_progress'
-        || status === 'failed'
-        || !!(item.output && String(item.output).length > 80)),
-  )
+  const [open, setOpen] = useState(() => !bulk && status === 'in_progress')
   const outRef = useRef(null)
   const argsSummary = bulk ? '' : formatArgsSummary(item.arguments)
 
-  // Keep open while running so progress stays visible.
   useEffect(() => {
-    if (!bulk && status === 'in_progress') setOpen(true)
+    if (bulk) return
+    setOpen(status === 'in_progress')
   }, [bulk, status])
 
-  // Follow latest ▶ / ✓ lines inside the card — rAF-throttle to avoid layout thrash.
   const scrollRafRef = useRef(0)
   useEffect(() => {
-    if (bulk || !open) return
+    if (bulk || !open || parsed.structured) return
     if (scrollRafRef.current) cancelAnimationFrame(scrollRafRef.current)
     scrollRafRef.current = requestAnimationFrame(() => {
       scrollRafRef.current = 0
@@ -51,7 +63,7 @@ export default function ToolCallCard({ item, project, onReaderJump }) {
     return () => {
       if (scrollRafRef.current) cancelAnimationFrame(scrollRafRef.current)
     }
-  }, [bulk, open, item.output, status])
+  }, [bulk, open, item.output, status, parsed.structured])
 
   const jump = (link) => {
     if (!onReaderJump || !link?.readerTab) return
@@ -62,8 +74,15 @@ export default function ToolCallCard({ item, project, onReaderJump }) {
     })
   }
 
+  // Inside「处理中」work card: structured pipeline = steps only (no 运行中/args/spinner head).
+  const headless = compact && parsed.structured
+  // Todos already render N major tasks + current micro steps — hide host pipeline card.
+  if (hideStructuredProgress) {
+    return null
+  }
+
   return (
-    <div className={`nx-toolcell nx-toolcell-${status}${bulk ? ' nx-toolcell-bulk' : ''}`}>
+    <div className={`nx-toolcell nx-toolcell-${status}${bulk ? ' nx-toolcell-bulk' : ''}${parsed.structured ? ' nx-toolcell-structured' : ''}${compact ? ' nx-toolcell-compact' : ''}${headless ? ' nx-toolcell-headless' : ''}`}>
       {bulk ? (
         <div className="nx-toolcell-head static">
           <span className="nx-toolcell-bullet" aria-hidden="true">
@@ -102,9 +121,9 @@ export default function ToolCallCard({ item, project, onReaderJump }) {
           {item.duration_ms != null && status !== 'in_progress' ? (
             <span className="nx-toolcell-dur">{formatDur(item.duration_ms)}</span>
           ) : null}
-          {status === 'in_progress' ? <span className="nx-toolcell-spin" aria-label="running" /> : null}
+          {status === 'in_progress' ? <span className="nx-toolcell-spin" aria-label="进行中" /> : null}
         </div>
-      ) : (
+      ) : headless ? null : (
         <button
           type="button"
           className="nx-toolcell-head"
@@ -114,23 +133,35 @@ export default function ToolCallCard({ item, project, onReaderJump }) {
           <span className="nx-toolcell-bullet" aria-hidden="true">
             {status === 'completed' ? '✓' : status === 'failed' ? '✕' : '•'}
           </span>
-          <span className="nx-toolcell-verb">{toolVerbZh(status)}</span>
+          {!compact ? (
+            <span className="nx-toolcell-verb">{toolVerbZh(status)}</span>
+          ) : null}
           <span className="nx-toolcell-name">{toolLabelZh(item.name)}</span>
-          {argsSummary ? (
+          {!open && stepSummary ? (
+            <span className="nx-toolcell-args">· {stepSummary}</span>
+          ) : (!compact && argsSummary) ? (
             <span className="nx-toolcell-args">· {argsSummary}</span>
           ) : null}
           {item.duration_ms != null && status !== 'in_progress' ? (
             <span className="nx-toolcell-dur">{formatDur(item.duration_ms)}</span>
           ) : null}
-          {status === 'in_progress' ? <span className="nx-toolcell-spin" aria-label="running" /> : null}
+          {/* Structured pipeline: only the tip step spins (plus outer「处理中」). */}
+          {status === 'in_progress' && !parsed.structured ? (
+            <span className="nx-toolcell-spin" aria-label="进行中" />
+          ) : null}
           {showExpandableBody ? (
             <span className="nx-toolcell-chevron">{open ? '▾' : '▸'}</span>
           ) : null}
         </button>
       )}
-      {open && showExpandableBody && (
+      {(headless || (open && showExpandableBody)) && (
         <div className="nx-toolcell-body">
-          {item.output ? (
+          {parsed.structured ? (
+            <ToolProgressList
+              entries={parsed.entries}
+              live={status === 'in_progress'}
+            />
+          ) : item.output ? (
             <pre className="nx-toolcell-output" ref={outRef}>
               <span className="nx-toolcell-branch">└ </span>
               {item.output}

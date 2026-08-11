@@ -278,7 +278,7 @@ handlers:
 "#;
         let file: PipelineFile = serde_yaml::from_str(yaml).unwrap();
         let p = PipelineConfig {
-            inner: Arc::new(normalize(file)),
+            inner: Arc::new(normalize_for_mode(file, "longform")),
         };
         assert_eq!(
             p.handler_for("dialogue_specialist").unwrap().focus.as_deref(),

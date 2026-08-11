@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
+import { skillLabelZh } from './toolLabels'
 
 const API = '/api'
 
@@ -21,9 +22,9 @@ async function api(path, options = {}) {
 
 const TABS = [
   { id: 'llm', label: '模型' },
-  { id: 'rules', label: '硬规则' },
-  { id: 'naming', label: '禁名' },
-  { id: 'skills', label: '能力包' },
+  { id: 'rules', label: '写作规则' },
+  { id: 'naming', label: '禁用名' },
+  { id: 'skills', label: '写作指南' },
 ]
 
 const EMPTY_LLM = {
@@ -35,7 +36,7 @@ const EMPTY_LLM = {
   retry: { max_retries: 3, base_delay_ms: 800, max_delay_ms: 10000 },
 }
 
-export default function ConfigPanel({ onClose, title = '引擎室' }) {
+export default function ConfigPanel({ onClose, title = '设置' }) {
   const [tab, setTab] = useState('llm')
   const [yaml, setYaml] = useState('')
   const [catalog, setCatalog] = useState([])
@@ -47,6 +48,7 @@ export default function ConfigPanel({ onClose, title = '引擎室' }) {
   const [llm, setLlm] = useState(EMPTY_LLM)
   const [llmRuntime, setLlmRuntime] = useState(null)
   const [apiKeyDraft, setApiKeyDraft] = useState('')
+  const [showAdvanced, setShowAdvanced] = useState(false)
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
@@ -212,7 +214,7 @@ export default function ConfigPanel({ onClose, title = '引擎室' }) {
       setError(data.error || '保存失败')
       return
     }
-    setStatus('已保存并热重载能力包')
+    setStatus('已保存写作指南')
   }
 
   async function saveLlm() {
@@ -263,7 +265,7 @@ export default function ConfigPanel({ onClose, title = '引擎室' }) {
       })
     }
     setLlmRuntime(data.runtime || null)
-    setStatus('已保存并热重载 LLM 配置')
+    setStatus('已保存，新对话将使用新配置')
   }
 
   const activeProvider =
@@ -309,7 +311,7 @@ export default function ConfigPanel({ onClose, title = '引擎室' }) {
             </button>
           ) : null}
         </div>
-        <p className="side-hint">模型、硬规则、禁名与能力包；落盘后热重载。写作台手稿不会被替换。</p>
+        <p className="side-hint">模型、写作规则、禁用名与写作指南。保存后立即生效，不会改掉你已写的正文。</p>
       </div>
 
       <div className="panel-tabs" role="tablist">
@@ -335,17 +337,17 @@ export default function ConfigPanel({ onClose, title = '引擎室' }) {
         <div className="config-body config-llm">
           <div className="config-llm-grid">
             <label className="config-field">
-              <span className="config-label">配置档</span>
+              <span className="config-label">使用方式</span>
               <select
                 value={llm.profile}
                 onChange={(e) => setLlm((p) => ({ ...p, profile: e.target.value }))}
               >
-                <option value="dev">dev（全部用 dev_model）</option>
-                <option value="prod">prod（按任务分模型）</option>
+                <option value="dev">省钱档（各任务共用默认模型）</option>
+                <option value="prod">均衡档（按任务分模型）</option>
               </select>
             </label>
             <label className="config-field">
-              <span className="config-label">dev_model</span>
+              <span className="config-label">默认模型</span>
               <input
                 type="text"
                 value={llm.dev_model}
@@ -354,7 +356,7 @@ export default function ConfigPanel({ onClose, title = '引擎室' }) {
               />
             </label>
             <label className="config-field">
-              <span className="config-label">Provider</span>
+              <span className="config-label">服务商</span>
               <select
                 value={llm.default_provider}
                 onChange={(e) => setLlm((p) => ({ ...p, default_provider: e.target.value }))}
@@ -367,7 +369,7 @@ export default function ConfigPanel({ onClose, title = '引擎室' }) {
               </select>
             </label>
             <label className="config-field">
-              <span className="config-label">Base URL</span>
+              <span className="config-label">接口地址</span>
               <input
                 type="text"
                 value={activeProvider?.base_url || ''}
@@ -378,108 +380,114 @@ export default function ConfigPanel({ onClose, title = '引擎室' }) {
             </label>
             <label className="config-field config-field-wide">
               <span className="config-label">
-                API Key <span className="config-muted-inline">（{keyStatusLabel} · 只写不读）</span>
+                API 密钥 <span className="config-muted-inline">（{keyStatusLabel} · 只写不读）</span>
               </span>
               <input
                 type="password"
                 value={apiKeyDraft}
                 onChange={(e) => setApiKeyDraft(e.target.value)}
-                placeholder="粘贴新 Key（留空则不修改）"
+                placeholder="粘贴新密钥（留空则不修改）"
                 autoComplete="new-password"
                 spellCheck={false}
               />
             </label>
           </div>
 
-          <div className="config-llm-section">
-            <div className="config-label">任务模型</div>
-            <div className="config-task-table">
-              <div className="config-task-head">
-                <span>任务</span>
-                <span>模型</span>
-                <span>max_tokens</span>
-              </div>
-              {llm.tasks.map((t, i) => (
-                <div key={t.name} className="config-task-row">
-                  <div className="config-task-name" title={t.description || t.name}>
-                    {t.name}
-                  </div>
-                  <input
-                    type="text"
-                    value={t.model}
-                    onChange={(e) => updateTask(i, { model: e.target.value })}
-                    autoComplete="off"
-                    spellCheck={false}
-                  />
-                  <input
-                    type="number"
-                    min={256}
-                    max={384000}
-                    value={t.max_tokens}
-                    onChange={(e) => updateTask(i, { max_tokens: e.target.value })}
-                  />
-                </div>
-              ))}
-            </div>
-          </div>
-
-          <div className="config-llm-grid config-llm-retry">
-            <label className="config-field">
-              <span className="config-label">max_retries</span>
-              <input
-                type="number"
-                min={0}
-                max={8}
-                value={llm.retry.max_retries}
-                onChange={(e) =>
-                  setLlm((p) => ({
-                    ...p,
-                    retry: { ...p.retry, max_retries: e.target.value },
-                  }))
-                }
-              />
-            </label>
-            <label className="config-field">
-              <span className="config-label">base_delay_ms</span>
-              <input
-                type="number"
-                min={100}
-                value={llm.retry.base_delay_ms}
-                onChange={(e) =>
-                  setLlm((p) => ({
-                    ...p,
-                    retry: { ...p.retry, base_delay_ms: e.target.value },
-                  }))
-                }
-              />
-            </label>
-            <label className="config-field">
-              <span className="config-label">max_delay_ms</span>
-              <input
-                type="number"
-                min={100}
-                value={llm.retry.max_delay_ms}
-                onChange={(e) =>
-                  setLlm((p) => ({
-                    ...p,
-                    retry: { ...p.retry, max_delay_ms: e.target.value },
-                  }))
-                }
-              />
-            </label>
-          </div>
-
           {llmRuntime ? (
             <div className="config-muted">
-              运行时：{llmRuntime.default_model}
-              {llmRuntime.api_key_env ? ` · env=${llmRuntime.api_key_env}` : ''}
+              当前默认模型：{llmRuntime.default_model}
               {llmRuntime.has_api_key
                 ? llmRuntime.api_key_suffix
-                  ? ` · Key ·•••${llmRuntime.api_key_suffix}`
-                  : ' · Key 已配置'
-                : ' · Key 未配置'}
+                  ? ` · 密钥已配置（尾号 ${llmRuntime.api_key_suffix}）`
+                  : ' · 密钥已配置'
+                : ' · 尚未配置密钥'}
             </div>
           ) : null}
+
+          <details
+            className="config-advanced"
+            open={showAdvanced}
+            onToggle={(e) => setShowAdvanced(e.target.open)}
+          >
+            <summary>高级：分任务模型与重试</summary>
+            <div className="config-llm-section">
+              <div className="config-label">任务模型</div>
+              <div className="config-task-table">
+                <div className="config-task-head">
+                  <span>任务</span>
+                  <span>模型</span>
+                  <span>长度上限</span>
+                </div>
+                {llm.tasks.map((t, i) => (
+                  <div key={t.name} className="config-task-row">
+                    <div className="config-task-name" title={t.description || t.name}>
+                      {t.name}
+                    </div>
+                    <input
+                      type="text"
+                      value={t.model}
+                      onChange={(e) => updateTask(i, { model: e.target.value })}
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+                    <input
+                      type="number"
+                      min={256}
+                      max={384000}
+                      value={t.max_tokens}
+                      onChange={(e) => updateTask(i, { max_tokens: e.target.value })}
+                    />
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="config-llm-grid config-llm-retry">
+              <label className="config-field">
+                <span className="config-label">失败重试次数</span>
+                <input
+                  type="number"
+                  min={0}
+                  max={8}
+                  value={llm.retry.max_retries}
+                  onChange={(e) =>
+                    setLlm((p) => ({
+                      ...p,
+                      retry: { ...p.retry, max_retries: e.target.value },
+                    }))
+                  }
+                />
+              </label>
+              <label className="config-field">
+                <span className="config-label">重试间隔（毫秒）</span>
+                <input
+                  type="number"
+                  min={100}
+                  value={llm.retry.base_delay_ms}
+                  onChange={(e) =>
+                    setLlm((p) => ({
+                      ...p,
+                      retry: { ...p.retry, base_delay_ms: e.target.value },
+                    }))
+                  }
+                />
+              </label>
+              <label className="config-field">
+                <span className="config-label">最长等待（毫秒）</span>
+                <input
+                  type="number"
+                  min={100}
+                  value={llm.retry.max_delay_ms}
+                  onChange={(e) =>
+                    setLlm((p) => ({
+                      ...p,
+                      retry: { ...p.retry, max_delay_ms: e.target.value },
+                    }))
+                  }
+                />
+              </label>
+            </div>
+          </details>
 
           <div className="config-actions">
             <button type="button" onClick={loadLlm} disabled={loading || saving}>
@@ -500,7 +508,7 @@ export default function ConfigPanel({ onClose, title = '引擎室' }) {
       {tab === 'rules' && (
         <div className="config-body">
           <p className="config-muted">
-            点击「启用/关闭」或「阻断/警告」会立即保存。关闭=不再扫描；警告=仅提示、不阻断发布。
+            点击开关会立即保存。「拦发布」=不合规则不能发布；「仅提醒」=仍可发布。
           </p>
           <ul className="config-rule-list">
             {catalog.map((r) => (
@@ -522,9 +530,9 @@ export default function ConfigPanel({ onClose, title = '引擎室' }) {
                       className={`config-flag-btn ${r.blocking ? 'block' : 'warn'}`}
                       disabled={saving || !r.enabled}
                       onClick={() => toggleRuleFlag(r.id, { blocking: !r.blocking })}
-                      title="阻断=不发布；警告=仅提示仍可发布"
+                      title="开启后：不合规则则不能发布；关闭则只提醒仍可发布"
                     >
-                      {r.blocking ? '阻断' : '警告'}
+                      {r.blocking ? '拦发布' : '仅提醒'}
                     </button>
                   </span>
                 </div>
@@ -532,49 +540,55 @@ export default function ConfigPanel({ onClose, title = '引擎室' }) {
               </li>
             ))}
           </ul>
-          <label className="config-label" htmlFor="content-rules-yaml">content_rules.yaml</label>
-          <textarea
-            id="content-rules-yaml"
-            className="config-editor"
-            value={yaml}
-            onChange={(e) => setYaml(e.target.value)}
-            spellCheck={false}
-          />
-          <div className="config-actions">
-            <button type="button" onClick={loadRules} disabled={loading || saving}>刷新</button>
-            <button
-              type="button"
-              className="primary"
-              onClick={() => saveYaml('/config/content_rules')}
-              disabled={loading || saving}
-            >
-              {saving ? '保存中…' : '保存'}
-            </button>
-          </div>
+          <details className="config-advanced">
+            <summary>高级：规则原文（一般不用改）</summary>
+            <label className="config-label" htmlFor="content-rules-yaml">规则原文</label>
+            <textarea
+              id="content-rules-yaml"
+              className="config-editor"
+              value={yaml}
+              onChange={(e) => setYaml(e.target.value)}
+              spellCheck={false}
+            />
+            <div className="config-actions">
+              <button type="button" onClick={loadRules} disabled={loading || saving}>刷新</button>
+              <button
+                type="button"
+                className="primary"
+                onClick={() => saveYaml('/config/content_rules')}
+                disabled={loading || saving}
+              >
+                {saving ? '保存中…' : '保存原文'}
+              </button>
+            </div>
+          </details>
         </div>
       )}
 
       {tab === 'naming' && (
         <div className="config-body">
-          <label className="config-label" htmlFor="naming-rules-yaml">naming_rules.yaml</label>
-          <textarea
-            id="naming-rules-yaml"
-            className="config-editor"
-            value={yaml}
-            onChange={(e) => setYaml(e.target.value)}
-            spellCheck={false}
-          />
-          <div className="config-actions">
-            <button type="button" onClick={loadNaming} disabled={loading || saving}>刷新</button>
-            <button
-              type="button"
-              className="primary"
-              onClick={() => saveYaml('/config/naming_rules')}
-              disabled={loading || saving}
-            >
-              {saving ? '保存中…' : '保存'}
-            </button>
-          </div>
+          <details className="config-advanced" open>
+            <summary>禁用名列表（高级原文）</summary>
+            <label className="config-label" htmlFor="naming-rules-yaml">禁用名原文</label>
+            <textarea
+              id="naming-rules-yaml"
+              className="config-editor"
+              value={yaml}
+              onChange={(e) => setYaml(e.target.value)}
+              spellCheck={false}
+            />
+            <div className="config-actions">
+              <button type="button" onClick={loadNaming} disabled={loading || saving}>刷新</button>
+              <button
+                type="button"
+                className="primary"
+                onClick={() => saveYaml('/config/naming_rules')}
+                disabled={loading || saving}
+              >
+                {saving ? '保存中…' : '保存'}
+              </button>
+            </div>
+          </details>
         </div>
       )}
 
@@ -589,17 +603,16 @@ export default function ConfigPanel({ onClose, title = '引擎室' }) {
                 onClick={() => setSkillName(s.name)}
                 title={s.description}
               >
-                <span className="config-skill-name">{s.name}</span>
-                <span className="config-skill-scope">{s.scope}</span>
+                <span className="config-skill-name">{skillLabelZh(s.name, s.description)}</span>
+                <span className="config-skill-scope">{s.scope === 'project' ? '本书' : '通用'}</span>
               </button>
             ))}
           </div>
           <div className="config-skill-editor">
             {skillMeta ? (
               <div className="config-muted">
-                {skillMeta.path}
-                {skillMeta.description ? ` · ${skillMeta.description}` : ''}
-                {!skillEditable ? ' · 只读（项目能力包）' : ''}
+                {skillMeta.description || skillLabelZh(skillName)}
+                {!skillEditable ? ' · 只读（本书自带）' : ''}
               </div>
             ) : null}
             <textarea
@@ -608,7 +621,7 @@ export default function ConfigPanel({ onClose, title = '引擎室' }) {
               onChange={(e) => setSkillContent(e.target.value)}
               spellCheck={false}
               disabled={!skillEditable}
-              aria-label="能力包正文"
+              aria-label="写作指南正文"
             />
             <div className="config-actions">
               <button type="button" onClick={() => loadSkill(skillName)} disabled={loading || saving}>

@@ -98,6 +98,9 @@ pub fn build_system_prompt(parts: SystemPromptParts<'_>) -> (String, SkillRender
              字数太少/扩写/重写/修正章节必须调用 revise_chapter，禁止用 audit_chapter 代替写章。\n\
              整卷复盘（审这一卷/卷末复盘）必须调用 audit_volume（摘要层），不要默认 audit_chapters 扫整卷。\n\
              审校多章（如1-8章）或「按建议深审」必须调用 audit_chapters（可用 chapters 列表），禁止同轮多次 audit_chapter。\n\
+             递进式多步任务（多章审阅、批写、卷交接等多步）应维护 Codex 式 To-dos：列出清单 → 逐项执行 → 完成一项勾掉一项；\
+             审阅队列：一致性通过后自动审下一章；评审团/修订复审必须走 audit_chapters continue（勿只用 audit_chapter）；\
+             队列未结束时禁止对用户说「继续创作/审完了」。\n\
              单章审校用 audit_chapter。通过（含仅有 P1/P2）→ 勿称未通过、勿伪造审批卡；用户要改则 revise_chapter。\
              未通过 → 立即 offer_decisions（按 issue_id 给出修某条/修全部阻断/接受等），不要只给「按审校局部修订」。\
              禁止在正文里自拟编号审批卡；决策卡只经 offer_decisions / 服务端 open_gate。",

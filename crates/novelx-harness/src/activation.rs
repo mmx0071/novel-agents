@@ -45,7 +45,14 @@ struct AgentsFile {
 #[derive(Debug, Deserialize)]
 struct AgentEntry {
     #[serde(default)]
+    tier: Option<String>,
+    #[serde(default)]
     activation: Vec<ActivationRule>,
+    /// Dead field — order comes from `pipeline.yaml`. Accepted only so stale YAML
+    /// still parses; never used for scheduling.
+    #[serde(default)]
+    #[allow(dead_code)]
+    depends_on: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,6 +73,9 @@ pub struct ActivationSuggestion {
 }
 
 /// Evaluate activation rules; any matching condition yields a suggestion.
+///
+/// Skips `tier: mvp` and agents listed in `pipeline.mvp` — those are always
+/// considered via [`resolve_pipeline_agents`], not activation suggestions.
 pub fn evaluate_activation(
     config_root: &Path,
     signals: &ActivationSignals,
@@ -77,9 +87,17 @@ pub fn evaluate_activation(
     let Ok(file) = serde_yaml::from_str::<AgentsFile>(&text) else {
         return Vec::new();
     };
+    let mvp: HashSet<String> = PipelineConfig::load(config_root)
+        .mvp()
+        .iter()
+        .cloned()
+        .collect();
 
     let mut out = Vec::new();
     for (id, entry) in file.agents {
+        if entry.tier.as_deref() == Some("mvp") || mvp.contains(&id) {
+            continue;
+        }
         for rule in &entry.activation {
             if condition_matches(rule, signals) {
                 out.push(ActivationSuggestion {
@@ -714,6 +732,103 @@ mod tests {
         let got3 = resolve_pipeline_agents_filtered(&pinned, &pipe, &[], Some(&quiet));
         assert!(got3.iter().any(|a| a == "dialogue_specialist"));
         assert!(got3.iter().any(|a| a == "scene_specialist"));
+    }
+
+    #[test]
+    fn evaluate_skips_mvp_tier_and_pipeline_mvp() {
+        let root = std::env::temp_dir().join(format!(
+            "novelx-act-mvp-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_micros()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("agents.yaml"),
+            r#"
+agents:
+  pacing_reviewer:
+    tier: mvp
+    activation:
+      - condition: word_count_gt
+        threshold: 1
+        reason: should-skip
+  lore_librarian:
+    tier: mvp
+    activation:
+      - condition: entity_count_gt
+        threshold: 0
+        reason: should-skip
+  literary_editor:
+    tier: extended
+    activation:
+      - condition: audit_fail_rate_gt
+        threshold: 0.1
+        reason: keep
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("pipeline.yaml"),
+            r#"
+version: 1
+order: [writer, pacing_reviewer, literary_editor]
+mvp: [writer, pacing_reviewer]
+handlers: {}
+"#,
+        )
+        .unwrap();
+        let sig = ActivationSignals {
+            draft_chars: 9000,
+            entity_count: 50,
+            audit_fail_rate: 0.5,
+            ..Default::default()
+        };
+        let got = evaluate_activation(&root, &sig);
+        assert!(
+            !got.iter().any(|s| s.agent == "pacing_reviewer" || s.agent == "lore_librarian"),
+            "mvp must not emit activation suggestions: {got:?}"
+        );
+        assert!(
+            got.iter().any(|s| s.agent == "literary_editor"),
+            "extended activation should still fire: {got:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn repo_agents_yaml_has_no_depends_on() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config");
+        let path = root.join("agents.yaml");
+        if !path.exists() {
+            return;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let raw: serde_yaml::Value = serde_yaml::from_str(&text).expect("agents.yaml parse");
+        let agents = raw
+            .get("agents")
+            .and_then(|v| v.as_mapping())
+            .expect("agents map");
+        for (key, entry) in agents {
+            let id = key.as_str().unwrap_or("?");
+            if let Some(map) = entry.as_mapping() {
+                assert!(
+                    !map.contains_key(serde_yaml::Value::String("depends_on".into())),
+                    "agent {id} must not declare depends_on; order lives in pipeline.yaml"
+                );
+            }
+        }
+        let file: AgentsFile = serde_yaml::from_str(&text).expect("agents.yaml typed parse");
+        for (id, entry) in &file.agents {
+            if entry.tier.as_deref() == Some("mvp") {
+                assert!(
+                    entry.activation.is_empty(),
+                    "mvp agent {id} must not list activation rules"
+                );
+            }
+        }
     }
 
     #[test]

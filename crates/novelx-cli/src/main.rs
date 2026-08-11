@@ -53,12 +53,18 @@ enum Commands {
         /// Stop after publishing this chapter (batch); falls back to target_chapters
         #[arg(long)]
         until_chapter: Option<u32>,
-        /// Skip mid-volume audit soft gate (batch)
+        /// Skip mid-volume audit soft gate (batch; also default via unattended.yaml)
         #[arg(long)]
         skip_volume_audit: bool,
-        /// Skip expected-events review gate (batch)
+        /// Skip expected-events review gate (batch; also default via unattended.yaml)
         #[arg(long)]
         skip_expected: bool,
+        /// Skip foreshadow pressure_high soft stop (batch; also default via unattended.yaml)
+        #[arg(long)]
+        skip_foreshadow: bool,
+        /// Keep soft gates on batch (disable unattended soft-skip defaults)
+        #[arg(long)]
+        respect_soft_gates: bool,
         /// Disable one-shot auto length revise in batch
         #[arg(long)]
         no_auto_length_revise: bool,
@@ -155,6 +161,8 @@ async fn main() -> Result<()> {
             until_chapter,
             skip_volume_audit,
             skip_expected,
+            skip_foreshadow,
+            respect_soft_gates,
             no_auto_length_revise,
         } => {
             let llm_cfg = load_llm_config(&config.join("llm.yaml"))?;
@@ -172,6 +180,8 @@ async fn main() -> Result<()> {
                         until_chapter,
                         confirm_skip_volume_audit: skip_volume_audit,
                         confirm_skip_expected: skip_expected,
+                        confirm_skip_foreshadow: skip_foreshadow,
+                        respect_soft_gates,
                         auto_length_revise: !no_auto_length_revise,
                     },
                     llm,

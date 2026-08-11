@@ -59,6 +59,8 @@ async fn dispatch_one(
     match op {
         Op::InterruptTurn { turn_id, .. } => {
             core.set_abort(thread_id, true).await;
+            // SubAgent: surface Interrupted lifecycle + unblock wait_agent.
+            core.mark_subagent_interrupted(thread_id).await;
             // Clear only the interrupted turn — never wipe a newer turn that already
             // claimed the gate after abort was set.
             if let Some(id) = turn_id.as_deref() {

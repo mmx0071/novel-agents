@@ -49,11 +49,12 @@ novel-agents/
 CLI / Web → Op::UserInput (Submission)
   → submission_loop → steer | RegularTask
   → run_turn (sample ↔ tools)
-  → continue_writing 等工具按 config/pipeline.yaml 的 order
-       spawn_agent(role) + wait_agent
+  → continue_writing / revise / audit
+       → run_pipeline_streaming → execute_pipeline（按 pipeline.yaml order，进程内）
+  → spawn_agent 仅单步专精 / 只读旁路（禁止 mode=continue|revise|audit_only 整章路径）
 ```
 
-写作 Agent（writer 等）是 **可 spawn 的 SubAgent Thread**，不是独立对等 UI。
+写作角色（writer 等）在主路径里是 **流水线步骤**（UI 进度行），不是每步一个 SubAgent 线程。SubAgent 用于隔离可观测的单步专精，不是并行加速串行修正。
 
 ## 快速开始
 

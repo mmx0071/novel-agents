@@ -41,7 +41,7 @@ impl FeatureFlags {
         m.insert("studio.pause_after_clean_write".into(), false);
         m.insert("studio.stream_reasoning".into(), true);
         m.insert("studio.clear_history_on_new_chapter".into(), true);
-        m.insert("studio.auto_reaudit_after_steer".into(), true);
+        m.insert("studio.auto_reaudit_after_steer".into(), false);
         m.insert("studio.reject_weak_ui_turns".into(), true);
         m.insert("studio.enforce_setup_gate".into(), true);
         m.insert("studio.enforce_volume_phase".into(), true);
@@ -57,10 +57,13 @@ impl FeatureFlags {
         m.insert("pipeline.auto_split_hard_long".into(), true);
         m.insert("studio.require_volume_audit_mid".into(), true);
         m.insert("studio.require_volume_audit_handoff".into(), true);
+        // Batch / council auto-continue default-skip soft gates (unattended.yaml).
+        m.insert("studio.unattended_soft_skip".into(), true);
         m.insert("studio.cold_archive_drafts".into(), true);
         // Append-only decision/execution audit trail under .novelx/ops_journal.jsonl.
         m.insert("studio.ops_journal".into(), true);
         m.insert("studio.decision_council".into(), false);
+        m.insert("studio.revise_plan".into(), true);
         m.insert("studio.seal_on_chapter_pass".into(), true);
         Self { map: Arc::new(m) }
     }
@@ -166,6 +169,14 @@ impl FeatureFlags {
         self.enabled("studio.decision_council")
     }
 
+    /// Deterministic RevisePlan before steer_run revise (local|full by type/hard gate).
+    pub fn revise_plan(&self) -> bool {
+        self.map
+            .get("studio.revise_plan")
+            .copied()
+            .unwrap_or(true)
+    }
+
     /// Seal Studio chat after a chapter passes (before N+1).
     pub fn seal_on_chapter_pass(&self) -> bool {
         self.map
@@ -200,5 +211,15 @@ mod tests {
         let d = FeatureFlags::defaults();
         assert!(d.mutation_severity_policy());
         assert!(d.version_nodes());
+    }
+
+    #[test]
+    fn unattended_soft_skip_defaults_on() {
+        // Disk-backed reads use UnattendedPolicy::soft_skip_enabled; map default stays aligned.
+        assert!(FeatureFlags::defaults().enabled("studio.unattended_soft_skip"));
+        let off = FeatureFlags {
+            map: Arc::new(HashMap::from([("studio.unattended_soft_skip".into(), false)])),
+        };
+        assert!(!off.enabled("studio.unattended_soft_skip"));
     }
 }

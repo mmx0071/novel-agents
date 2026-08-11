@@ -25,16 +25,15 @@ impact_scan_mode: indexed
 batch_max_chapters: 20
 
 # Max auto-revise attempts per chapter in batch (hard rules / consistency / length).
-batch_max_auto_revise: 2
+batch_max_auto_revise: 1
 
 # Soft-short streak: when consecutive SoftShort publishes would reach this,
 # the current SoftShort blocks publish (force expand). See chapter.yaml hard min.
 soft_short_auto_revise_after: 3
 
-# Pause batch when *pressure* foreshadow debt exceeds this. 0 = off.
-# Pressure ≠ total dangling: fresh plants (within grace) and far-horizon lines
-# do not block recent-chapter publishing. See foreshadow_debt below.
-# Temporarily 0 for miwenlu continue-write (pressure 52 > 40). Re-enable after batch.
+# ForeshadowPhase: pressure > this → pressure_high (batch soft-stop; single-chapter advise only).
+# 0 = off (phase stays clear). Unattended may skip via unattended.yaml skip_foreshadow_pressure.
+# Pressure ≠ total dangling: fresh (within grace) and far-horizon do not count. See foreshadow_debt.
 batch_max_dangling_foreshadow: 0
 
 # Debt tiers (age = current_chapter − planted_chapter).

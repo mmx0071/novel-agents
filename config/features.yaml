@@ -12,7 +12,9 @@ features:
   # Clear prior chat when continue_writing actually starts (plot gate Allow; keep current turn).
   studio.clear_history_on_new_chapter: true
   # After steer_run revise, auto re-audit (queue continue or audit_chapter).
-  studio.auto_reaudit_after_steer: true
+  # Human steer revise: do not force re-audit (avoids revise→audit→revise thrash).
+  # Decision Council path still re-audits after its own auto-steer.
+  studio.auto_reaudit_after_steer: false
   # Reject weak client ui_turns snapshots that wipe a richer server timeline.
   studio.reject_weak_ui_turns: true
   # After design_arc_outline leaves setup awaiting_confirm, auto-offer RequestUserInput;
@@ -54,6 +56,10 @@ features:
   studio.require_volume_audit_mid: true
   # Block sync_volume until this volume has an audit_volume report (or confirm_skip).
   studio.require_volume_audit_handoff: true
+  # Unattended paths (batch / council auto-continue) default-skip soft gates in
+  # config/unattended.yaml (mid volume audit + expected-events review). Hard gates unchanged.
+  # Set false or pass respect_soft_gates=true to keep soft gates on those paths.
+  studio.unattended_soft_skip: true
   # When true, completed-volume drafts may be gzip-archived off the hot path.
   studio.cold_archive_drafts: true
   # Append-only decision/execution audit trail at projects/<name>/.novelx/ops_journal.jsonl
@@ -62,6 +68,9 @@ features:
   # Decision Council: auto-resolve content-audit FAIL via multi-ballot scoring;
   # escalate only on deadlock / infra / max retries.
   studio.decision_council: true
+  # Before steer_run revise: deterministic RevisePlan (local|full) from P0 types + hard gates.
+  # Off → legacy issue_ids-only local revise. See decision_council.yaml → revise_plan.
+  studio.revise_plan: true
   # After a chapter passes (clean publish): seal Studio chat so N+1 does not carry
   # chapter-N creation-process messages. Complements clear_history_on_new_chapter.
   studio.seal_on_chapter_pass: true

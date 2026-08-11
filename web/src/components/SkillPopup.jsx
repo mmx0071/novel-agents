@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef } from 'react'
+import { skillLabelZh } from './toolLabels'
 
 export default function SkillPopup({
   open,
@@ -12,8 +13,10 @@ export default function SkillPopup({
     return (skills || [])
       .filter((s) => {
         if (!q) return true
+        const label = skillLabelZh(s.name).toLowerCase()
         return (
           s.name.toLowerCase().includes(q)
+          || label.includes(q)
           || (s.description || '').toLowerCase().includes(q)
         )
       })
@@ -33,10 +36,10 @@ export default function SkillPopup({
   if (!open) return null
 
   return (
-    <div className="nx-skill-popup" ref={ref} role="listbox" aria-label="能力列表">
-      <div className="nx-skill-popup-hint">能力 · 选中后插入 $name</div>
+    <div className="nx-skill-popup" ref={ref} role="listbox" aria-label="常用动作">
+      <div className="nx-skill-popup-hint">常用动作 · 选中后插入到输入框</div>
       {list.length === 0 ? (
-        <div className="nx-skill-empty">无匹配能力</div>
+        <div className="nx-skill-empty">没有匹配的动作</div>
       ) : (
         list.map((s) => (
           <button
@@ -45,7 +48,7 @@ export default function SkillPopup({
             className="nx-skill-item"
             onClick={() => onPick(s)}
           >
-            <span className="nx-skill-name">${s.name}</span>
+            <span className="nx-skill-name">{skillLabelZh(s.name)}</span>
             <span className="nx-skill-desc">{s.description}</span>
           </button>
         ))

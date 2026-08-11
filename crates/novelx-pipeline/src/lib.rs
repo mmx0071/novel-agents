@@ -32,6 +32,8 @@ pub mod cost_log;
 pub mod version_nodes;
 pub mod volume_audit_gate;
 pub mod volume_checklist;
+pub mod volume_qa;
+pub mod foreshadow_phase;
 
 pub use cards::{
     collect_entity_gaps, detect_location_parent, entity_names_equivalent, entity_status_is_active,
@@ -40,7 +42,8 @@ pub use cards::{
     resolve_entity_card_path, resolve_location_write_target, MarkdownCard,
 };
 pub use batch::{
-    run_continue_batch, BatchChapterResult, BatchContinueOpts, BatchContinueResult,
+    apply_unattended_batch_policy, run_continue_batch, BatchChapterResult, BatchContinueOpts,
+    BatchContinueResult,
 };
 pub use body_state::{
     check_body_state_conflicts, check_body_state_locus_conflicts, check_body_state_side_conflicts,
@@ -145,8 +148,17 @@ pub use volume_audit::{
     run_volume_audit, volume_audit_report_path, volume_has_audit_report, VolumeAuditReport,
 };
 pub use volume_audit_gate::{
-    check_volume_audit_for_continue, check_volume_audit_for_sync, find_config_root,
-    mid_audit_threshold_resolved, thick_volume_threshold_resolved, VolumeAuditGateBlock,
+    check_volume_audit_for_continue, check_volume_audit_for_continue_ex,
+    check_volume_audit_for_sync, find_config_root, mid_audit_threshold_resolved,
+    thick_volume_threshold_resolved, VolumeAuditGateBlock,
+};
+pub use volume_qa::{
+    clear_volume_qa_mid_due, mark_volume_qa_mid_skipped, resolve_volume_qa_phase,
+    set_volume_qa_phase, VolumeQaPhase,
+};
+pub use foreshadow_phase::{
+    foreshadow_batch_block_message, foreshadow_phase_advice, resolve_foreshadow_phase,
+    set_foreshadow_phase, ForeshadowPhase, ForeshadowPhaseSnapshot,
 };
 pub use volume_checklist::{
     run_volume_memory_checklist, ChecklistItem, VolumeMemoryChecklist,

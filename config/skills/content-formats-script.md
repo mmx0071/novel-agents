@@ -58,12 +58,16 @@ VO：旁白（可选）
 【钩子】下一集必须接住的悬念一句
 ```
 
-硬规则：
+硬规则（形状门 `validate_script`，违反则拦发布）：
 
 1. 首行必须是 `# 第N集 …`（N 与目录号一致）
 2. 至少 2 个 `## 场` 节
-3. 必须有 `【钩子】` 行（可在文末）
-4. 正文（标题行后）字数门见 `config/script.yaml`，**不是** chapter.yaml 的 4500+
+3. **每个「## 场」节至少一条 `【画面】`**；全文 `【画面】` 条数门槛见 `config/script.yaml`（默认每场≥1 且总数≥2）
+4. 必须有 `【钩子】` 行（可在文末）
+5. 标题禁止代码围栏（\`\`\`）与 `markdown` 字样；勿写「第N集 · 章 · …」（normalize 会剥「章」噪音，但仍应直接写对）
+6. 正文（标题行后）字数门见 `config/script.yaml`，**不是** chapter.yaml 的 4500+
+
+无 `【画面】` 的散文剧本、或缺场画面的半剧本，**不能发布**。
 
 ## 系列总纲（`series_outline.md` / `master_outline.md`）
 
@@ -76,6 +80,6 @@ VO：旁白（可选）
 
 ## 与长篇差异（勿混用）
 
-- 不用 `chapters/`、`volume_phase`、`sync_volume`、`continue_writing_batch`、`split_chapter`
+- 不用 `chapters/`、`volume_phase`、`sync_volume`、`split_chapter`；连写用 `continue_writing_batch`（写 `episodes/`）
 - 定稿不要求卷纲；总纲用系列大纲即可
 - Web 阅读区展示 `script.md`，不是长篇散文 draft

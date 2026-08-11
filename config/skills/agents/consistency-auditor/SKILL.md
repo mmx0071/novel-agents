@@ -52,6 +52,8 @@ description: 以细读方式检查人物、时间线、设定与章间钩子一�
 - 仅「倒计时读数偏少 / 时间压缩感」而无回跳互斥 → 不得 `TIMELINE`+`P0`
 - 仅「写得略糊 / 建议强化」而无前后矛盾 → 不得 `ABILITY_LOC`+`P0`
 - 已锁定伤势用颤抖/冷汗/握力等**症状承接**且未写反侧、未默默愈合 → 不得 `INJURY`+`P0`（未再点名左右 ≠ 矛盾）
+- **复审 / 同章再审**：勿因 quote 微调把已标过的同类 TIMELINE/INJURY/CONTINUITY 再开一条新 P0；无新增硬互斥则降为 P1 或省略。系统会按 `revise_plan` 对 TIMELINE/INJURY/CONTINUITY/`body_state_*` 升整章档——勿靠反复局部 P0 空转催修
+- 一句略跳接 / 压缩叙事已能读通 → 不得 `CONTINUITY`+`P0`
 
 有任意真正的 `P0` 时必须 `passed=false`。  
 **仅有 P1/P2 时：`passed=true`**。  
