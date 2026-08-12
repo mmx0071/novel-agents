@@ -31,8 +31,9 @@ cd web && npm install && npm run dev
 一键重启（编译 + 启动）：
 
 ```bash
-./scripts/restart.sh          # macOS / Linux
-./scripts/restart.sh --quick  # 不重新编译
+./scripts/restart.sh              # macOS / Linux（默认后台 daemon，日志 .novelx/web.log）
+./scripts/restart.sh --quick      # 不重新编译
+./scripts/restart.sh --foreground # 前台运行
 ```
 
 ```powershell

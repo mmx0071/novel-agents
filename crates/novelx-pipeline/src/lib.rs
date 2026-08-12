@@ -130,10 +130,10 @@ pub use schemas::{
 };
 pub use run::{
     apply_cached_local_patches, execute_pipeline, execute_pipeline_with_steps,
-    execute_single_agent_step, finalize_chapter_publish, needs_full_rewrite,
-    plan_local_revision_preview, plan_steps_for_mode, steer_revision_options, LocalPatchPreviewItem,
-    LocalRevisionPreview, PipelineEvent, PipelineRun, PipelineStep, PublishFinalizeResult,
-    RevisionOptions, RunMode,
+    execute_single_agent_step, finalize_chapter_publish, looks_like_revision_instruction_leak,
+    needs_full_rewrite, plan_full_revision_preview, plan_local_revision_preview, plan_steps_for_mode,
+    steer_revision_options, LocalPatchPreviewItem, LocalRevisionPreview, PipelineEvent, PipelineRun,
+    PipelineStep, PublishFinalizeResult, RevisionOptions, RunMode,
 };
 pub use volume::{
     active_volume_for_chapter, arc_outline_path, bound_for_volume, evaluate_volume_end,

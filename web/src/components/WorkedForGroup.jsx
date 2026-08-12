@@ -15,7 +15,8 @@ import { buildTodoTasks } from '../todoTasks.js'
 /**
  * Cursor-like hierarchy:
  *   ▾ 待办 4/20 · …
- *       ✓ / ● rows (+ micro steps / gate under current)
+ *       ✓ / ● / ○ rows (+ micro under current)
+ *       [选项卡] after the checklist when awaiting a choice
  *   ▾ 进行中… / 用时 1 分 24 秒
  */
 export default function WorkedForGroup({

@@ -1,12 +1,14 @@
 //! Situational next-step gates via Studio `offer_decisions(kind=studio_next)`.
 
 use crate::studio_next::{
-    contextual_fallback_options, studio_next_nudge, validate_studio_next_options,
-    AwaitingStudioNext, PendingStudioNext, StudioNextContext, StudioNextOption,
+    contextual_fallback_options, mutation_fallback_options, studio_next_nudge,
+    validate_studio_next_options, AwaitingStudioNext, PendingStudioNext, StudioNextContext,
+    StudioNextOption,
 };
 use crate::ui_sync::{attach_ui_approval, strip_ui_approvals};
 use crate::{PendingSettingBlocker, PlotWriteGateAction, NovelxCore};
 use anyhow::Result;
+use novelx_pipeline::project_dir;
 use novelx_protocol::{new_id, EventMsg, ItemStatus, TurnItem, UserInputOption};
 use serde_json::{json, Value};
 
@@ -206,13 +208,15 @@ impl NovelxCore {
         let Some(awaiting) = awaiting else {
             return Ok(false);
         };
-        let (prompt_prefix, mut options) =
-            contextual_fallback_options(&awaiting.project, &awaiting.context);
-        // Generic/mutation: prefer gates.yaml labels when present.
-        if matches!(
-            awaiting.context,
-            StudioNextContext::Mutation { .. } | StudioNextContext::Generic
-        ) {
+        let dir = project_dir(&self.roots.projects_root, &awaiting.project);
+        let (prompt_prefix, mut options) = match &awaiting.context {
+            StudioNextContext::Mutation { apply_tool } if dir.is_dir() => {
+                mutation_fallback_options(&awaiting.project, &dir, apply_tool)
+            }
+            other => contextual_fallback_options(&awaiting.project, other),
+        };
+        // Generic only: YAML「继续推进 / 稍后」last resort (never override Mutation).
+        if matches!(awaiting.context, StudioNextContext::Generic) {
             let fb = self.gates.studio_next_fallback_options();
             if !fb.is_empty() {
                 options = fb
@@ -240,6 +244,9 @@ impl NovelxCore {
             return Ok(false);
         }
         let prompt = if awaiting.reason.is_empty() {
+            prompt_prefix
+        } else if prompt_prefix.contains("本轮小结") {
+            // Disk-aware mutation prompt already carries summary + recommendation.
             prompt_prefix
         } else {
             format!("{} {}", awaiting.reason, prompt_prefix)

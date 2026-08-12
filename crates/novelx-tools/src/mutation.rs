@@ -12,6 +12,41 @@ pub fn mutation_confirm_enabled(config_root: &Path) -> bool {
     novelx_pipeline::PhaseEnforceFlags::load(config_root).mutation_confirm
 }
 
+/// `studio.agent_auto_apply_mutations` — Agent may skip human「应用修改」cards.
+/// Read from disk each call so ConfigPanel toggles apply without process restart.
+pub fn agent_auto_apply_enabled(config_root: &Path) -> bool {
+    feature_flag(config_root, "studio.agent_auto_apply_mutations", false)
+}
+
+fn feature_flag(config_root: &Path, key: &str, default: bool) -> bool {
+    let path = config_root.join("features.yaml");
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return default;
+    };
+    #[derive(serde::Deserialize)]
+    struct FeaturesFile {
+        #[serde(default)]
+        features: std::collections::HashMap<String, bool>,
+    }
+    serde_yaml::from_str::<FeaturesFile>(&raw)
+        .ok()
+        .and_then(|f| f.features.get(key).copied())
+        .unwrap_or(default)
+}
+
+/// Irreversible / restore ops always need a human card, even with agent auto-apply.
+pub fn always_require_human_confirm(kind: &str) -> bool {
+    matches!(
+        kind,
+        "delete_entity" | "restore_version_node"
+    )
+}
+
+/// True when this mutation kind should self-confirm (no human card).
+pub fn agent_may_auto_apply(config_root: &Path, kind: &str) -> bool {
+    agent_auto_apply_enabled(config_root) && !always_require_human_confirm(kind)
+}
+
 pub fn wants_apply(args: &Value) -> bool {
     args.get("apply").and_then(|v| v.as_bool()).unwrap_or(false)
 }
@@ -81,6 +116,81 @@ fn preview_has_text_diffs(preview: &Value) -> bool {
         .is_some_and(|a| !a.is_empty())
 }
 
+/// Max lines kept on each side of a hunk (keeps confirm cards readable).
+const HUNK_LINE_CAP: usize = 48;
+
+/// Attach `diffs` + full documents so the writing desk can render inline −/+ at real positions.
+pub fn with_text_diff(mut preview: Value, before: &str, after: &str) -> Value {
+    let diffs = text_hunk_diffs(before, after);
+    if let Some(obj) = preview.as_object_mut() {
+        obj.insert("diffs".into(), diffs);
+        obj.insert("before_full".into(), Value::String(before.to_string()));
+        obj.insert("after_full".into(), Value::String(after.to_string()));
+    }
+    preview
+}
+
+/// Git-style line hunks for mutation confirm: `{ before, after }` per changed region.
+/// Strips common prefix/suffix lines; empty before → pure additions (green +).
+pub fn text_hunk_diffs(before: &str, after: &str) -> Value {
+    if before == after {
+        return json!([]);
+    }
+    let bl: Vec<&str> = before.lines().collect();
+    let al: Vec<&str> = after.lines().collect();
+    let mut pre = 0usize;
+    while pre < bl.len() && pre < al.len() && bl[pre] == al[pre] {
+        pre += 1;
+    }
+    let mut suf = 0usize;
+    while suf < bl.len().saturating_sub(pre)
+        && suf < al.len().saturating_sub(pre)
+        && bl[bl.len() - 1 - suf] == al[al.len() - 1 - suf]
+    {
+        suf += 1;
+    }
+    // Only the changed mid slice — do NOT pad shared context into before/after.
+    // Context lines in both sides were rendered as false −/+ pairs in chat cards.
+    let b_changed_end = bl.len() - suf;
+    let a_changed_end = al.len() - suf;
+    let b_slice = if pre < b_changed_end {
+        &bl[pre..b_changed_end]
+    } else {
+        &[][..]
+    };
+    let a_slice = if pre < a_changed_end {
+        &al[pre..a_changed_end]
+    } else {
+        &[][..]
+    };
+    let (b_text, b_trunc) = join_capped(b_slice, HUNK_LINE_CAP);
+    let (a_text, a_trunc) = join_capped(a_slice, HUNK_LINE_CAP);
+    let mut before_out = b_text;
+    let mut after_out = a_text;
+    if b_trunc {
+        before_out.push_str("\n…（后续删减已省略）");
+    }
+    if a_trunc {
+        after_out.push_str("\n…（后续新增已省略）");
+    }
+    json!([{
+        "before": before_out,
+        "after": after_out,
+        "start_para": 1,
+        "end_para": 1,
+    }])
+}
+
+fn join_capped(lines: &[&str], cap: usize) -> (String, bool) {
+    if lines.is_empty() {
+        return (String::new(), false);
+    }
+    if lines.len() <= cap {
+        return (lines.join("\n"), false);
+    }
+    (lines[..cap].join("\n"), true)
+}
+
 /// Build a confirm-required tool result (no disk write).
 pub fn preview_mutation(
     kind: &str,
@@ -96,10 +206,13 @@ pub fn preview_mutation(
     }
     let output = if preview_has_text_diffs(&preview) {
         format!(
-            "⏸ 修订预览：{summary}\n\n请对照原文与修订（写作台「修订对照」或聊天 diff 卡），确认后选「应用修改」落盘，或「放弃」。"
+            "⏸ 修订预览：{summary}\n\n\
+             绿 + 为新增，红 − 为删减（同 git）。选「应用修改」写入磁盘，「取消变更」丢弃本次预览。"
         )
     } else {
-        format!("⏸ 待确认：{summary}\n\n请查看预览后选「应用修改」落盘，或「放弃」。")
+        format!(
+            "⏸ 待确认：{summary}\n\n请查看预览后选「应用修改」落盘，或「取消变更」退回。"
+        )
     };
     ToolResult {
         output,
@@ -138,6 +251,10 @@ pub fn maybe_preview(
     if is_routine_self_confirm(config_root, kind) {
         return None;
     }
+    // Agent auto-apply (连写/无人值守)：可自行落盘，跳过「应用修改」卡。
+    if agent_may_auto_apply(config_root, kind) {
+        return None;
+    }
     if apply_without_mutation_id(config_root, args) {
         return Some(reject_apply_without_id());
     }
@@ -163,6 +280,9 @@ pub fn will_write_without_preview(config_root: &Path, kind: &str, args: &Value) 
     if !mutation_confirm_enabled(config_root) {
         return true;
     }
+    if agent_may_auto_apply(config_root, kind) {
+        return true;
+    }
     is_routine_self_confirm(config_root, kind)
 }
 
@@ -172,7 +292,7 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn preview_with_diffs_mentions_desk_diff() {
+    fn preview_with_diffs_mentions_git_style() {
         let r = preview_mutation(
             "revise_local",
             "第1章局部修订（1 处）",
@@ -183,7 +303,8 @@ mod tests {
             json!({ "project": "sample-novel", "chapter": 1 }),
         );
         assert!(r.output.contains("修订预览"));
-        assert!(r.output.contains("修订对照") || r.output.contains("diff"));
+        assert!(r.output.contains("绿 +") || r.output.contains("git"));
+        assert!(r.output.contains("取消变更"));
         assert!(!r.output.starts_with("⏸ 待确认："));
     }
 
@@ -197,7 +318,42 @@ mod tests {
             json!({ "project": "sample-novel" }),
         );
         assert!(r.output.starts_with("⏸ 待确认："));
-        assert!(!r.output.contains("写作台「修订对照」"));
+        assert!(r.output.contains("取消变更"));
+    }
+
+    #[test]
+    fn text_hunk_diffs_highlights_changed_middle() {
+        let before = "a\nb\nold line\nc\n";
+        let after = "a\nb\nnew line with 如曼德拉去世\nc\n";
+        let diffs = text_hunk_diffs(before, after);
+        let arr = diffs.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        let b = arr[0]["before"].as_str().unwrap();
+        let a = arr[0]["after"].as_str().unwrap();
+        assert!(b.contains("old line"), "{b}");
+        assert!(a.contains("如曼德拉去世"), "{a}");
+        assert!(!b.contains("如曼德拉去世"), "{b}");
+    }
+
+    #[test]
+    fn text_hunk_diffs_empty_before_is_addition() {
+        let diffs = text_hunk_diffs("", "# 世界观\n\n## 0. x\n");
+        let arr = diffs.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["before"].as_str().unwrap(), "");
+        assert!(arr[0]["after"].as_str().unwrap().contains("世界观"));
+    }
+
+    #[test]
+    fn text_hunk_diffs_pure_mid_insert_has_no_false_context_minus() {
+        let before = "a\nb\nc\n";
+        let after = "a\nb\nNEW section\nc\n";
+        let diffs = text_hunk_diffs(before, after);
+        let arr = diffs.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        // Must not put shared context line "b" into before (was rendered as false −).
+        assert_eq!(arr[0]["before"].as_str().unwrap(), "");
+        assert_eq!(arr[0]["after"].as_str().unwrap(), "NEW section");
     }
 
     #[test]
@@ -228,6 +384,60 @@ mod tests {
             json!({}),
             "continue_writing",
             json!({"project": "demo"}),
+        )
+        .is_none());
+        assert!(maybe_preview(
+            &dir,
+            &args,
+            "delete_entity",
+            "删卡",
+            json!({}),
+            "delete_entity",
+            json!({"project": "demo"}),
+        )
+        .is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agent_auto_apply_skips_content_preview_keeps_delete() {
+        let dir = std::env::temp_dir().join(format!(
+            "novelx-mut-auto-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut feat = std::fs::File::create(dir.join("features.yaml")).unwrap();
+        write!(
+            feat,
+            "version: 1\nfeatures:\n  studio.require_mutation_confirm: true\n  studio.mutation_severity_policy: true\n  studio.agent_auto_apply_mutations: true\n"
+        )
+        .unwrap();
+        let mut pol = std::fs::File::create(dir.join("mutation_policy.yaml")).unwrap();
+        write!(
+            pol,
+            "version: 1\nmode: severity\nhigh_tools: [upsert_setting, delete_entity, revise_chapter]\nroutine_tools: [continue_writing]\n"
+        )
+        .unwrap();
+        let args = json!({});
+        assert!(agent_auto_apply_enabled(&dir));
+        assert!(maybe_preview(
+            &dir,
+            &args,
+            "upsert_setting",
+            "Bible",
+            json!({"diffs":[{"before":"a","after":"b"}]}),
+            "upsert_setting",
+            json!({"project": "demo"}),
+        )
+        .is_none());
+        assert!(maybe_preview(
+            &dir,
+            &args,
+            "revise_chapter",
+            "修订",
+            json!({}),
+            "revise_chapter",
+            json!({"project": "demo", "chapter": 1}),
         )
         .is_none());
         assert!(maybe_preview(

@@ -2011,6 +2011,43 @@ async fn run_writer(
     budget: &ChapterBudget,
     content_rules: &ContentRulesConfig,
 ) -> Result<(String, bool)> {
+    run_writer_ex(
+        llm,
+        skill,
+        state,
+        chapter,
+        project_dir,
+        outline,
+        existing_draft,
+        revision,
+        prefer_local,
+        tx,
+        canon,
+        naming_block,
+        budget,
+        content_rules,
+        true,
+    )
+    .await
+}
+
+async fn run_writer_ex(
+    llm: &LlmClient,
+    skill: &str,
+    state: &ProjectState,
+    chapter: u32,
+    project_dir: &Path,
+    outline: &str,
+    existing_draft: &str,
+    revision: &RevisionOptions,
+    prefer_local: bool,
+    tx: &Option<mpsc::UnboundedSender<PipelineEvent>>,
+    canon: &str,
+    naming_block: &str,
+    budget: &ChapterBudget,
+    content_rules: &ContentRulesConfig,
+    flush_draft: bool,
+) -> Result<(String, bool)> {
     let revision_mode = revision.revision_mode
         || !existing_draft.is_empty()
             && (prefer_local || revision.user_instructions.is_some() || !revision.audit_issues.is_empty());
@@ -2103,6 +2140,7 @@ async fn run_writer(
             budget,
             tx,
             content_rules,
+            flush_draft,
         )
         .await?;
         return Ok((draft, false));
@@ -2124,6 +2162,7 @@ async fn run_writer(
             budget,
             tx,
             content_rules,
+            flush_draft,
         )
         .await?;
         return Ok((draft, false));
@@ -2459,6 +2498,7 @@ async fn revise_full(
     budget: &ChapterBudget,
     tx: &Option<mpsc::UnboundedSender<PipelineEvent>>,
     content_rules: &ContentRulesConfig,
+    flush_draft: bool,
 ) -> Result<String> {
     let instr = revision
         .user_instructions
@@ -2478,8 +2518,16 @@ async fn revise_full(
          {naming_block}\n\n{canon}\n\n# 章纲\n{outline}\n\n# 现有正文\n{draft}",
         state.name
     );
-    // Codex-like stream into ToolCallOutputDelta + intermittent draft.md for reader.
+    // Live pipeline: stream into reader. Preview path keeps disk untouched.
     let model = llm.model_for_agent("writer");
+    let sink = if flush_draft {
+        Some(DraftFlushSink {
+            project_dir: project_dir.to_path_buf(),
+            chapter,
+        })
+    } else {
+        None
+    };
     let rewritten = stream_agent_llm(
         llm,
         skill,
@@ -2488,10 +2536,7 @@ async fn revise_full(
         "writer",
         tx,
         true,
-        Some(DraftFlushSink {
-            project_dir: project_dir.to_path_buf(),
-            chapter,
-        }),
+        sink,
     )
     .await?;
     let rewritten = scrub_writer_draft(rewritten, content_rules);
@@ -4071,6 +4116,116 @@ pub async fn plan_local_revision_preview(
     })
 }
 
+/// Run Writer LLM for a full-chapter rewrite preview without writing `draft.md`.
+/// Result is cached as `__full_draft__` for the mutation confirm apply step.
+pub async fn plan_full_revision_preview(
+    projects_root: &Path,
+    config_root: &Path,
+    project: &str,
+    chapter: u32,
+    mut revision: RevisionOptions,
+    llm: Arc<LlmClient>,
+    tx: Option<mpsc::UnboundedSender<PipelineEvent>>,
+) -> Result<LocalRevisionPreview> {
+    revision.prefer_local_patch = false;
+    revision.revision_mode = true;
+    let project_dir = projects_root.join(project);
+    let existing = read_chapter_draft(&project_dir, chapter).unwrap_or_default();
+    if existing.trim().is_empty() {
+        anyhow::bail!("第{chapter}章无正文，无法规划整章修订");
+    }
+    let state = load_project_state(&project_dir)?;
+    let outline = read_chapter_outline(&project_dir, chapter).unwrap_or_default();
+    let skill_outcome = load_skills(&[
+        (SkillScope::Studio, config_root.join("skills")),
+        (SkillScope::Agent, config_root.join("skills/agents")),
+    ]);
+    let skill_body = load_agent_skill_body(&skill_outcome.skills, "writer");
+    let naming = NamingRules::load_from_config_root(config_root);
+    let naming_block = naming.prompt_block();
+    let content_rules = ContentRulesConfig::load_from_config_root(config_root);
+    let mode_key = crate::project::resolve_project_mode(&project_dir).as_str();
+    let chapter_budget = ChapterBudget::load_for_mode(config_root, mode_key);
+    let script_shape = ScriptShapeConfig::load_from_config_root(config_root);
+    let pack = build_chapter_context(
+        &project_dir,
+        chapter,
+        &existing,
+        &outline,
+        ContextProfile::Full,
+    );
+    if let Some(tx) = &tx {
+        let _ = tx.send(PipelineEvent::StepStarted {
+            agent: "writer".into(),
+        });
+        let _ = tx.send(PipelineEvent::LlmDelta {
+            agent: "writer".into(),
+            delta: format!("（整章修订预览：第{chapter}章，不落盘）\n"),
+        });
+    }
+    let (draft_after, _) = run_writer_ex(
+        llm.as_ref(),
+        &skill_body,
+        &state,
+        chapter,
+        &project_dir,
+        &outline,
+        &existing,
+        &revision,
+        false,
+        &tx,
+        &pack.markdown,
+        &naming_block,
+        &chapter_budget,
+        &content_rules,
+        false,
+    )
+    .await?;
+    let (shaped, _) =
+        normalize_unit_body_best_effort(&project_dir, chapter, &draft_after, &script_shape);
+    if shaped.trim().is_empty() {
+        anyhow::bail!("整章修订预览产出为空");
+    }
+    if shaped == existing {
+        anyhow::bail!("整章修订未产生有效差异");
+    }
+    // Refuse instruction-leak placeholders (legacy bug: instructions pasted as after).
+    if looks_like_revision_instruction_leak(&shaped) {
+        anyhow::bail!("整章修订预览疑似指令文本而非正文，已拒绝出卡");
+    }
+    if let Some(tx) = &tx {
+        let _ = tx.send(PipelineEvent::StepCompleted {
+            agent: "writer".into(),
+            summary: format!("预览已生成（{} 字）", shaped.chars().count()),
+        });
+    }
+    let summary = format!(
+        "## 整章修订预览\n第{chapter}章全文重写对照（尚未写入磁盘）。确认「应用修改」后落盘。"
+    );
+    Ok(LocalRevisionPreview {
+        patches: vec![LocalPatchPreviewItem {
+            start_para: 0,
+            end_para: 0,
+            before: existing,
+            after: shaped,
+            instruction: "__full_draft__".into(),
+        }],
+        summary_markdown: summary,
+    })
+}
+
+/// True when model (or legacy preview) returned rewrite *instructions* instead of prose.
+pub fn looks_like_revision_instruction_leak(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    t.contains("（确认后按指令全文重写")
+        || t.contains("确认后按指令修订")
+        || (t.starts_with("指令：") && t.contains("整章修订"))
+        || (t.contains("非局部补丁") && t.contains("id=fp-") && !t.contains("\n\n# 第"))
+}
+
 /// Apply cached local patches from confirm step (uses `__full_draft__` if present).
 pub fn apply_cached_local_patches(
     projects_root: &Path,
@@ -4171,6 +4326,23 @@ fn append_drift_sample(project_dir: &Path, chapter: u32) -> anyhow::Result<()> {
         .open(path)?;
     writeln!(f, "{}", serde_json::to_string(&line)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod instruction_leak_tests {
+    use super::looks_like_revision_instruction_leak;
+
+    #[test]
+    fn detects_legacy_instruction_placeholder() {
+        let fake = "（确认后按指令全文重写第2章）\n指令：整章修订（非局部补丁）：通读本章\n1. [CONTINUITY] id=fp-abc";
+        assert!(looks_like_revision_instruction_leak(fake));
+    }
+
+    #[test]
+    fn real_chapter_prose_is_not_leak() {
+        let prose = "# 第2章 翕动的涟漪\n\n相纸在掌心下鼓动，像一只被压住的蛾子。\n\n闻喻没有松手。";
+        assert!(!looks_like_revision_instruction_leak(prose));
+    }
 }
 
 #[cfg(test)]

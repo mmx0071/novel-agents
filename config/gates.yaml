@@ -96,8 +96,9 @@ gates:
         aliases: [跳过, 不同步, 稍后, "3"]
 
   # Soft fallback when Studio fails to call offer_decisions(kind=studio_next).
-  # Situational next steps (mutation follow-up, setting BLOCKER, plot/draft/expected/volume_audit)
-  # must come from the model — not hardcoded menus here.
+  # Mutation / setting BLOCKER / plot / draft / expected / volume_audit use
+  # disk-aware contextual options in novelx-core::studio_next; this YAML pair is
+  # only the Generic last resort — not a substitute for situational cards.
   studio_next_fallback:
     options:
       - id: snf_continue
@@ -125,13 +126,13 @@ gates:
   confirm_mutation:
     options:
       - id: cm_apply
-        label: 应用修改
+        label: 全部应用
         resolve: apply_mutation
-        aliases: [应用修改, 应用, 确认修改, 确认, 确定, 应用此修改, 确认定稿, sc_approve, approve]
+        aliases: [全部应用, 应用修改, 应用, 确认修改, 确认, 确定, 应用此修改, 确认定稿, sc_approve, approve]
       - id: cm_discard
-        label: 放弃
+        label: 取消变更
         resolve: discard_mutation
-        aliases: [放弃, 取消, 不要改, sc_revise]
+        aliases: [取消变更, 取消, 放弃, 不要改, sc_revise]
 
   # After mutation apply: cascade revise dependent drafts/outlines/settings.
   confirm_impact:
