@@ -1012,6 +1012,7 @@ export default function App() {
   // 创作状态交通灯：ok 绿 / warn 黄 / bad 红（含相位字段 + 引擎档位）
   const volumeQaPhase = preview?.volume_qa_phase || ''
   const foreshadowPhase = preview?.foreshadow_phase || ''
+  const loopStatus = preview?.loop || null
   const foreshadowLevel = foreshadowHealthLevel(foreshadowDebt, foreshadowPhase)
   const volumeLevel = volumeHealthLevel(volumeHealth, volumeQaPhase)
   const lengthLevel = lengthHealthLevel(lengthHealth)
@@ -2279,7 +2280,7 @@ export default function App() {
       </div>
 
       <CreationStatusBar
-        visible={Boolean(project && (isShortDrama || longformHealth))}
+        visible={Boolean(project && (isShortDrama || longformHealth || loopStatus?.hasJob))}
         isShortDrama={isShortDrama}
         overallLevel={overallHealthLevel}
         foreshadowDebt={foreshadowDebt}
@@ -2288,6 +2289,7 @@ export default function App() {
         volumeLevel={volumeLevel}
         lengthLevel={lengthLevel}
         lengthChip={lengthChip}
+        loopStatus={loopStatus}
         progressLabel={
           novelRecord
             ? `已写 ${novelRecord.published_count || 0} ${isShortDrama ? '集' : '章'}`
@@ -2339,6 +2341,16 @@ export default function App() {
               costTop={costTop}
               publishedCount={publishedCount}
               nextChapter={nextChapter}
+              loopStatus={loopStatus}
+              onArmLoopWake={async () => {
+                if (!project) return
+                try {
+                  await api(`/projects/${project}/loop/arm`, { method: 'POST' })
+                  await fetchNovelPreview(project)
+                } catch (e) {
+                  console.warn('arm loop wake failed', e)
+                }
+              }}
               onOpenEngine={() => {
                 setStatusOpen(false)
                 setEngineOpen(true)

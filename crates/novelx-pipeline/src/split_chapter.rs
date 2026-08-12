@@ -213,14 +213,6 @@ fn cut_body_at_paragraph(body: &str, ratio: f32) -> Result<(String, String, usiz
     Ok((left, right, cut))
 }
 
-/// True when chapter tip draft exists and looks split-worthy vs `word_max`.
-pub fn chapter_looks_overlong(project_dir: &Path, chapter: u32, word_max: u32) -> bool {
-    let Some(draft) = read_chapter_draft(project_dir, chapter) else {
-        return false;
-    };
-    draft_body_chars(&draft) > word_max as usize
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

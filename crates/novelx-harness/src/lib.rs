@@ -1,6 +1,7 @@
 //! Harness: pipeline constants, content rules, review priority, gates.
 
 pub mod activation;
+pub mod agent_catalog;
 pub mod chapter_budget;
 pub mod content_rules;
 pub mod continuity;
@@ -17,6 +18,10 @@ pub mod unattended;
 pub use activation::{
     collect_signals, evaluate_activation, resolve_pipeline_agents, resolve_pipeline_agents_filtered,
     resolve_pipeline_agents_with_tier, ActivationSignals, ActivationSuggestion,
+};
+pub use agent_catalog::{
+    is_spawn_allowed, list_spawnable_agents, load_agent_catalog, lookup_agent, spawn_tools_for_role,
+    subagent_uses_pipeline_step, AgentCatalogEntry, AgentInvocation,
 };
 pub use chapter_budget::{
     consecutive_soft_short_from_meta, set_consecutive_soft_short, ChapterBudget, LengthAssessment,

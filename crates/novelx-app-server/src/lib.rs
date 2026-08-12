@@ -10,7 +10,7 @@ use axum::Router;
 use futures_util::{SinkExt, StreamExt};
 use novelx_core::ops_journal::{self, OpsJournalQuery};
 use novelx_core::NovelxCore;
-use novelx_harness::{ContentRulesConfig, NamingRules, StudioPolicies};
+use novelx_harness::{ContentRulesConfig, LongformConfig, NamingRules, StudioPolicies};
 use novelx_llm::{
     apply_llm_form_to_yaml, load_llm_config, load_llm_form_settings, upsert_dotenv_key,
     validate_llm_form_put, LlmClient, LlmFormPut,
@@ -23,8 +23,8 @@ use novelx_pipeline::project::{
     read_chapter_outline, write_chapter_draft, write_chapter_outline,
 };
 use novelx_pipeline::{
-    format_body_state_board, format_body_state_board_for_character, resolve_setup_phase,
-    resolve_volume_phase,
+    format_body_state_board, format_body_state_board_for_character, loop_status_dto,
+    resolve_setup_phase, resolve_volume_phase,
 };
 use novelx_pipeline::schemas::{
     display_bible, display_chapter_outline, display_draft, display_entity_card,
@@ -111,10 +111,30 @@ pub async fn serve(repo_root: PathBuf, addr: SocketAddr) -> Result<()> {
     }
 
     let state = AppState {
-        core,
+        core: core.clone(),
         repo_root: repo_root.clone(),
         event_bus,
     };
+
+    // Loop Engineering Automations: online wake scanner (no OS cron).
+    {
+        let wake_core = core.clone();
+        tokio::spawn(async move {
+            loop {
+                let interval = LongformConfig::load_from_config_root(wake_core.config_root())
+                    .loop_wake_interval_secs;
+                if interval == 0 {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    continue;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                let n = wake_core.try_auto_wake_project_loops().await;
+                if n > 0 {
+                    info!(woke = n, "loop Automations wake cycle");
+                }
+            }
+        });
+    }
 
     let web_dist = repo_root.join("web/dist");
     let index_html = web_dist.join("index.html");
@@ -157,6 +177,8 @@ pub async fn serve(repo_root: PathBuf, addr: SocketAddr) -> Result<()> {
         .route("/api/library", get(library))
         .route("/api/library/{name}", get(library_one).delete(library_delete))
         .route("/api/projects/{name}/preview", get(preview))
+        .route("/api/projects/{name}/loop", get(project_loop_get))
+        .route("/api/projects/{name}/loop/arm", post(project_loop_arm))
         .route("/api/projects/{name}/content", put(project_content_put))
         .route(
             "/api/projects/{name}/ops_journal",
@@ -1319,6 +1341,7 @@ fn build_preview(repo_root: &std::path::Path, name: &str) -> serde_json::Value {
         "has_arc_outline": has_arc,
         "longform_health": novelx_pipeline::longform_health_snapshot(&dir),
         "cost_by_agent": novelx_pipeline::summarize_cost_by_agent(&dir, 400),
+        "loop": loop_status_dto(&dir),
     })
 }
 
@@ -1426,6 +1449,50 @@ async fn library_one(State(state): State<AppState>, Path(name): Path<String>) ->
 
 async fn preview(State(state): State<AppState>, Path(name): Path<String>) -> impl IntoResponse {
     Json(build_preview(&state.repo_root, &name))
+}
+
+/// Loop Engineering job status (StopContract / 可续写|需处理).
+async fn project_loop_get(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let dir = state.repo_root.join("projects").join(&name);
+    if !dir.is_dir() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("项目「{name}」不存在"),
+            })),
+        )
+            .into_response();
+    }
+    Json(loop_status_dto(&dir)).into_response()
+}
+
+/// Arm one Automations wake after human cleared a blocking gate (does not skip hard gates).
+async fn project_loop_arm(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let dir = state.repo_root.join("projects").join(&name);
+    if !dir.is_dir() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("项目「{name}」不存在"),
+            })),
+        )
+            .into_response();
+    }
+    let armed = state.core.arm_project_loop_wake(&name);
+    Json(serde_json::json!({
+        "ok": true,
+        "armed": armed,
+        "loop": loop_status_dto(&dir),
+    }))
+    .into_response()
 }
 
 #[derive(Debug, Deserialize)]

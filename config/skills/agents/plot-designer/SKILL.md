@@ -44,14 +44,16 @@ description: 在已有卷纲下，为卷内一段情节设计剧情卡；必须�
 
 ## 生命周期（与运行时一致）
 
-状态机：`planned` → `in_progress` → `bridging` → `completed`（可 `abandoned`）。
+主路径：`planned` → `in_progress` → `completed`（可 `abandoned`）。  
+欠衔接时：`completed` → `bridging` → `completed`（`bridge_done: true`）。  
+**不**在收束后自动升 `next_plot`；跨卡须人 `design_plot` + `update_plot(in_progress)`。
 
 | 状态 | 含义 |
 |------|------|
 | `planned` | 已建卡，未开写 |
 | `in_progress` | 当前主推（一卷同时仅一张 **main** 进行中） |
-| `bridging` | 系统正在写至多 1 章衔接（勿人工指定） |
-| `completed` | 本卡主情节落点已兑现 |
+| `completed` | 本卡主情节落点已兑现（可能仍欠衔接） |
+| `bridging` | 落点后系统正在写至多 1 章衔接（勿人工指定） |
 | `abandoned` | 废弃 |
 
 推进靠**收束条件是否兑现**（章末 `plot_acceptor` 验收通过可自动 completed），**不靠章号、不设默认章数**。衔接章**不要用户选择**：你必须在卡上给出 `needs_bridge: true|false`。  

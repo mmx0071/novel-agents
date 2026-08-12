@@ -371,10 +371,6 @@ pub fn post_restore_disk_hooks(project_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn nodes_to_json(nodes: &[VersionNode]) -> Value {
-    json!(nodes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

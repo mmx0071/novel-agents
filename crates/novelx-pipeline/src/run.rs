@@ -180,16 +180,6 @@ pub enum PipelineEvent {
     Error { message: String },
 }
 
-/// Continue steps: MVP + project active + agents.yaml activation suggestions.
-pub fn plan_chapter_steps_with_activation(
-    config_root: &Path,
-    project_dir: &Path,
-    state: &ProjectState,
-    draft: &str,
-) -> Vec<String> {
-    plan_chapter_steps_with_activation_for(config_root, project_dir, state, draft, state.next_chapter.max(1))
-}
-
 /// Plan chapter steps for a specific chapter (activation uses that chapter for lean/arc counts).
 pub fn plan_chapter_steps_with_activation_for(
     config_root: &Path,
@@ -2861,6 +2851,31 @@ async fn run_consistency_auditor(
             format!("一致性审计输出无法解析：\n{}", raw.chars().take(800).collect::<String>())
         },
     ))
+}
+
+/// True when consistency failed only due to empty / unparseable auditor (infra), not prose P0.
+/// Must not treat chapter-number META (or other content META) as infrastructure.
+pub fn is_audit_infra_failure(issues: &[Value], report: &str, message: &str) -> bool {
+    let infra_msg = |msg: &str| {
+        msg.contains("返回为空")
+            || msg.contains("无法解析")
+            || msg.contains("请重试")
+            || msg.contains("一致性审计失败：无输出")
+            || msg.contains("模型返回为空")
+    };
+    if !issues.is_empty() {
+        return issues.iter().all(|i| {
+            let ty = i.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let msg = i.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            ty.eq_ignore_ascii_case("META") && infra_msg(msg)
+        });
+    }
+    infra_msg(report) || infra_msg(message)
+}
+
+pub fn pipeline_run_is_audit_infra(run: &PipelineRun) -> bool {
+    run.consistency_passed == Some(false)
+        && is_audit_infra_failure(&run.issues, &run.report, &run.message)
 }
 
 async fn run_pacing_reviewer(

@@ -123,10 +123,6 @@ pub fn normalize_script_best_effort(
     }
 }
 
-pub fn display_script(text: &str) -> String {
-    normalize_blank_lines(text.trim())
-}
-
 fn count_picture_markers(text: &str) -> usize {
     text.matches("【画面】").count()
 }

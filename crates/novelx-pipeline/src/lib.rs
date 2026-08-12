@@ -2,6 +2,7 @@
 
 pub mod activation_hints;
 pub mod batch;
+pub mod loop_runtime;
 pub mod body_state;
 pub mod cards;
 pub mod chapter_gate;
@@ -44,6 +45,10 @@ pub use cards::{
 pub use batch::{
     apply_unattended_batch_policy, run_continue_batch, BatchChapterResult, BatchContinueOpts,
     BatchContinueResult,
+};
+pub use loop_runtime::{
+    arm_loop_wake_after_human, list_projects_with_loop_jobs, loop_status_dto, opts_from_job,
+    should_auto_wake, LoopEndVerify, LoopJob, LoopJobStatus, StopContract, StopKind,
 };
 pub use body_state::{
     check_body_state_conflicts, check_body_state_locus_conflicts, check_body_state_side_conflicts,
@@ -90,7 +95,7 @@ pub use plots::{
     accept_verdict_is_pass, accept_verdict_is_pass_against, active_plot_exit_context,
     advance_plots_for_published_chapter, check_plot_write_gate, check_plot_write_gate_with,
     complete_active_plot_on_accept, complete_bridging_plots_after_publish,
-    in_progress_plot_missing_exit, ensure_bridge_plot_active, ensure_next_plot_card,
+    in_progress_plot_missing_exit, ensure_bridge_plot_active,
     ensure_plot_card_lifecycle_frontmatter,
     extract_plot_exit_condition, format_plot_progress_report, format_plot_progress_report_for,
     list_plots_summary,
@@ -118,7 +123,7 @@ pub use project::{
 };
 pub use schemas::{
     display_arc_outline, display_bible, display_chapter_outline, display_draft, display_entity_card,
-    display_entity_gaps, display_master_outline, display_plot_card_body, display_script,
+    display_entity_gaps, display_master_outline, display_plot_card_body,
     draft_body_chars, migrate_project_reader_formats, normalize_script_best_effort,
     outline_budget_repair_hint, outline_entity_roster, parse_chapter_outline_text,
     parse_chapter_outline_text_budget, validate_arc_outline, validate_bible,
@@ -130,8 +135,9 @@ pub use schemas::{
 };
 pub use run::{
     apply_cached_local_patches, execute_pipeline, execute_pipeline_with_steps,
-    execute_single_agent_step, finalize_chapter_publish, looks_like_revision_instruction_leak,
-    needs_full_rewrite, plan_full_revision_preview, plan_local_revision_preview, plan_steps_for_mode,
+    execute_single_agent_step, finalize_chapter_publish, is_audit_infra_failure,
+    looks_like_revision_instruction_leak, needs_full_rewrite, pipeline_run_is_audit_infra,
+    plan_full_revision_preview, plan_local_revision_preview, plan_steps_for_mode,
     steer_revision_options, LocalPatchPreviewItem, LocalRevisionPreview, PipelineEvent, PipelineRun,
     PipelineStep, PublishFinalizeResult, RevisionOptions, RunMode,
 };
@@ -200,7 +206,7 @@ pub use setting_pass::{
     run_chapter_setting_pass, run_plot_setting_pass, ChapterSettingPassFlags,
     PlotSettingPassFlags, PlotSettingPassResult,
 };
-pub use split_chapter::{chapter_looks_overlong, split_chapter_draft, SplitChapterResult};
+pub use split_chapter::{split_chapter_draft, SplitChapterResult};
 pub use version_nodes::{
     commit_node, ensure_repo as ensure_version_repo, git_available as version_git_available,
     list_nodes as list_version_nodes, post_restore_disk_hooks,

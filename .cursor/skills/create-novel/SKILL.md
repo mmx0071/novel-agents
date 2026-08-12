@@ -51,10 +51,10 @@ CLI / Web → Op::UserInput (Submission)
   → run_turn (sample ↔ tools)
   → continue_writing / revise / audit
        → run_pipeline_streaming → execute_pipeline（按 pipeline.yaml order，进程内）
-  → spawn_agent 仅单步专精 / 只读旁路（禁止 mode=continue|revise|audit_only 整章路径）
+  → spawn_agent 仅 agents.yaml allow_spawn=true 旁路（禁止 mode=continue|revise|audit_only；禁 spawn writer 等 MVP）
 ```
 
-写作角色（writer 等）在主路径里是 **流水线步骤**（UI 进度行），不是每步一个 SubAgent 线程。SubAgent 用于隔离可观测的单步专精，不是并行加速串行修正。
+写作角色（writer 等）在主路径里是 **流水线步骤**（UI 进度行），不是每步一个 SubAgent 线程。SubAgent 仅用于 `allow_spawn` 旁路（如 literary_editor / material_researcher），目录见 `list_agents(filter=spawnable)`。
 
 ## 快速开始
 

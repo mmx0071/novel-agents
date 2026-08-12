@@ -35,9 +35,7 @@ pub use plot::{
     display_plot_card_body, normalize_plot_card_best_effort, validate_plot_card,
     validate_plot_card_body_edit,
 };
-pub use script::{
-    display_script, normalize_script_best_effort, validate_script, MIN_SCRIPT_BODY_CHARS,
-};
+pub use script::{normalize_script_best_effort, validate_script, MIN_SCRIPT_BODY_CHARS};
 
 /// Fixed entity-gaps reader text (computed list; no on-disk file).
 pub fn display_entity_gaps(gaps: &[String]) -> String {

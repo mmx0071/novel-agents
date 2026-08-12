@@ -27,6 +27,9 @@ pub struct GateOptionSpec {
 
 #[derive(Debug, Clone, Deserialize)]
 struct GateSpec {
+    /// Optional human-facing prompt (e.g. `llm_turn_retry`).
+    #[serde(default)]
+    prompt: Option<String>,
     options: Vec<GateOptionSpec>,
 }
 
@@ -112,6 +115,20 @@ impl GateCatalog {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Optional prompt text from `gates.yaml` (empty if unset).
+    pub fn prompt(&self, gate: &str) -> Option<String> {
+        self.gates
+            .get(gate)
+            .and_then(|g| g.prompt.as_ref())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn resolve_llm_turn_retry(&self, text: &str) -> Option<GateResolve> {
+        self.find_option("llm_turn_retry", text)
+            .and_then(|opt| Self::materialize(opt, &TemplateVars::default()))
     }
 
     /// chapter_next: published → continue (+ batch); blocked → revise;
@@ -830,6 +847,15 @@ mod tests {
                 assert_eq!(args["confirm_memory"], "true");
             }
             _ => panic!("display index 1 must sync + confirm memory"),
+        }
+        assert!(g.prompt("llm_turn_retry").is_some());
+        match g.resolve_llm_turn_retry("再试一次").unwrap() {
+            GateResolve::Tool { name, .. } => assert_eq!(name, "__retry_llm_turn"),
+            _ => panic!("expected __retry_llm_turn"),
+        }
+        match g.resolve_llm_turn_retry("ltr_end").unwrap() {
+            GateResolve::Tool { name, .. } => assert_eq!(name, "__dismiss_llm_turn"),
+            _ => panic!("expected __dismiss_llm_turn"),
         }
     }
 }

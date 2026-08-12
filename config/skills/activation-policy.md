@@ -9,6 +9,19 @@ Harness 范式：`agents.yaml` 中的 `activation` 条件产生**建议**；本�
 > 说明：当前实现**没有**独立 Orchestrator LLM 输出 `pipeline` JSON 再执行；顺序以 `pipeline.yaml` 为准。  
 > **勿写 `depends_on`**（运行时不读）；**`tier: mvp` 勿挂 `activation`**（evaluate 会跳过，纳入只靠 `pipeline.mvp`）。
 
+## 调用面（`agents.yaml` → `invocation` / `allow_spawn`）
+
+| invocation | 含义 | allow_spawn |
+|------------|------|-------------|
+| `orchestration` | Studio 根会话 | 永不 |
+| `pipeline` | 章/集流水线步骤（进程内） | 默认 false；仅 `literary_editor` 可为 true（点名单步可观测） |
+| `domain_tool` | Studio 专用工具主路径 | 默认 false；`material_researcher` / `setting_auditor` 可为 true（长上下文隔离） |
+| `in_process` | 确定性逻辑（非 LLM SubAgent） | 永不（`lore_librarian`、`decision_council`） |
+
+- **热路径专改**靠 activation / `activate_agents` 进 `pipeline.yaml` order，**不要**每章 `spawn_agent`。
+- **整章**永远用 `continue_writing` / `revise_chapter` / `audit_*`，禁止 spawn `writer` 等 MVP。
+- 可委派目录：`list_agents(filter=spawnable)`。
+
 ## MVP 核心 Agent（`pipeline.yaml` → `mvp`，每章通常包含）
 
 | ID | 职责 |
@@ -62,12 +75,13 @@ chapter_planner → lore_librarian → writer
 | dialogue_specialist | 对话密集 |
 | scene_specialist | 场景/动作高潮 |
 | foreshadow_tracker | 未收束伏笔；或已发布 >10 章（lean：无未收时奇数章跳过） |
-| literary_editor | **非 MVP**。规则建议或 Studio `activate_agents`；用户点名润色时持久激活，勿每章必跑。即时润色优先 `revise_chapter`；可选 `spawn_agent` 单步可观测（勿带整章 pipeline `mode`） |
-| master_planner / arc_planner | 尚无总纲/卷纲 |
+| literary_editor | **非 MVP**（`allow_spawn=true`）。规则建议或 Studio `activate_agents`；用户点名润色时持久激活，勿每章必跑。即时润色优先 `revise_chapter`；可选 `spawn_agent` 单步可观测（勿带整章 pipeline `mode`） |
+| master_planner / arc_planner | 尚无总纲/卷纲（`domain_tool`，禁 spawn） |
 | expectation_reviewer | **不进章流水线**。由 Studio `review_expected_events` 在硬条件满足时调用；用户决策纳入/跳过 |
-| volume_auditor | **不进章流水线**。Studio `audit_volume` 摘要层复盘 + 建议深审章；深审再走 `audit_chapters` |
+| volume_auditor | **不进章流水线**。Studio `audit_volume`（禁 spawn，避免双路径） |
+| setting_auditor | **不进章流水线**。主路径 `audit_setting`；深挖可 `spawn_agent`（`allow_spawn=true`） |
 | decision_council | **不进章流水线**。内容审校 FAIL 时**确定性 in-process** 聚合票（`decision_council.yaml`）；不 spawn SubAgent |
-| material_researcher | **不进章流水线**。仅剧情枯竭 / 需灵感时 `research_materials`；产出参考卡非 Canon；可走只读旁路 spawn |
+| material_researcher | **不进章流水线**。主路径 `research_materials`；长检索可 `spawn_agent`（`allow_spawn=true`）；产出参考卡非 Canon |
 
 共享短文：`prose-pitfalls`（正文硬雷区）、`content-formats`（落盘格式）、`volume-lifecycle`（卷相位/衔接章）由运行时按 Agent 白名单前缀注入；勿在各 SKILL 内复制长文。
 
@@ -83,6 +97,8 @@ chapter_planner → lore_librarian → writer
 **审校已通过**（即使报告有 P1/P2）**不弹**审校门控；用户要改走 `revise_chapter`。
 
 **无人值守**（`continue_writing_batch` / 评审团 `chapter_next_clean`）：默认按 `config/unattended.yaml` 跳过**软相位**——`volume_qa_phase=mid_due`、预期检阅、`foreshadow_phase=pressure_high`；硬门（setup / volume 交接 / 章序 / 剧情门 / 一致性 P0 / 字数硬门 / 草稿形状 / 卷末 sync 前 handoff 审）仍停。总开关 `studio.unattended_soft_skip`；批写可传 `respect_soft_gates=true` 保留软相位。
+
+**Loop Engineering（质量优先）**：批写是 Goal 外环，不是模型自评完成。停机只认 `StopContract`（硬门 `requires_human`，Automations 不得伪造确认）。校验权威仍是进程内 pipeline + harness。服务在线时扫描 `loop/job.json`：崩溃（Running 心跳过期）或人已 `arm` 的可续任务才自动再跑；有活跃 Turn 则跳过。批结束 Goal/Quota 且发布数 ≥ `loop_end_verify_min_chapters` 时做确定性卷 QA 相位抽检，需人则阻断自动唤醒。
 
 **相位（量化→状态机）**：
 - `volume_qa_phase`：`ok` / `mid_due` / `handoff_required`（阈值章数达线无卷审 → mid_due；有人软卡，无人可跳）

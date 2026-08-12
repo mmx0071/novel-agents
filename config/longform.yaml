@@ -25,7 +25,23 @@ impact_scan_mode: indexed
 batch_max_chapters: 20
 
 # Max auto-revise attempts per chapter in batch (hard rules / consistency / length).
-batch_max_auto_revise: 1
+# 2: e.g. length expand first, then one consistency pass if expand introduces P0.
+batch_max_auto_revise: 2
+
+# Batch: auto AuditOnly retries when consistency fails only as audit_infra
+# (empty / unparseable auditor). 0 = off (stop immediately like content FAIL).
+batch_max_audit_infra_retries: 2
+
+# Loop Engineering (outer Goal loop): online wake interval while web server runs.
+# 0 = disable Automations wake scanner.
+loop_wake_interval_secs: 120
+
+# Stale Running job older than this is treated as crash → auto resume (if no active turn).
+loop_stale_running_secs: 600
+
+# After GoalReached/Quota with ≥N publishes, run deterministic volume_qa loop-end verify.
+# 0 = off. Short drama skips.
+loop_end_verify_min_chapters: 5
 
 # Soft-short streak: when consecutive SoftShort publishes would reach this,
 # the current SoftShort blocks publish (force expand). See chapter.yaml hard min.

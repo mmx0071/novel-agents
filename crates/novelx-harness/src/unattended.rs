@@ -117,14 +117,14 @@ impl UnattendedPolicy {
     }
 
     /// Resolve skip flags for council auto-continue (single chapter).
-    pub fn resolve_council_skips(&self, config_root: &Path) -> (bool, bool, bool) {
+    /// Foreshadow soft-skip is batch-only; council never uses it.
+    pub fn resolve_council_skips(&self, config_root: &Path) -> (bool, bool) {
         if !Self::soft_skip_enabled(config_root) {
-            return (false, false, false);
+            return (false, false);
         }
         (
             self.council_auto_continue.skip_volume_audit_mid,
             self.council_auto_continue.skip_expected_review,
-            self.council_auto_continue.skip_foreshadow_pressure,
         )
     }
 }

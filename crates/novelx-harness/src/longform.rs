@@ -133,6 +133,9 @@ pub struct LongformConfig {
     /// Max auto-revise attempts per chapter in continue_writing_batch (hard/consistency/length).
     #[serde(default = "default_batch_max_auto_revise")]
     pub batch_max_auto_revise: u32,
+    /// Batch AuditOnly retries for audit_infra (empty/unparseable). 0 = off.
+    #[serde(default = "default_batch_max_audit_infra_retries")]
+    pub batch_max_audit_infra_retries: u32,
     #[serde(default = "default_soft_short_streak")]
     pub soft_short_auto_revise_after: u32,
     /// Pause continue_writing_batch when **pressure** foreshadow debt exceeds this (0 = off).
@@ -141,13 +144,25 @@ pub struct LongformConfig {
     pub batch_max_dangling_foreshadow: u32,
     #[serde(default)]
     pub foreshadow_debt: ForeshadowDebtConfig,
+    /// Online Automations wake interval (seconds). 0 = disable scanner.
+    #[serde(default = "default_loop_wake_interval")]
+    pub loop_wake_interval_secs: u64,
+    /// Running job with heartbeat older than this → crash resume candidate.
+    #[serde(default = "default_loop_stale_running")]
+    pub loop_stale_running_secs: u64,
+    /// Loop-end volume_qa verify when Goal/Quota and publishes ≥ this (0 = off).
+    #[serde(default = "default_loop_end_verify_min")]
+    pub loop_end_verify_min_chapters: u32,
 }
 
 fn default_batch_max() -> u32 {
     20
 }
 fn default_batch_max_auto_revise() -> u32 {
-    1
+    2
+}
+fn default_batch_max_audit_infra_retries() -> u32 {
+    2
 }
 fn default_soft_short_streak() -> u32 {
     3
@@ -155,6 +170,15 @@ fn default_soft_short_streak() -> u32 {
 /// 0 = foreshadow pressure phase off (aligned with config/longform.yaml).
 fn default_batch_max_dangling() -> u32 {
     0
+}
+fn default_loop_wake_interval() -> u64 {
+    120
+}
+fn default_loop_stale_running() -> u64 {
+    600
+}
+fn default_loop_end_verify_min() -> u32 {
+    5
 }
 
 impl Default for LongformConfig {
@@ -165,9 +189,13 @@ impl Default for LongformConfig {
             impact_scan_mode: ImpactScanMode::Indexed,
             batch_max_chapters: default_batch_max(),
             batch_max_auto_revise: default_batch_max_auto_revise(),
+            batch_max_audit_infra_retries: default_batch_max_audit_infra_retries(),
             soft_short_auto_revise_after: default_soft_short_streak(),
             batch_max_dangling_foreshadow: default_batch_max_dangling(),
             foreshadow_debt: ForeshadowDebtConfig::default(),
+            loop_wake_interval_secs: default_loop_wake_interval(),
+            loop_stale_running_secs: default_loop_stale_running(),
+            loop_end_verify_min_chapters: default_loop_end_verify_min(),
         }
     }
 }
@@ -211,12 +239,16 @@ mod tests {
         assert_eq!(c.audit_tier, AuditTier::Layered);
         assert_eq!(c.impact_scan_mode, ImpactScanMode::Indexed);
         assert_eq!(c.batch_max_chapters, 20);
-        assert_eq!(c.batch_max_auto_revise, 1);
+        assert_eq!(c.batch_max_auto_revise, 2);
+        assert_eq!(c.batch_max_audit_infra_retries, 2);
         assert_eq!(c.soft_short_auto_revise_after, 3);
         assert_eq!(c.batch_max_dangling_foreshadow, 0);
         assert_eq!(c.foreshadow_debt.grace_chapters, 6);
         assert_eq!(c.foreshadow_debt.far_after_chapters, 40);
         assert!(c.foreshadow_debt.batch_count_mid);
+        assert_eq!(c.loop_wake_interval_secs, 120);
+        assert_eq!(c.loop_stale_running_secs, 600);
+        assert_eq!(c.loop_end_verify_min_chapters, 5);
     }
 
     #[test]

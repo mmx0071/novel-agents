@@ -55,6 +55,7 @@ cd web && npm install && npm run dev
 - Skills 渐进披露：启动只注入摘要，激活后再加载全文
 - 章流水线可配置：`config/pipeline.yaml`；扩展角色按需激活
 - 局部改稿优先；立项与卷生命周期门控；批写到卡点；Studio 安全闸
+- **Loop 外环（Goal）**：`continue_writing_batch` / `novel run --batch` 按 Trigger→Frame→Run→Verify→Record→Stop 运转；停机认 `StopContract`（硬门永不自动跳过）；校验仍以进程内 pipeline + harness 为准
 
 ### 依赖
 
@@ -72,6 +73,7 @@ cargo run -p novelx-cli -- init my-novel --genre 未定
 cargo run -p novelx-cli -- run my-novel 1
 cargo run -p novelx-cli -- run my-novel 1 --revise --instructions "改第2段，加强冲突"
 cargo run -p novelx-cli -- run my-novel --batch --max-chapters 10
+# 批写到卡点：遇硬门即停；软相位默认见 config/unattended.yaml
 
 cargo run -p novelx-cli -- status my-novel
 cargo run -p novelx-cli -- projects
@@ -81,12 +83,43 @@ cargo run -p novelx-cli -- migrate my-novel
 
 Release 二进制：`./target/release/novel`。
 
+### Loop 外环与无人值守批写
+
+连写不是「模型说写完了就停」，而是机器可读的 Goal 外环：
+
+| 阶段 | NovelX 落点 |
+|------|-------------|
+| Trigger | 意图 / 审批卡「连写到卡点」/ CLI `--batch` / Web 在线唤醒 |
+| Frame | `projects/<name>/.novelx/loop/job.json`（预算、`until_chapter`、软跳过键） |
+| Run | **按章**执行：每轮只对 `next_chapter` 跑一次 `execute_pipeline` |
+| Verify | 一致性 P0 / content_rules / 字数硬门等（与单章发布链相同） |
+| Record | `state.json` + memory + `loop/journal.jsonl` |
+| Stop | `StopContract`（兼保留 `stopped_reason` 字符串给旧客户端） |
+
+**粒度与自然停**：执行最小单位是**章**；无人值守的自然停单位 ≈ **当前剧情卡**——本卡收束后不会自动建/升下一张卡；下一卡未设计、未激活或缺少可用收束条件时，以 `plot_gate:*`（如 `need_design_plot` / `planned_inactive` / `missing_exit`）硬停，需人 `design_plot` + `update_plot(in_progress)` 后再批写。`batch_max_chapters` 只是安全上限，不是鼓励跨多卡冲配额。「卡点」= 硬门/剧情卡门控停机，不是「写满 N 章」。
+
+质量红线：**硬门**（setup / 卷交接 / 章序 / 剧情门 / 一致性 P0 / 字数硬门 / 草稿形状 / handoff 审）永不自动跳过。软相位跳过只走 `config/unattended.yaml`，并写入 journal 可审计。
+
+Web 服务存活时会周期性扫描可恢复任务（`config/longform.yaml` → `loop_wake_interval_secs`，`0` 关闭）：仅崩溃续跑或作者已「允许自动续写」（`POST /api/projects/{name}/loop/arm`）才会再跑；项目有活跃 Turn 则跳过。创作状态栏可看「连写：可续写 / 需处理」。
+
+批结束若 Goal/Quota 且本批发布数 ≥ `loop_end_verify_min_chapters`，会做确定性卷 QA 相位抽检（短剧跳过）；需人处理则阻断自动唤醒。
+
 ### LLM 配置
 
 1. `.env` 中的 `DEEPSEEK_API_KEY`
 2. 任务 / 模型映射：`config/llm.yaml`（`NOVELX_LLM_PROFILE=dev|prod` 可覆盖）
 3. Agent Skills：`config/skills/**/SKILL.md`
 4. Web「配置 → 模型」可粘贴 Key（只写不读）
+
+**Loop / LLM 重试与降级（摘要）**
+
+| 机制 | 配置 | 行为 |
+|------|------|------|
+| 瞬态重试 | `llm.yaml` → `max_retries` 等 | 429/5xx/网络错误退避重试 |
+| 同端点换模 | 任务级 `fallback_model` | 主模型重试耗尽后换模再跑一套预算 |
+| 兼容端点链 | `failover.enabled` + `failover.chain` | 再按序试另一 OpenAI 兼容 `base_url`（有 Key 才试；占位无 Key 不进） |
+| 批写审计 infra | `longform.yaml` → `batch_max_audit_infra_retries` | 空响应/不可解析自动 `AuditOnly` 再审；耗尽 → `StopContract(audit_infra)`（勿当正文局部修订） |
+| Studio 终败 | `gates.yaml` → `llm_turn_retry` | 内层重试+failover 后 Studio 再自动开 1 轮；仍失败出「再试一次 / 结束本轮」 |
 
 ### 章流水线（摘要）
 
@@ -108,15 +141,15 @@ crates/
   novelx-protocol/     # Submission / Op / Event / AgentPath
   novelx-skills/       # 渐进披露 loader
   novelx-draft-patch/  # 局部段落补丁
-  novelx-harness/      # gates / 硬规则 / 激活 / longform
+  novelx-harness/      # gates / 硬规则 / 激活 / longform / unattended
   novelx-llm/          # OpenAI-compatible 客户端
-  novelx-pipeline/     # 领域单步（run_step）+ schemas / 卷同步
+  novelx-pipeline/     # 领域单步 + schemas / batch / loop_runtime
   novelx-tools/        # continue / revise / spawn_agent …
-  novelx-core/         # Codex Session：submission_loop + SubAgent
-  novelx-app-server/   # axum HTTP + WS → Submission
+  novelx-core/         # Codex Session：submission_loop + SubAgent + loop wake
+  novelx-app-server/   # axum HTTP + WS → Submission；在线 loop 扫描
   novelx-cli/          # novel 二进制
-config/                # agents / pipeline / features / longform / skills …
-projects/<name>/       # 小说数据（state、chapters、entities、artifacts…）
+config/                # agents / pipeline / features / longform / unattended / skills …
+projects/<name>/       # 小说数据（state、chapters、entities、artifacts、.novelx/loop…）
 web/                   # NovelX React 前端
 ```
 
@@ -127,12 +160,15 @@ Studio 在 `projects/<name>/.novelx/ops_journal.jsonl` 追加记录工具调用�
 - CLI：`novel ops-log <project> [--limit N] [--kind mutation_applied] [--chapter 3] [--json]`
 - HTTP：`GET /api/projects/{name}/ops_journal?limit=&chapter=&kind=&after=`
 
+批写外环另有 `projects/<name>/.novelx/loop/job.json` + `journal.jsonl`（StopContract、软跳过键、批结束抽检）。HTTP：`GET /api/projects/{name}/loop`，武装自动续写：`POST /api/projects/{name}/loop/arm`。
+
 | 文件 | 作用 |
 |------|------|
 | `config/agents.yaml` | Agent 注册与激活条件 |
 | `config/pipeline.yaml` | 章步骤顺序与 handler |
 | `config/features.yaml` | Studio / 流水线特性开关 |
-| `config/longform.yaml` | 质量档、审计档、批写上限、影响扫描 |
+| `config/longform.yaml` | 质量档、审计档、批写上限、影响扫描、`loop_*` 唤醒/抽检 |
+| `config/unattended.yaml` | 无人值守软相位跳过策略 |
 | `config/chapter.yaml` | 章长目标与字数硬门 |
 | `config/volume.yaml` | 卷中审 / 厚卷频率 |
 | `config/gates.yaml` / `intents.yaml` | 门控与确定性意图路由 |

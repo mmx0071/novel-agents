@@ -14,7 +14,7 @@
 | `sync_volume` / `confirm_setup` 再叠一层 mutation 确认 | 走专用门控，不叠第二层 |
 | 硬规则阻断仍套「第N章/禁名」泛化话术 | 按 `content_rules` 真实 rule id / detail 生成 prompt |
 | `gates.yaml` 选项 id 与 audit 裸 `"1"/"2"/"3"` 冲突 | 用稳定前缀 id（见 `gates.yaml` 注释） |
-| 把 `audit_infra` 当正文问题局部修订 | 走 `audit_infra` 重试门控 |
+| 把 `audit_infra` 当正文问题局部修订 | 走 `audit_infra` 重试门控；批写内另有 `batch_max_audit_infra_retries` 自动 `AuditOnly` 再审（耗尽才 `StopContract(audit_infra)`），仍禁止 `revise_chapter` / force_full |
 | 审校已通过仍弹审校卡或称「未通过」 | P1/P2 是可改进项；用户要改直接 `revise_chapter` |
 | 多章 `audit_chapters` 因软 `needs_user_choice`（形状等）停在一章，却说「复审通过/继续创作」 | 队列仅在一致性失败或硬规则/字数硬门停；通过后自动推进；队列未结束勿开 chapter_next「继续创作」 |
 | 评审团 AutoRevise 后只调 `audit_chapter`，队列停在第 1 章 | 有活跃队列时必须 `audit_chapters continue`；通过则继续后续章，勿 `drain_council_auto_continue` 写下一章 |
@@ -29,7 +29,7 @@
 | 一张剧情卡塞整卷 | `design_plot` 只切卷内一段；卷纲终止条件 ≥2 |
 | `plot_acceptor` 改写收束条件来 pass | 对照卡面原文；`pass=true` 且发布成功才 `completed` |
 | 单步 spawn 子 Agent 后推进 `next_chapter` | 发布收尾只在完整章流水线末尾一次 |
-| 用 `spawn_agent(mode=continue\|revise\|audit_only)` 写章/审校 | 整章走 `continue_writing` / `revise_chapter` / `audit_*`（进程内流水线）；spawn 仅单步专精/只读旁路 |
+| 用 `spawn_agent(mode=continue\|revise\|audit_only)` 写章/审校 | 整章走 `continue_writing` / `revise_chapter` / `audit_*`（进程内流水线）；spawn 仅 `allow_spawn=true` 旁路（见 `agents.yaml` / `list_agents(filter=spawnable)`） |
 | 润色 Agent 每章必跑 | `literary_editor` 靠 activation 建议或 Studio `activate_agents`；即时润色优先 `revise_chapter` |
 | mutation 落盘后只弹「继续推进 / 稍后」 | 主 Agent 须小结+`offer_decisions(studio_next)`；未出卡时 Mutation fallback 按 `setup_next`/剧情门拼可执行工具卡 |
 | 连写被「应用修改」卡卡住 | 设置 → 工作流开启 `studio.agent_auto_apply_mutations`；删卡/还原版本仍须确认 |
@@ -71,6 +71,8 @@
 | mutation 预览/确认 | `novelx-tools` mutation + features |
 | studio_next 情境卡 | `novelx-core::studio_next` + `studio_next_gates` |
 | 批写循环 | `novelx-pipeline::batch` |
+| Loop 外环 / StopContract / journal | `novelx-pipeline::loop_runtime` + `projects/<name>/.novelx/loop/`；`longform.yaml` → `loop_*` |
+| Automations 在线唤醒 | `novelx-app-server` wake scanner + `NovelxCore::try_auto_wake_project_loops`；`POST …/loop/arm` |
 | 无人值守软相位 | `config/unattended.yaml` + `studio.unattended_soft_skip`；`novelx-harness::UnattendedPolicy` |
 | 卷 QA / 伏笔相位 | `volume_qa_phase` / `foreshadow_phase`（`novelx-pipeline::volume_qa` / `foreshadow_phase`） |
 | body_state 板 | `novelx-pipeline::body_state` |
@@ -94,6 +96,7 @@
 | gates 外置 + studio_next | 固定门控 YAML 化；情境下一步白名单工具卡；减少「僵硬」固定三按钮 |
 | 预期事件 | `expectation_reviewer` + 工具链；硬条件满足时检阅，不进章流水线 order |
 | longform / batch | 批写到卡点、审计档、冷归档、volume_* 模块、activation_hints |
+| Loop Engineering | Goal 外环 StopContract；硬门不可自动化；崩溃/武装才 wake；批结束卷 QA 抽检 |
 | body_state / world_state | 伤势·能力载体确定性板；硬规则文案保真 |
 | 内容 schema 双层 | prompt 软约束 + Rust schema 硬校验；migrate 命令 |
 | Web 正文空 | 懒加载与 `body_chars` 缓存失效修复 |

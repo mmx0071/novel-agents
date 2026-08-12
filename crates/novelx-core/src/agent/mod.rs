@@ -115,9 +115,6 @@ impl CoreAgentRuntime {
 #[async_trait::async_trait]
 impl AgentRuntime for CoreAgentRuntime {
     async fn spawn_agent(&self, req: SpawnAgentRequest) -> Result<SpawnAgentResponse> {
-        if !registry::is_spawnable_role(&req.role) {
-            anyhow::bail!("role '{}' is not spawnable", req.role);
-        }
         // Block full-chapter pipeline modes — those stranded Studio turns historically.
         if let Some(msg) =
             registry::pipeline_mode_spawn_forbidden(req.chapter, req.mode.as_deref())
@@ -128,6 +125,9 @@ impl AgentRuntime for CoreAgentRuntime {
             let g = self.hub.core.lock().await;
             self.hub.upgrade(&g)?
         };
+        if !registry::is_spawnable_role(core.config_root(), &req.role) {
+            anyhow::bail!("{}", registry::spawn_denied_message(core.config_root(), &req.role));
+        }
         let parent = core
             .get_session_source(&req.parent_thread_id)
             .await
@@ -162,6 +162,11 @@ impl AgentRuntime for CoreAgentRuntime {
         let (child_id, _) = core
             .spawn_thread_with_source(project.clone(), false, source.clone())
             .await?;
+        let allowed_tools =
+            novelx_harness::spawn_tools_for_role(core.config_root(), &req.role);
+        if let Some(tools) = allowed_tools.clone() {
+            core.set_thread_allowed_tools(&child_id, tools).await;
+        }
         self.hub
             .register_child(&req.parent_thread_id, &child_id)
             .await;
@@ -179,19 +184,24 @@ impl AgentRuntime for CoreAgentRuntime {
         })
         .await;
 
-        // Stash pipeline step metadata for the child turn.
-        core.set_subagent_job(
-            &child_id,
-            SubagentJob {
-                role: req.role.clone(),
-                task: req.task.clone(),
-                project: project.clone(),
-                chapter: req.chapter,
-                mode: req.mode.clone(),
-                revision: req.revision.clone(),
-            },
-        )
-        .await;
+        // Pipeline-handler roles → deterministic single step.
+        // Domain-tool / unwired allow_spawn roles → LLM tool loop (no SubagentJob;
+        // run_turn / regular task must publish_result for wait_agent).
+        if novelx_harness::subagent_uses_pipeline_step(core.config_root(), &req.role) {
+            core.set_subagent_job(
+                &child_id,
+                SubagentJob {
+                    role: req.role.clone(),
+                    task: req.task.clone(),
+                    project: project.clone(),
+                    chapter: req.chapter,
+                    mode: req.mode.clone(),
+                    revision: req.revision.clone(),
+                    allowed_tools,
+                },
+            )
+            .await;
+        }
 
         let mut items = vec![UserInput::text(req.task.clone())];
         if let Some(skill) = Some(registry::skill_name_for_role(&req.role)) {
@@ -361,6 +371,8 @@ pub struct SubagentJob {
     pub chapter: Option<u32>,
     pub mode: Option<String>,
     pub revision: Option<novelx_pipeline::RevisionOptions>,
+    /// Optional tools whitelist from agents.yaml (Phase B).
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 pub fn result_mail(author: &str, parent: &str, summary: &str) -> InterAgentCommunication {
@@ -373,10 +385,37 @@ pub fn result_mail(author: &str, parent: &str, summary: &str) -> InterAgentCommu
     }
 }
 
+/// Normalize SubAgent step result into wait_agent summary contract.
 pub fn json_step_result(summary: &str, run: &novelx_pipeline::PipelineRun) -> Value {
+    let artifacts = run
+        .steps
+        .iter()
+        .filter_map(|s| {
+            if s.summary.is_empty() {
+                None
+            } else {
+                Some(json!({
+                    "agent": s.agent,
+                    "summary": s.summary,
+                }))
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut warnings = Vec::new();
+    if run.needs_user_choice {
+        warnings.push(json!("needs_user_choice"));
+    }
+    if run.plot_setting_blocker {
+        warnings.push(json!("plot_setting_blocker"));
+    }
+    if run.content_rule_blocked {
+        warnings.push(json!("content_rule_blocked"));
+    }
     json!({
         "step_ran": true,
         "summary": summary,
+        "artifacts": artifacts,
+        "warnings": warnings,
         "project": run.project,
         "chapter": run.chapter,
         "consistency_passed": run.consistency_passed,

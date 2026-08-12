@@ -11,7 +11,9 @@ use crate::plots::{
 use crate::project::{
     is_short_drama, load_project_state, project_dir, read_chapter_draft,
 };
-use crate::run::{execute_pipeline, PipelineRun, RevisionOptions, RunMode};
+use crate::run::{
+    execute_pipeline, pipeline_run_is_audit_infra, PipelineRun, RevisionOptions, RunMode,
+};
 use crate::schemas::draft_body_chars;
 use crate::volume_audit_gate::check_volume_audit_for_continue;
 use anyhow::Result;
@@ -27,6 +29,10 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::run::PipelineEvent;
+use crate::loop_runtime::{
+    append_loop_journal, begin_loop_job, finish_loop_job, heartbeat_loop_job, now_rfc3339,
+    run_loop_end_verify, soft_skip_keys_from_opts, StopContract,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchContinueOpts {
@@ -105,6 +111,9 @@ pub struct BatchChapterResult {
     /// Consistency P0 revise attempted (up to batch_max_auto_revise).
     #[serde(default)]
     pub consistency_auto_revised: bool,
+    /// AuditOnly retries for audit_infra (empty/unparseable auditor).
+    #[serde(default)]
+    pub audit_infra_retries: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run: Option<PipelineRun>,
 }
@@ -120,6 +129,9 @@ pub struct BatchContinueResult {
     pub chapters_attempted: u32,
     pub chapters_published: u32,
     pub stopped_reason: String,
+    /// Machine-checked stop (compatible clients may ignore; wire string stays in stopped_reason).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_contract: Option<StopContract>,
     pub results: Vec<BatchChapterResult>,
     /// Display unit: `章` (longform) or `集` (short_drama).
     #[serde(default = "default_batch_unit")]
@@ -127,9 +139,17 @@ pub struct BatchContinueResult {
     /// Soft gates (mid volume audit / expected review) were auto-skipped by unattended policy.
     #[serde(default)]
     pub soft_gates_skipped_by_policy: bool,
+    /// Policy keys skipped when soft_gates_skipped_by_policy (auditable).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub soft_gates_skipped: Vec<String>,
     /// Progressive checklist snapshot at batch end (also streamed live via PipelineEvent::TodoList).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub todos: Vec<novelx_protocol::TodoItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_end_verify: Option<crate::loop_runtime::LoopEndVerify>,
+    /// UI label: 可续写 / 需处理 / 已完成 …
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_label: Option<String>,
 }
 
 fn expected_gate_message(
@@ -385,6 +405,56 @@ struct BatchAutoReviseFlags {
     consistency: bool,
 }
 
+/// When consistency failed only as audit_infra, re-run AuditOnly (do not revise prose).
+async fn batch_recover_audit_infra(
+    projects_root: &Path,
+    config_root: &Path,
+    project: &str,
+    chapter: u32,
+    mut run: PipelineRun,
+    max_retries: u32,
+    llm: Arc<LlmClient>,
+    tx: &Option<mpsc::UnboundedSender<PipelineEvent>>,
+    unit: &str,
+) -> Result<(PipelineRun, u32)> {
+    if max_retries == 0 || run.published || !pipeline_run_is_audit_infra(&run) {
+        return Ok((run, 0));
+    }
+    let mut retries = 0u32;
+    while retries < max_retries && !run.published && pipeline_run_is_audit_infra(&run) {
+        retries += 1;
+        emit_batch(
+            tx,
+            format!(
+                "⚙ 第{chapter}{unit}审计基础设施失败，自动重审（{retries}/{max_retries}）…"
+            ),
+        );
+        let _ = append_loop_journal(
+            &crate::project::project_dir(projects_root, project),
+            json!({
+                "ts": now_rfc3339(),
+                "event": "audit_infra_retry",
+                "chapter": chapter,
+                "attempt": retries,
+                "max": max_retries,
+            }),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        run = execute_pipeline(
+            projects_root,
+            config_root,
+            project,
+            chapter,
+            RunMode::AuditOnly,
+            RevisionOptions::default(),
+            llm.clone(),
+            tx.clone(),
+        )
+        .await?;
+    }
+    Ok((run, retries))
+}
+
 /// After HardLong auto-split, body changed — run AuditOnly on part A before revise/publish.
 async fn reaudit_after_auto_split(
     projects_root: &Path,
@@ -497,7 +567,9 @@ async fn batch_auto_revise_until_publish(
         }
         let length_blocks = length_blocks_publish(dir, config_root, chapter);
         let need_hard = run.content_rule_blocked;
-        let need_consistency = run.consistency_passed == Some(false);
+        // Never treat audit_infra META as content P0 — that forces bad full rewrites.
+        let need_consistency = run.consistency_passed == Some(false)
+            && !pipeline_run_is_audit_infra(&run);
         let mut need_len = should_batch_auto_length_revise(
             auto_length_revise,
             run.published,
@@ -609,6 +681,12 @@ pub async fn run_continue_batch(
     tx: Option<mpsc::UnboundedSender<PipelineEvent>>,
 ) -> Result<BatchContinueResult> {
     let soft_gates_skipped_by_policy = apply_unattended_batch_policy(config_root, &mut opts);
+    let soft_gates_skipped = soft_skip_keys_from_opts(
+        soft_gates_skipped_by_policy,
+        opts.confirm_skip_volume_audit,
+        opts.confirm_skip_expected,
+        opts.confirm_skip_foreshadow,
+    );
     let lf = LongformConfig::load_from_config_root(config_root);
     let max = opts
         .max_chapters
@@ -616,8 +694,10 @@ pub async fn run_continue_batch(
         .max(1)
         .min(100);
     let max_auto_revise = lf.batch_max_auto_revise.max(1);
+    let max_audit_infra_retries = lf.batch_max_audit_infra_retries;
     let dir = project_dir(projects_root, &opts.project);
-    let unit = if is_short_drama(&dir) { "集" } else { "章" };
+    let short_drama = is_short_drama(&dir);
+    let unit = if short_drama { "集" } else { "章" };
     let state0 = load_project_state(&dir)?;
     let started = state0.next_chapter.max(1);
     let until = resolve_batch_until(opts.until_chapter, state0.target_chapters);
@@ -628,6 +708,49 @@ pub async fn run_continue_batch(
     let budget = ChapterBudget::load_from_config_root(config_root);
     // Safety: avoid infinite loops if publishes never advance (gates thrash).
     let safety_cap = max.saturating_mul(3).max(max + 5);
+
+    let mut loop_job = begin_loop_job(
+        &dir,
+        &opts.project,
+        &opts,
+        started,
+        unit,
+        soft_gates_skipped.clone(),
+    )
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "loop job begin failed; continuing without persist");
+        crate::loop_runtime::LoopJob {
+            project: opts.project.clone(),
+            status: crate::loop_runtime::LoopJobStatus::Running,
+            until_chapter: opts.until_chapter,
+            max_chapters: opts.max_chapters,
+            respect_soft_gates: opts.respect_soft_gates,
+            confirm_skip_volume_audit: opts.confirm_skip_volume_audit,
+            confirm_skip_expected: opts.confirm_skip_expected,
+            confirm_skip_foreshadow: opts.confirm_skip_foreshadow,
+            auto_length_revise: opts.auto_length_revise,
+            started_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+            chapters_done: 0,
+            chapters_attempted: 0,
+            started_chapter: started,
+            last_stop: None,
+            soft_gates_skipped: soft_gates_skipped.clone(),
+            pending_wake: false,
+            loop_end_verify: None,
+            unit: unit.to_string(),
+        }
+    });
+    if soft_gates_skipped_by_policy {
+        let _ = append_loop_journal(
+            &dir,
+            json!({
+                "ts": now_rfc3339(),
+                "event": "soft_gates_skipped",
+                "keys": soft_gates_skipped,
+            }),
+        );
+    }
 
     let until_label = until
         .map(|u| format!("，写到第{u}{unit}为止"))
@@ -657,6 +780,7 @@ pub async fn run_continue_batch(
     );
 
     while published_n < max && attempted < safety_cap {
+        let _ = heartbeat_loop_job(&dir);
         let state = load_project_state(&dir)?;
         let chapter = state.next_chapter.max(1);
         if let Some(u) = until {
@@ -669,6 +793,8 @@ pub async fn run_continue_batch(
         }
 
         attempted += 1;
+        loop_job.chapters_attempted = attempted;
+        loop_job.chapters_done = published_n;
         let todo_idx = (chapter.saturating_sub(started)) as usize;
         emit_batch_todos(&tx, &todo_labels, todo_idx, false);
         emit_batch(
@@ -698,6 +824,7 @@ pub async fn run_continue_batch(
                 length_auto_revised: false,
                 hard_rule_auto_revised: false,
                 consistency_auto_revised: false,
+                audit_infra_retries: 0,
                 run: None,
             });
             stopped = "volume_audit_gate".into();
@@ -718,6 +845,7 @@ pub async fn run_continue_batch(
                 length_auto_revised: false,
                 hard_rule_auto_revised: false,
                 consistency_auto_revised: false,
+                audit_infra_retries: 0,
                 run: None,
             });
             stopped = reason;
@@ -741,6 +869,7 @@ pub async fn run_continue_batch(
                     length_auto_revised: false,
                     hard_rule_auto_revised: false,
                     consistency_auto_revised: false,
+                    audit_infra_retries: 0,
                     run: None,
                 });
                 stopped = "chapter_order".into();
@@ -761,6 +890,7 @@ pub async fn run_continue_batch(
                     length_auto_revised: false,
                     hard_rule_auto_revised: false,
                     consistency_auto_revised: false,
+                    audit_infra_retries: 0,
                     run: None,
                 });
                 stopped = format!("plot_gate:{reason}");
@@ -790,6 +920,7 @@ pub async fn run_continue_batch(
                     length_auto_revised: false,
                     hard_rule_auto_revised: false,
                     consistency_auto_revised: false,
+                    audit_infra_retries: 0,
                     run: None,
                 });
                 stopped = "foreshadow_pressure_high".into();
@@ -832,6 +963,18 @@ pub async fn run_continue_batch(
                 &tx,
             )
             .await?;
+            let (audit_run, audit_infra_retries) = batch_recover_audit_infra(
+                projects_root,
+                config_root,
+                &opts.project,
+                chapter,
+                audit_run,
+                max_audit_infra_retries,
+                llm.clone(),
+                &tx,
+                unit,
+            )
+            .await?;
             let (audit_run, revise_flags) = batch_auto_revise_until_publish(
                 projects_root,
                 config_root,
@@ -870,33 +1013,46 @@ pub async fn run_continue_batch(
                     length_auto_revised,
                     hard_rule_auto_revised,
                     consistency_auto_revised,
+                    audit_infra_retries,
                     run: Some(audit_run),
                 });
                 continue;
             }
+            let stop_reason = if pipeline_run_is_audit_infra(&audit_run) {
+                "audit_infra"
+            } else {
+                "draft_exists"
+            };
             let revise_hint = if unit == "集" {
                 "revise_episode"
             } else {
                 "revise_chapter"
             };
-            let message = format!(
-                "第{chapter}{unit}已有未发布正文（约 {} 字），审校/自动修订后仍未发布。批写暂停；请 {revise_hint} 或按审批卡修正。",
-                existing.chars().count()
-            );
+            let message = if stop_reason == "audit_infra" {
+                format!(
+                    "第{chapter}{unit}一致性审计基础设施失败（空响应/不可解析），自动重审 {audit_infra_retries} 次仍失败。批写暂停；请点「重新审校」。"
+                )
+            } else {
+                format!(
+                    "第{chapter}{unit}已有未发布正文（约 {} 字），审校/自动修订后仍未发布。批写暂停；请 {revise_hint} 或按审批卡修正。",
+                    existing.chars().count()
+                )
+            };
             emit_batch(&tx, format!("⛔ {message}"));
             results.push(BatchChapterResult {
                 chapter,
                 published: false,
                 blocked: true,
-                reason: Some("draft_exists".into()),
+                reason: Some(stop_reason.into()),
                 needs_user_choice: true,
                 message,
                 length_auto_revised,
                 hard_rule_auto_revised,
                 consistency_auto_revised,
+                audit_infra_retries,
                 run: Some(audit_run),
             });
-            stopped = "draft_exists".into();
+            stopped = stop_reason.into();
             break;
         }
 
@@ -923,6 +1079,18 @@ pub async fn run_continue_batch(
             run,
             llm.clone(),
             &tx,
+        )
+        .await?;
+        let (run, audit_infra_retries) = batch_recover_audit_infra(
+            projects_root,
+            config_root,
+            &opts.project,
+            chapter,
+            run,
+            max_audit_infra_retries,
+            llm.clone(),
+            &tx,
+            unit,
         )
         .await?;
 
@@ -952,6 +1120,8 @@ pub async fn run_continue_batch(
             Some("volume_ended".into())
         } else if run.content_rule_blocked {
             Some("content_rule".into())
+        } else if pipeline_run_is_audit_infra(&run) {
+            Some("audit_infra".into())
         } else if run.consistency_passed == Some(false) {
             Some("consistency_fail".into())
         } else if run.needs_user_choice {
@@ -996,6 +1166,7 @@ pub async fn run_continue_batch(
             length_auto_revised,
             hard_rule_auto_revised,
             consistency_auto_revised,
+            audit_infra_retries,
             run: Some(run),
         });
 
@@ -1039,6 +1210,48 @@ pub async fn run_continue_batch(
         emit_batch(&tx, "✓ 批写循环正常结束");
     }
 
+    let mut stop_contract = StopContract::from_reason(&stopped);
+    let loop_end_verify = run_loop_end_verify(
+        config_root,
+        &dir,
+        published_n,
+        lf.loop_end_verify_min_chapters,
+        &stop_contract,
+        short_drama,
+    );
+    if let Some(ref v) = loop_end_verify {
+        let _ = append_loop_journal(
+            &dir,
+            json!({
+                "ts": now_rfc3339(),
+                "event": "loop_end_verify",
+                "verify": v,
+            }),
+        );
+        if v.requires_human {
+            stop_contract.requires_human = true;
+            emit_batch(
+                &tx,
+                format!(
+                    "⏸ 批结束跨章抽检：{}（{}）",
+                    v.volume_qa_phase,
+                    v.summary.as_deref().unwrap_or("需处理")
+                ),
+            );
+        }
+    }
+    let status_label = stop_contract.status_label_zh().to_string();
+    if let Err(e) = finish_loop_job(
+        &dir,
+        loop_job,
+        stop_contract.clone(),
+        published_n,
+        attempted,
+        loop_end_verify.clone(),
+    ) {
+        tracing::warn!(error = %e, "loop job finish failed");
+    }
+
     let todos = novelx_protocol::progressive_todo_list(
         &todo_labels,
         published_n as usize,
@@ -1056,10 +1269,14 @@ pub async fn run_continue_batch(
         chapters_attempted: attempted,
         chapters_published: published_n,
         stopped_reason: stopped,
+        stop_contract: Some(stop_contract),
         results,
         unit: unit.to_string(),
         soft_gates_skipped_by_policy,
+        soft_gates_skipped,
         todos,
+        loop_end_verify,
+        status_label: Some(status_label),
     })
 }
 
@@ -1078,11 +1295,32 @@ impl BatchContinueResult {
             "批写完成：尝试 {} {unit}，发布 {} {unit}，停止原因：{}",
             self.chapters_attempted, self.chapters_published, self.stopped_reason
         )];
+        if let Some(label) = self.status_label.as_deref() {
+            lines.push(format!("状态：{label}"));
+        }
+        if let Some(sc) = &self.stop_contract {
+            lines.push(format!(
+                "StopContract：kind={:?} resumable={} requires_human={}",
+                sc.kind, sc.resumable, sc.requires_human
+            ));
+        }
         if self.soft_gates_skipped_by_policy {
-            lines.push(
-                "（无人值守：已跳过卷 QA mid_due / 预期检阅 / 伏笔近债软相位；硬门控仍会停）"
-                    .into(),
-            );
+            if self.soft_gates_skipped.is_empty() {
+                lines.push(
+                    "（无人值守：已跳过卷 QA mid_due / 预期检阅 / 伏笔近债软相位；硬门控仍会停）"
+                        .into(),
+                );
+            } else {
+                lines.push(format!(
+                    "（无人值守软跳过：{}；硬门控仍会停）",
+                    self.soft_gates_skipped.join(", ")
+                ));
+            }
+        }
+        if let Some(v) = &self.loop_end_verify {
+            if let Some(s) = &v.summary {
+                lines.push(format!("批结束抽检：{s}"));
+            }
         }
         for r in &self.results {
             let flag = if r.published {
@@ -1168,12 +1406,14 @@ mod tests {
 
     #[test]
     fn summary_text_mentions_stop_reason() {
+        let stop = StopContract::from_reason("draft_exists");
         let r = BatchContinueResult {
             project: "sample-novel".into(),
             started_chapter: 1,
             chapters_attempted: 1,
             chapters_published: 0,
             stopped_reason: "draft_exists".into(),
+            stop_contract: Some(stop.clone()),
             results: vec![BatchChapterResult {
                 chapter: 1,
                 published: false,
@@ -1184,15 +1424,53 @@ mod tests {
                 length_auto_revised: false,
                 hard_rule_auto_revised: false,
                 consistency_auto_revised: false,
+                audit_infra_retries: 0,
                 run: None,
             }],
             unit: "章".into(),
             soft_gates_skipped_by_policy: false,
+            soft_gates_skipped: vec![],
             todos: vec![],
+            loop_end_verify: None,
+            status_label: Some(stop.status_label_zh().into()),
         };
         let s = r.summary_text();
         assert!(s.contains("draft_exists"));
         assert!(s.contains("⛔拦截"));
+        assert!(s.contains("需处理"));
+    }
+
+    #[test]
+    fn stop_contract_on_batch_reasons() {
+        assert!(!StopContract::from_reason("chapter_order").auto_wake_allowed());
+        assert!(!StopContract::from_reason("consistency_fail").auto_wake_allowed());
+        assert!(StopContract::from_reason("crash_interrupted").auto_wake_allowed());
+        let infra = StopContract::from_reason("audit_infra");
+        assert!(infra.requires_human);
+        assert!(!infra.auto_wake_allowed());
+        assert_eq!(infra.gate_id.as_deref(), Some("audit_infra"));
+    }
+
+    #[test]
+    fn audit_infra_detection_ignores_content_meta() {
+        use crate::run::is_audit_infra_failure;
+        let infra = vec![json!({
+            "type": "META",
+            "priority": "P0",
+            "message": "一致性审计模型返回为空，请重试 audit_chapter"
+        })];
+        assert!(is_audit_infra_failure(&infra, "", ""));
+        let chapter_meta = vec![json!({
+            "type": "META",
+            "priority": "P0",
+            "message": "正文出现「第3章」元叙述"
+        })];
+        assert!(!is_audit_infra_failure(&chapter_meta, "", ""));
+        assert!(is_audit_infra_failure(
+            &[],
+            "一致性审计失败：模型返回为空",
+            ""
+        ));
     }
 
     #[test]

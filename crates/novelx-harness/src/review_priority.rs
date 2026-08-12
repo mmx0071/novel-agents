@@ -127,6 +127,37 @@ fn issue_message(issue: &Value) -> String {
     .join(" ")
 }
 
+/// Soft denials that embed hard substrings (「无回跳」contains「回跳」).
+/// Strip before scanning hard markers / non-issue detection.
+fn msg_without_soft_denials(msg: &str) -> String {
+    let mut s = msg.to_string();
+    for phrase in [
+        "不构成硬性回跳",
+        "不构成硬性",
+        "不构成硬冲突",
+        "不算硬冲突",
+        "故不构成",
+        "没有回跳",
+        "无回跳",
+        "无侧别矛盾",
+        "未产生矛盾",
+        "无矛盾",
+        "不影响承接",
+        "符合承接要求",
+        "符合承接",
+        "未发现P0级阻断",
+        "未发现P0",
+        "未发现 P0",
+        "无P0级",
+        "无P0",
+        "不算硬",
+        "可接受范围",
+    ] {
+        s = s.replace(phrase, " ");
+    }
+    s
+}
+
 /// Model sometimes emits "checked, no violation" as a fake P0 — drop those.
 pub fn is_non_issue(issue: &Value) -> bool {
     let msg = issue_message(issue);
@@ -141,27 +172,23 @@ pub fn is_non_issue(issue: &Value) -> bool {
         "无实质性",
         "衔接流畅",
         "无矛盾",
+        "无侧别矛盾",
+        "无回跳",
+        "没有回跳",
+        "不影响承接",
+        "符合承接要求",
+        "符合承接",
         "不构成强制",
         "不阻断",
         "可视为合理",
         "检查发现无",
+        "未发现P0",
+        "未发现 P0",
     ];
     if soft_clear.iter().any(|s| msg.contains(s)) {
-        // Keep real contradictions that also mention a soft phrase elsewhere.
-        let hard = [
-            "互斥",
-            "回跳",
-            "矛盾",
-            "冲突",
-            "不一致",
-            "破设定",
-            "死人",
-            "章号元叙述",
-        ];
-        let has_hard = hard.iter().any(|h| msg.contains(h))
-            && !msg.contains("无矛盾")
-            && !msg.contains("无违规")
-            && !msg.contains("未检出");
+        // After stripping soft denials, any remaining hard marker = real conflict.
+        let remainder = msg_without_soft_denials(&msg);
+        let has_hard = has_hard_conflict_markers_raw(&remainder);
         // "时间互斥…；另：无章号违规" — rare; prefer drop only when soft dominates.
         if msg.contains("无违规") || msg.contains("未检出") || msg.contains("暂无明文违规") {
             return true;
@@ -169,12 +196,22 @@ pub fn is_non_issue(issue: &Value) -> bool {
         if msg.contains("无实质") || msg.contains("衔接流畅") {
             return !has_hard;
         }
+        // Pure clearance notes: 「无回跳；符合承接」with nothing hard left.
+        if (msg.contains("无回跳")
+            || msg.contains("没有回跳")
+            || msg.contains("无侧别矛盾")
+            || msg.contains("符合承接")
+            || msg.contains("不影响承接"))
+            && !has_hard
+        {
+            return true;
+        }
         return !has_hard;
     }
     false
 }
 
-fn has_hard_conflict_markers(msg: &str) -> bool {
+fn has_hard_conflict_markers_raw(msg: &str) -> bool {
     [
         "互斥",
         "回跳",
@@ -189,6 +226,10 @@ fn has_hard_conflict_markers(msg: &str) -> bool {
     ]
     .iter()
     .any(|h| msg.contains(h))
+}
+
+fn has_hard_conflict_markers(msg: &str) -> bool {
+    has_hard_conflict_markers_raw(&msg_without_soft_denials(msg))
 }
 
 fn is_outline_key_events_missing(msg: &str) -> bool {
@@ -888,7 +929,11 @@ mod tests {
             "message": "末段倒计时跳动次数偏少，略有压缩感；数值序列没有回跳或停滞，属于可接受的微小波动，不算硬冲突。",
         })]);
         assert!(!has_p0, "{issues:?}");
-        assert_eq!(issues[0]["priority"], "P1");
+        // Clearance / soft denial may demote to P1 or drop entirely as non-issue.
+        assert!(
+            issues.is_empty() || issues.iter().all(|i| i["priority"] == "P1"),
+            "{issues:?}"
+        );
     }
 
     #[test]
@@ -904,6 +949,35 @@ mod tests {
         assert!(!has_p0, "{issues:?}");
         assert_eq!(issues[0]["priority"], "P1");
         assert!(!has_timeline_p0(&issues));
+    }
+
+    #[test]
+    fn drops_clearance_notes_embedding_hard_substrings() {
+        // Production false P0: clearance text embeds「回跳」inside「无回跳」.
+        let (has_p0, issues) = normalize_consistency_issues(vec![
+            json!({
+                "type": "TIMELINE",
+                "priority": "P0",
+                "message": "时间表述以'晨光'为主，未使用明确钟点或倒计时，无回跳；时段词未出现，符合承接要求。",
+                "quote": "晨光斜过窗台",
+            }),
+            json!({
+                "type": "INJURY",
+                "priority": "P0",
+                "message": "左脸颊渗血的新痕叠旧痕有交代，符合第4章伤势；但'左眼眶深处'的胀痛与灰色噪点变化描述在第4章已确立，无侧别矛盾。左掌心齿痕（第2章）未提及，不影响承接。",
+                "quote": "一样温热的液体顺着左脸颊旧痕的路径往下滑",
+            }),
+            json!({
+                "type": "CONTINUITY",
+                "priority": "P1",
+                "message": "上章钩子在开篇被直接承接；章末留有悬念，属可接受范围。",
+            }),
+        ]);
+        assert!(!has_p0, "{issues:?}");
+        assert!(
+            issues.iter().all(|i| i["type"] != "TIMELINE" && i["type"] != "INJURY"),
+            "clearance TIMELINE/INJURY must be dropped: {issues:?}"
+        );
     }
 
     #[test]

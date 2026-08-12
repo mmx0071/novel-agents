@@ -40,6 +40,7 @@ description: >-
 | Prompt / Skill | `config/skills/**` | 软约束：写章目标、编排、Agent 行为 |
 | Schema | `novelx_pipeline::schemas` | 结构硬校验；人读摘要在 `content-formats.md` / `schemas/README.md` |
 | 确定性门控 | harness + `content_rules` / `chapter.yaml` / phases | 发布拦、跳章、setup/volume 相位、字数、一致性 P0 |
+| Loop 外环 | `loop_runtime` + `longform.loop_*` | Goal 批写 StopContract；硬门不可自动化；在线 wake / journal |
 | 意图路由 | `intents.yaml` + `novelx-core::intent` | 高置信写章/批写/修订等薄匹配；未命中才进 LLM tool loop |
 | 人机选项 | `gates.yaml` + `offer_decisions` | 固定事务按钮 vs 情境 `studio_next` vs 审校 `audit` |
 
@@ -105,7 +106,7 @@ description: >-
 ## 流水线与发布
 
 - 顺序以 `pipeline.yaml` 为准：先生产 → 专改 → 一致性 → 摘要 → `plot_acceptor`。
-- 一致性 P0 **挡发布**；节奏 P0 **不挡**；`plot_acceptor` 未收束 **不挡**发布（跨多章铺垫）；通过并发布成功才 `completed`（可自动升 `next_plot`）。
+- 一致性 P0 **挡发布**；节奏 P0 **不挡**；`plot_acceptor` 未收束 **不挡**发布（跨多章铺垫）；通过并发布成功才 `completed`。收束后**不**自动升 `next_plot`（Loop 自然停在剧情卡边界；跨卡须人 prep）。
 - 发布收尾只在**完整章流水线末尾**一次；单步 spawn 不推进 `next_chapter`。
 - 发布链：`validate_draft` → 字数硬门 → `content_rules` → 一致性 P0；缺收束条件硬拦，未收束仅记录。
 - 门控文案须吃透真实 `rule id` / `gate_prompt`，勿用泛化「第N章/禁名」fallback 盖掉细节。

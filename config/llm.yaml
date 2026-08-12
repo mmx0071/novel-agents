@@ -3,6 +3,13 @@ retry:
   max_retries: 3
   base_delay_ms: 800
   max_delay_ms: 10000
+# After per-model retries exhaust on transient faults, try next OpenAI-compat endpoint/model.
+# Entries without a usable API key are skipped at runtime.
+failover:
+  enabled: true
+  chain:
+    - provider: deepseek
+      model: deepseek-v4-flash
 dev_model: deepseek-v4-flash
 providers:
   deepseek:
@@ -19,12 +26,14 @@ tasks:
     description: 强推理 — 章纲、总纲、卷纲、世界观
     provider: deepseek
     model: deepseek-v4-pro
+    fallback_model: deepseek-v4-flash
     temperature: 0.7
     max_tokens: 131072
   creative:
     description: 强创作 — 正文撰写
     provider: deepseek
     model: deepseek-v4-pro
+    fallback_model: deepseek-v4-flash
     temperature: 0.85
     max_tokens: 131072
   editing:
@@ -49,6 +58,7 @@ tasks:
     description: 名词设计 — 人物/物品/设定取名，名与能力语义绑定
     provider: deepseek
     model: deepseek-v4-pro
+    fallback_model: deepseek-v4-flash
     temperature: 0.75
     max_tokens: 65536
   studio:

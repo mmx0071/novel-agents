@@ -269,6 +269,17 @@ pub(crate) struct PendingImpact {
     pub resume_data: Value,
 }
 
+/// Studio LLM exhausted provider retries/failover + one auto-retry → human card.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PendingLlmTurnRetry {
+    #[serde(default)]
+    pub project: String,
+    /// Original user text to replay on「再试一次」(not the gate label).
+    pub user_text: String,
+    #[serde(default)]
+    pub error: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ThreadState {
     pub(crate) summary: ThreadSummary,
@@ -313,6 +324,9 @@ pub(crate) struct ThreadState {
     /// Post-apply impact cascade awaiting sync / skip.
     #[serde(default)]
     pub(crate) pending_impact: Option<PendingImpact>,
+    /// Studio LLM terminal failure →「再试一次 / 结束本轮」.
+    #[serde(default)]
+    pub(crate) pending_llm_turn_retry: Option<PendingLlmTurnRetry>,
     /// Decision Council auto-revise retry counter (content audit).
     #[serde(default)]
     pub(crate) council_retry_count: u32,
@@ -340,6 +354,9 @@ pub(crate) struct ThreadState {
     pub(crate) lifecycle: AgentLifecycle,
     #[serde(skip)]
     pub(crate) subagent_job: Option<SubagentJob>,
+    /// Optional SubAgent tools whitelist from agents.yaml (Phase B).
+    #[serde(skip)]
+    pub(crate) allowed_tools: Option<Vec<String>>,
     /// Last `SessionPhaseChanged` phase (dedupe WS). Not persisted.
     #[serde(skip)]
     pub(crate) last_composer_phase: Option<ComposerPhase>,
@@ -1024,6 +1041,104 @@ impl NovelxCore {
         gate.active_id().await
     }
 
+    /// True when any thread for `project` has an in-flight turn (blocks Automations wake).
+    pub async fn project_has_active_turn(&self, project: &str) -> bool {
+        let ids: Vec<String> = {
+            let guard = self.threads.read().await;
+            guard
+                .iter()
+                .filter(|(_, t)| t.summary.project.as_deref() == Some(project))
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for id in ids {
+            if self.active_turn_id(&id).await.is_some() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Arm loop wake after human cleared a soft/hard gate (Automations may resume once).
+    pub fn arm_project_loop_wake(&self, project: &str) -> bool {
+        let dir = novelx_pipeline::project_dir(&self.roots.projects_root, project);
+        novelx_pipeline::arm_loop_wake_after_human(&dir).unwrap_or(false)
+    }
+
+    /// Online Automations: resume crash / armed loops. Never skips hard gates.
+    pub async fn try_auto_wake_project_loops(self: &Arc<Self>) -> usize {
+        let lf = novelx_harness::LongformConfig::load_from_config_root(&self.roots.config_root);
+        if lf.loop_wake_interval_secs == 0 {
+            return 0;
+        }
+        let stale = lf.loop_stale_running_secs.max(60);
+        let mut woke = 0usize;
+        for (name, dir, job) in novelx_pipeline::list_projects_with_loop_jobs(&self.roots.projects_root)
+        {
+            if !novelx_pipeline::should_auto_wake(&job, stale) {
+                continue;
+            }
+            if self.project_has_active_turn(&name).await {
+                tracing::debug!(project = %name, "loop wake skipped: active turn");
+                continue;
+            }
+            // Hard-stop jobs require human arm; crash (Running+stale) / auto_wake_allowed only.
+            if matches!(job.status, novelx_pipeline::LoopJobStatus::Stopped) {
+                if let Some(stop) = &job.last_stop {
+                    if stop.requires_human && !job.pending_wake {
+                        continue;
+                    }
+                    if !stop.resumable {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
+            let mut opts = novelx_pipeline::opts_from_job(&job);
+            // Crash / armed resume: keep prior soft-skip flags; never invent hard-gate skips.
+            opts.project = name.clone();
+            tracing::info!(
+                project = %name,
+                pending_wake = job.pending_wake,
+                status = ?job.status,
+                "loop Automations wake → continue_writing_batch"
+            );
+            match novelx_pipeline::run_continue_batch(
+                &self.roots.projects_root,
+                &self.roots.config_root,
+                opts,
+                self.roots.llm.clone(),
+                None,
+            )
+            .await
+            {
+                Ok(result) => {
+                    woke += 1;
+                    tracing::info!(
+                        project = %name,
+                        stopped = %result.stopped_reason,
+                        published = result.chapters_published,
+                        "loop wake batch finished"
+                    );
+                    let _ = novelx_pipeline::loop_runtime::append_loop_journal(
+                        &dir,
+                        serde_json::json!({
+                            "ts": novelx_pipeline::loop_runtime::now_rfc3339(),
+                            "event": "auto_wake",
+                            "stopped_reason": result.stopped_reason,
+                            "chapters_published": result.chapters_published,
+                        }),
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(project = %name, error = %e, "loop wake batch failed");
+                }
+            }
+        }
+        woke
+    }
+
     /// True when a human gate is open — RegularTask must not auto-drain queued clicks.
     pub async fn thread_awaiting_human(&self, thread_id: &str) -> bool {
         let guard = self.threads.read().await;
@@ -1039,6 +1154,7 @@ impl NovelxCore {
             || t.pending_mutation.is_some()
             || t.pending_studio_next.is_some()
             || t.pending_impact.is_some()
+            || t.pending_llm_turn_retry.is_some()
     }
 
     async fn clear_queued_inputs(&self, thread_id: &str) {
@@ -1071,9 +1187,26 @@ impl NovelxCore {
 
     pub async fn set_subagent_job(&self, thread_id: &str, job: SubagentJob) {
         if let Some(t) = self.threads.write().await.get_mut(thread_id) {
+            if job.allowed_tools.is_some() {
+                t.allowed_tools = job.allowed_tools.clone();
+            }
             t.subagent_job = Some(job);
             t.lifecycle = AgentLifecycle::Running;
         }
+    }
+
+    pub async fn set_thread_allowed_tools(&self, thread_id: &str, tools: Vec<String>) {
+        if let Some(t) = self.threads.write().await.get_mut(thread_id) {
+            t.allowed_tools = Some(tools);
+        }
+    }
+
+    async fn thread_allowed_tools(&self, thread_id: &str) -> Option<Vec<String>> {
+        self.threads
+            .read()
+            .await
+            .get(thread_id)
+            .and_then(|t| t.allowed_tools.clone())
     }
 
     /// Child SubAgents registered under `parent_thread_id` (for Studio hydrate).
@@ -1309,6 +1442,7 @@ impl NovelxCore {
                             awaiting_studio_next: None,
                             outline_rewrite_active: false,
                             pending_impact: None,
+                            pending_llm_turn_retry: None,
                             council_retry_count: 0,
                             council_last_p0_types: Vec::new(),
                             council_same_type_streak: 0,
@@ -1319,6 +1453,7 @@ impl NovelxCore {
                             session_source: SessionSource::Root,
                             lifecycle: AgentLifecycle::Running,
                             subagent_job: None,
+                            allowed_tools: None,
                             last_composer_phase: None,
                         },
                     );
@@ -1542,6 +1677,8 @@ impl NovelxCore {
                 json!({
                     "step_ran": false,
                     "summary": format!("{e}"),
+                    "artifacts": [],
+                    "warnings": [format!("{e}")],
                     "error": format!("{e}"),
                 }),
             ),
@@ -2340,6 +2477,145 @@ impl NovelxCore {
             return Ok(());
         }
 
+        // Deterministic: Studio LLM terminal failure → retry same user text / end turn.
+        if let Some((tool_name, pending_ltr)) =
+            self.parse_llm_turn_retry_op(&thread_id, &text).await
+        {
+            tracing::info!(%tool_name, "studio llm_turn_retry gate");
+            if tool_name == "__retry_llm_turn" {
+                let summary = "正在用原请求再试一次…".to_string();
+                let agent_item_id = new_id("item");
+                self.emit_to_thread(
+                    &thread_id,
+                    EventMsg::ItemStarted {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                        item: TurnItem::AgentMessage {
+                            id: agent_item_id.clone(),
+                            text: String::new(),
+                            status: ItemStatus::InProgress,
+                        },
+                    },
+                )
+                .await;
+                self.emit_to_thread(
+                    &thread_id,
+                    EventMsg::AgentMessageContentDelta {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                        item_id: agent_item_id.clone(),
+                        delta: summary.clone(),
+                    },
+                )
+                .await;
+                if let Some(t) = self.threads.write().await.get_mut(&thread_id) {
+                    t.messages.push(ChatMessage {
+                        role: "assistant".into(),
+                        content: summary.clone(),
+                        tool_call_id: None,
+                        tool_calls: None,
+                        ..Default::default()
+                    });
+                    t.ui_turns = append_completion_ui_turn(
+                        std::mem::take(&mut t.ui_turns),
+                        &turn_id,
+                        &summary,
+                        false,
+                    );
+                }
+                self.emit_to_thread(
+                    &thread_id,
+                    EventMsg::ItemCompleted {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                        item: TurnItem::AgentMessage {
+                            id: agent_item_id,
+                            text: summary,
+                            status: ItemStatus::Completed,
+                        },
+                    },
+                )
+                .await;
+                let _ = self.persist_thread(&thread_id).await;
+                self.emit_to_thread(
+                    &thread_id,
+                    EventMsg::TurnComplete {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                    },
+                )
+                .await;
+                // Replay original user text; history keeps prior successful tool results.
+                self.enqueue_pending_user_text(&thread_id, &pending_ltr.user_text)
+                    .await;
+                return Ok(());
+            }
+            // __dismiss_llm_turn
+            let summary = "已结束本轮。需要时可重新发送同一请求。".to_string();
+            let agent_item_id = new_id("item");
+            self.emit_to_thread(
+                &thread_id,
+                EventMsg::ItemStarted {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    item: TurnItem::AgentMessage {
+                        id: agent_item_id.clone(),
+                        text: String::new(),
+                        status: ItemStatus::InProgress,
+                    },
+                },
+            )
+            .await;
+            self.emit_to_thread(
+                &thread_id,
+                EventMsg::AgentMessageContentDelta {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    item_id: agent_item_id.clone(),
+                    delta: summary.clone(),
+                },
+            )
+            .await;
+            if let Some(t) = self.threads.write().await.get_mut(&thread_id) {
+                t.messages.push(ChatMessage {
+                    role: "assistant".into(),
+                    content: summary.clone(),
+                    tool_call_id: None,
+                    tool_calls: None,
+                    ..Default::default()
+                });
+                t.ui_turns = append_completion_ui_turn(
+                    std::mem::take(&mut t.ui_turns),
+                    &turn_id,
+                    &summary,
+                    false,
+                );
+            }
+            self.emit_to_thread(
+                &thread_id,
+                EventMsg::ItemCompleted {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    item: TurnItem::AgentMessage {
+                        id: agent_item_id,
+                        text: summary,
+                        status: ItemStatus::Completed,
+                    },
+                },
+            )
+            .await;
+            let _ = self.persist_thread(&thread_id).await;
+            self.emit_to_thread(
+                &thread_id,
+                EventMsg::TurnComplete {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                },
+            )
+            .await;
+            return Ok(());
+        }
+
         // Situational next-step card from offer_decisions(kind=studio_next) or soft fallback.
         if let Some(pick) = self.parse_studio_next_op(&thread_id, &text).await {
             tracing::info!(option = %pick.opt.id, "studio_next gate");
@@ -2829,6 +3105,9 @@ impl NovelxCore {
         {
             tracing::info!(%tool_name, args = %args, "studio direct volume audit gate");
             if tool_name == "__dismiss_volume_audit" {
+                if let Some(project) = bound_project.as_deref().filter(|p| !p.is_empty()) {
+                    let _ = self.arm_project_loop_wake(project);
+                }
                 let agent_item_id = new_id("item");
                 let summary = "已结束卷级复盘。需要时再说「审这一卷」或「审阅第N-M章」。".to_string();
                 self.emit_to_thread(&thread_id, EventMsg::ItemStarted {
@@ -5687,7 +5966,22 @@ impl NovelxCore {
             injections: &injections,
         });
 
-        let specs = tool_specs(&self.tools);
+        let allowed = self.thread_allowed_tools(&thread_id).await;
+        let specs = match &allowed {
+            Some(allow) if !allow.is_empty() => {
+                let allow_set: std::collections::HashSet<&str> =
+                    allow.iter().map(|s| s.as_str()).collect();
+                tool_specs(
+                    &self
+                        .tools
+                        .iter()
+                        .filter(|t| allow_set.contains(t.name()))
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                )
+            }
+            _ => tool_specs(&self.tools),
+        };
         let mut agent_item_id = new_id("item");
         self.emit_to_thread(&thread_id, EventMsg::ItemStarted {
                 thread_id: thread_id.clone(),
@@ -5788,20 +6082,24 @@ impl NovelxCore {
             }
 
             // Prefer studio task model (faster / bounded) for the tool loop.
+            // Provider retries + failover run inside LlmClient; Studio adds one auto-retry
+            // then opens gates.yaml `llm_turn_retry` instead of aborting the turn.
             let studio_model = self.roots.llm.model_for_agent("studio_agent");
-            let core_delta = self.clone();
-            let thread_delta = thread_id.clone();
-            let turn_delta = turn_id.clone();
-            let item_delta = agent_item_id.clone();
-            let reasoning_item_id = new_id("item");
             let stream_reasoning = self.features.stream_reasoning();
-            let reasoning_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let mut streamed = String::new();
-            let result = self
-                .roots
-                .llm
-                .complete_messages_stream_limited_ex(
-                    messages,
+            let mut reasoning_item_id;
+            let mut reasoning_started;
+            let mut studio_llm_auto_retried = false;
+            let result = loop {
+                let core_delta = self.clone();
+                let thread_delta = thread_id.clone();
+                let turn_delta = turn_id.clone();
+                let item_delta = agent_item_id.clone();
+                reasoning_item_id = new_id("item");
+                reasoning_started =
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let call = self.roots.llm.complete_messages_stream_limited_ex(
+                    messages.clone(),
                     Some(&studio_model),
                     Some(&specs),
                     None,
@@ -5864,8 +6162,64 @@ impl NovelxCore {
                                 .await;
                         }
                     },
-                )
-                .await?;
+                );
+                match call.await {
+                    Ok(r) => break r,
+                    Err(e) => {
+                        if studio_should_auto_retry_llm(studio_llm_auto_retried) {
+                            studio_llm_auto_retried = true;
+                            tracing::warn!(
+                                error = %e,
+                                "studio llm failed after provider retries; auto-retry once"
+                            );
+                            // Fresh bubble so partial stream / blank TurnTimeline does not stick.
+                            if !streamed.is_empty() || opened_post_tool_bubble {
+                                agent_item_id = new_id("item");
+                                self.emit_to_thread(
+                                    &thread_id,
+                                    EventMsg::ItemStarted {
+                                        thread_id: thread_id.clone(),
+                                        turn_id: turn_id.clone(),
+                                        item: TurnItem::AgentMessage {
+                                            id: agent_item_id.clone(),
+                                            text: String::new(),
+                                            status: ItemStatus::InProgress,
+                                        },
+                                    },
+                                )
+                                .await;
+                            }
+                            streamed.clear();
+                            let note = "（模型调用失败，正在自动重试…）\n";
+                            self.emit_to_thread(
+                                &thread_id,
+                                EventMsg::AgentMessageContentDelta {
+                                    thread_id: thread_id.clone(),
+                                    turn_id: turn_id.clone(),
+                                    item_id: agent_item_id.clone(),
+                                    delta: note.into(),
+                                },
+                            )
+                            .await;
+                            streamed.push_str(note);
+                            continue;
+                        }
+                        tracing::warn!(
+                            error = %e,
+                            "studio llm failed after auto-retry; opening llm_turn_retry gate"
+                        );
+                        self.finish_studio_llm_turn_failure(
+                            &thread_id,
+                            &turn_id,
+                            &agent_item_id,
+                            &text,
+                            &e.to_string(),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
+            };
             if reasoning_started.load(std::sync::atomic::Ordering::Relaxed) {
                 let text = result.reasoning_content.clone().unwrap_or_default();
                 self.emit_to_thread(
@@ -6192,8 +6546,18 @@ impl NovelxCore {
                     .await
                 });
 
-                let tool_result =
-                    dispatch(&self.tools, &tool_ctx, &tc.name, &tc.arguments).await;
+                let tool_result = if let Some(allow) = allowed.as_ref() {
+                    if !allow.is_empty() && !allow.iter().any(|n| n == &tc.name) {
+                        Err(anyhow::anyhow!(
+                            "tool '{}' not in SubAgent tools whitelist for this role",
+                            tc.name
+                        ))
+                    } else {
+                        dispatch(&self.tools, &tool_ctx, &tc.name, &tc.arguments).await
+                    }
+                } else {
+                    dispatch(&self.tools, &tool_ctx, &tc.name, &tc.arguments).await
+                };
                 drop(tool_ctx);
                 // Progress flusher can stall on a full WS sink; never block ItemCompleted.
                 let streamed = match tokio::time::timeout(
@@ -6939,7 +7303,98 @@ impl NovelxCore {
                 thread_id: thread_id.clone(),
                 turn_id: turn_id.clone(),
             }).await;
+
+        // LLM-path SubAgent (no SubagentJob): unblock wait_agent with closing summary.
+        self.maybe_finish_llm_subagent(&thread_id, &closing, true)
+            .await;
+
         Ok(())
+    }
+
+    /// Publish wait_agent result for SubAgents that ran the LLM tool loop
+    /// (domain_tool allow_spawn roles). Pipeline SubagentJob path already published.
+    pub async fn maybe_finish_llm_subagent(
+        &self,
+        thread_id: &str,
+        summary: &str,
+        ok: bool,
+    ) {
+        let src = match self.get_session_source(thread_id).await {
+            Some(s) if !s.is_root() => s,
+            _ => return,
+        };
+        // Pipeline step already published (or interrupt already filled the slot).
+        if self.hub.result_summary(thread_id).await.is_some() {
+            return;
+        }
+        // Still has a pending pipeline job → not the LLM path.
+        if self
+            .threads
+            .read()
+            .await
+            .get(thread_id)
+            .and_then(|t| t.subagent_job.as_ref())
+            .is_some()
+        {
+            return;
+        }
+        let summary = if summary.trim().is_empty() {
+            if ok {
+                format!("{} completed", src.role().unwrap_or("subagent"))
+            } else {
+                format!("{} failed", src.role().unwrap_or("subagent"))
+            }
+        } else {
+            summary.trim().to_string()
+        };
+        let data = json!({
+            "step_ran": false,
+            "llm_path": true,
+            "summary": summary,
+            "artifacts": [],
+            "warnings": if ok { json!([]) } else { json!([summary]) },
+        });
+        self.hub
+            .publish_result(thread_id, summary.clone(), data)
+            .await;
+        let lifecycle = if ok {
+            AgentLifecycle::Completed
+        } else {
+            AgentLifecycle::Failed
+        };
+        if let Some(t) = self.threads.write().await.get_mut(thread_id) {
+            if !matches!(t.lifecycle, AgentLifecycle::Interrupted) {
+                t.lifecycle = lifecycle.clone();
+            }
+        }
+        let final_life = self.agent_lifecycle(thread_id).await;
+        if let Some(parent) = src.parent_thread_id().map(|p| p.to_string()) {
+            let mail = result_mail(thread_id, &parent, &summary);
+            let core = self.arc_self().ok();
+            if let Some(core) = core {
+                tokio::spawn(async move {
+                    let _ = core
+                        .submit(
+                            &parent,
+                            Op::InterAgentCommunication {
+                                communication: mail,
+                            },
+                        )
+                        .await;
+                });
+            }
+        }
+        self.emit_global(EventMsg::AgentStatusChanged {
+            status: novelx_protocol::AgentStatus {
+                thread_id: thread_id.to_string(),
+                agent_path: src.agent_path(),
+                role: src.role().map(|r| r.to_string()),
+                parent_thread_id: src.parent_thread_id().map(|p| p.to_string()),
+                lifecycle: final_life,
+                summary: Some(summary),
+            },
+        })
+        .await;
     }
 
     async fn persist_thread(&self, thread_id: &str) -> Result<()> {
@@ -7035,6 +7490,7 @@ impl NovelxCore {
                 awaiting_studio_next: None,
                 outline_rewrite_active: false,
                 pending_impact: None,
+                pending_llm_turn_retry: None,
                 council_retry_count: 0,
                 council_last_p0_types: Vec::new(),
                 council_same_type_streak: 0,
@@ -7045,6 +7501,7 @@ impl NovelxCore {
                 session_source: source,
                 lifecycle: AgentLifecycle::Running,
                 subagent_job: None,
+                allowed_tools: None,
                 last_composer_phase: None,
             },
         );
@@ -7791,22 +8248,6 @@ impl NovelxCore {
         false
     }
 
-    /// Legacy helper: draft-exists messaging (batch resume is preferred for bare continue).
-    #[allow(dead_code)]
-    fn clarify_bare_continue(&self, project: &str, user_text: &str) -> Option<String> {
-        if !self.with_policies(|p| p.is_continue_write_intent(user_text)) {
-            return None;
-        }
-        let (chapter, chars, suggest) = self.draft_exists_meta(project);
-        if chars < self.with_policies(|p| p.draft_min_chars()) {
-            return None;
-        }
-        Some(format!(
-            "第{chapter}章已有正文（约 {chars} 字），尚未发布（next_chapter={chapter}）。\n\
-             可审校本章并继续连写，或修订本章 / 跳过草稿写第{suggest}章。"
-        ))
-    }
-
     fn draft_exists_meta(&self, project: &str) -> (u32, usize, u32) {
         let dir = project_dir(&self.roots.projects_root, project);
         let chapter = novelx_pipeline::load_project_state(&dir)
@@ -8027,8 +8468,8 @@ impl NovelxCore {
         }
         // Same disk-backed policy as batch (`UnattendedPolicy::soft_skip_enabled`),
         // not the process-cached FeatureFlags — so hot-edited features.yaml stays consistent.
-        // foreshadow skip is batch-only; single-chapter continue_writing never hard-blocks pressure_high.
-        let (skip_vol, skip_exp, _skip_fsh) = {
+        // Foreshadow soft-skip is batch-only.
+        let (skip_vol, skip_exp) = {
             let policy =
                 novelx_harness::UnattendedPolicy::load_from_config_root(&self.roots.config_root);
             policy.resolve_council_skips(&self.roots.config_root)
@@ -9033,6 +9474,7 @@ impl NovelxCore {
             });
             t.pending_audit = None;
             t.pending_chapter_next = None;
+            t.pending_llm_turn_retry = None;
             t.ui_turns = attach_ui_approval(
                 std::mem::take(&mut t.ui_turns),
                 turn_id,
@@ -9053,6 +9495,181 @@ impl NovelxCore {
         .await;
         let _ = self.persist_thread(thread_id).await;
         Ok(true)
+    }
+
+    async fn parse_llm_turn_retry_op(
+        &self,
+        thread_id: &str,
+        text: &str,
+    ) -> Option<(String, PendingLlmTurnRetry)> {
+        let pending = {
+            let guard = self.threads.read().await;
+            guard.get(thread_id)?.pending_llm_turn_retry.clone()
+        }?;
+        let resolve = self.gates.resolve_llm_turn_retry(text)?;
+        let GateResolve::Tool { name, .. } = resolve else {
+            return None;
+        };
+        if name != "__retry_llm_turn" && name != "__dismiss_llm_turn" {
+            return None;
+        }
+        if let Some(t) = self.threads.write().await.get_mut(thread_id) {
+            t.pending_llm_turn_retry = None;
+            t.ui_turns = strip_ui_approvals(std::mem::take(&mut t.ui_turns));
+        }
+        self.clear_queued_inputs(thread_id).await;
+        Some((name, pending))
+    }
+
+    /// Complete the agent bubble with a failure summary and open `llm_turn_retry`.
+    async fn finish_studio_llm_turn_failure(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        agent_item_id: &str,
+        user_text: &str,
+        error: &str,
+    ) -> Result<()> {
+        let project = self
+            .threads
+            .read()
+            .await
+            .get(thread_id)
+            .and_then(|t| t.summary.project.clone())
+            .unwrap_or_default();
+        let gate_prompt = self
+            .gates
+            .prompt("llm_turn_retry")
+            .unwrap_or_else(|| "模型调用失败。请选择：再试一次，或结束本轮。".into());
+        let summary = studio_llm_failure_user_summary(&gate_prompt, error);
+        let options = self.gates.options("llm_turn_retry");
+        if options.is_empty() {
+            // Misconfigured gates — still finish the bubble so the turn is not silent.
+            self.emit_to_thread(
+                thread_id,
+                EventMsg::AgentMessageContentDelta {
+                    thread_id: thread_id.to_string(),
+                    turn_id: turn_id.to_string(),
+                    item_id: agent_item_id.to_string(),
+                    delta: summary.clone(),
+                },
+            )
+            .await;
+            if let Some(t) = self.threads.write().await.get_mut(thread_id) {
+                t.messages.push(ChatMessage {
+                    role: "assistant".into(),
+                    content: summary.clone(),
+                    tool_call_id: None,
+                    tool_calls: None,
+                    ..Default::default()
+                });
+                t.ui_turns = append_completion_ui_turn(
+                    std::mem::take(&mut t.ui_turns),
+                    turn_id,
+                    &summary,
+                    false,
+                );
+            }
+            self.emit_to_thread(
+                thread_id,
+                EventMsg::ItemCompleted {
+                    thread_id: thread_id.to_string(),
+                    turn_id: turn_id.to_string(),
+                    item: TurnItem::AgentMessage {
+                        id: agent_item_id.to_string(),
+                        text: summary,
+                        status: ItemStatus::Completed,
+                    },
+                },
+            )
+            .await;
+            let _ = self.persist_thread(thread_id).await;
+            self.emit_to_thread(
+                thread_id,
+                EventMsg::TurnComplete {
+                    thread_id: thread_id.to_string(),
+                    turn_id: turn_id.to_string(),
+                },
+            )
+            .await;
+            return Ok(());
+        }
+
+        self.emit_to_thread(
+            thread_id,
+            EventMsg::AgentMessageContentDelta {
+                thread_id: thread_id.to_string(),
+                turn_id: turn_id.to_string(),
+                item_id: agent_item_id.to_string(),
+                delta: summary.clone(),
+            },
+        )
+        .await;
+        if let Some(t) = self.threads.write().await.get_mut(thread_id) {
+            t.pending_llm_turn_retry = Some(PendingLlmTurnRetry {
+                project: project.clone(),
+                user_text: user_text.to_string(),
+                error: error.to_string(),
+            });
+            // Terminal LLM failure card must be the only human gate.
+            t.pending_audit = None;
+            t.pending_chapter_next = None;
+            t.pending_studio_next = None;
+            t.awaiting_studio_next = None;
+            t.messages.push(ChatMessage {
+                role: "assistant".into(),
+                content: summary.clone(),
+                tool_call_id: None,
+                tool_calls: None,
+                ..Default::default()
+            });
+            t.ui_turns = append_completion_ui_turn(
+                std::mem::take(&mut t.ui_turns),
+                turn_id,
+                &summary,
+                true,
+            );
+            t.ui_turns = attach_ui_approval(
+                std::mem::take(&mut t.ui_turns),
+                turn_id,
+                &summary,
+                &options,
+            );
+        }
+        self.clear_queued_inputs(thread_id).await;
+        self.emit_to_thread(
+            thread_id,
+            EventMsg::ItemCompleted {
+                thread_id: thread_id.to_string(),
+                turn_id: turn_id.to_string(),
+                item: TurnItem::AgentMessage {
+                    id: agent_item_id.to_string(),
+                    text: summary.clone(),
+                    status: ItemStatus::Completed,
+                },
+            },
+        )
+        .await;
+        self.emit_to_thread(
+            thread_id,
+            EventMsg::RequestUserInput {
+                thread_id: thread_id.to_string(),
+                turn_id: turn_id.to_string(),
+                prompt: summary,
+                options,
+            },
+        )
+        .await;
+        let _ = self.persist_thread(thread_id).await;
+        self.emit_to_thread(
+            thread_id,
+            EventMsg::TurnComplete {
+                thread_id: thread_id.to_string(),
+                turn_id: turn_id.to_string(),
+            },
+        )
+        .await;
+        Ok(())
     }
 
     /// After a volume ends (publish advanced to end chapter), ask sync/skip.
@@ -10411,6 +11028,7 @@ impl NovelxCore {
             "pending_studio_next": t.pending_studio_next,
             "awaiting_studio_next": t.awaiting_studio_next,
             "pending_impact": t.pending_impact,
+            "pending_llm_turn_retry": t.pending_llm_turn_retry,
             "pending_audit_queue": queue,
             "turn_active": turn_active,
             "active_turn_id": active_turn_id,
@@ -10442,6 +11060,18 @@ impl NovelxCore {
                 "summary_markdown": imp.summary_markdown,
                 "hits": imp.hits,
                 "entity_gaps_count": imp.entity_gaps_count,
+            }));
+        }
+        if let Some(ltr) = &t.pending_llm_turn_retry {
+            let prompt = self
+                .gates
+                .prompt("llm_turn_retry")
+                .unwrap_or_else(|| "模型调用失败。请选择：再试一次，或结束本轮。".into());
+            let summary = studio_llm_failure_user_summary(&prompt, &ltr.error);
+            return Some(json!({
+                "kind": "llm_turn_retry",
+                "prompt": summary,
+                "options": self.gates.options("llm_turn_retry"),
             }));
         }
         if let Some(sn) = &t.pending_studio_next {
@@ -10576,6 +11206,7 @@ impl NovelxCore {
                     || t.pending_mutation.is_some()
                     || t.pending_impact.is_some()
                     || t.pending_studio_next.is_some()
+                    || t.pending_llm_turn_retry.is_some()
                     || load_audit_queue(
                         &self.roots.projects_root,
                         t.summary.project.as_deref().unwrap_or(""),
@@ -10804,6 +11435,7 @@ impl NovelxCore {
                     || t.pending_chapter_order.is_some()
                     || t.pending_studio_next.is_some()
                     || t.awaiting_studio_next.is_some()
+                    || t.pending_llm_turn_retry.is_some()
                 {
                     return Ok(false);
                 }
@@ -11243,6 +11875,7 @@ impl NovelxCore {
             t.pending_chapter_order = None;
             t.pending_studio_next = None;
             t.awaiting_studio_next = None;
+            t.pending_llm_turn_retry = None;
             t.ui_turns = attach_ui_approval(
                 std::mem::take(&mut t.ui_turns),
                 turn_id,
@@ -12199,6 +12832,7 @@ impl NovelxCore {
                     || t.pending_chapter_order.is_some()
                     || t.pending_studio_next.is_some()
                     || t.awaiting_studio_next.is_some()
+                    || t.pending_llm_turn_retry.is_some()
                 {
                     return Ok(false);
                 }
@@ -13832,6 +14466,20 @@ fn format_audit_choice_brief(data: &Value, chapter: u32) -> String {
     format!("## 第{chapter}章审校未通过\n\n（无结构化问题；请展开审校工具卡）")
 }
 
+/// After provider retries + failover are exhausted, Studio may auto-reopen the
+/// model call once before opening `llm_turn_retry`.
+pub(crate) fn studio_should_auto_retry_llm(already_auto_retried: bool) -> bool {
+    !already_auto_retried
+}
+
+pub(crate) fn studio_llm_failure_user_summary(gate_prompt: &str, err: &str) -> String {
+    let err = err.trim();
+    if err.is_empty() {
+        gate_prompt.trim().to_string()
+    } else {
+        format!("{}\n\n详情：{err}", gate_prompt.trim())
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -14310,6 +14958,88 @@ mod tests {
             .unwrap();
         assert!(sub.starts_with("sub_"));
         assert!(core.runtimes.read().unwrap().contains_key(&tid));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn studio_llm_recovery_auto_once_then_human_gate() {
+        assert!(studio_should_auto_retry_llm(false));
+        assert!(!studio_should_auto_retry_llm(true));
+    }
+
+    #[test]
+    fn studio_llm_failure_summary_includes_error_detail() {
+        let s = studio_llm_failure_user_summary("模型调用失败。请选择：", "llm http 503");
+        assert!(s.contains("模型调用失败"));
+        assert!(s.contains("llm http 503"));
+        assert_eq!(
+            studio_llm_failure_user_summary("prompt only", "  "),
+            "prompt only"
+        );
+    }
+
+    #[tokio::test]
+    async fn studio_llm_turn_failure_opens_llm_turn_retry_gate() {
+        let root = std::env::temp_dir().join(format!(
+            "novelx-llm-retry-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let projects = root.join("projects");
+        let config = root.join("config");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join("gates.yaml"),
+            include_str!("../../../config/gates.yaml"),
+        )
+        .unwrap();
+        std::fs::write(
+            config.join("features.yaml"),
+            include_str!("../../../config/features.yaml"),
+        )
+        .unwrap();
+        let llm = Arc::new(LlmClient::new(Default::default()));
+        let core = NovelxCore::new(projects, config, llm);
+        let (tid, _) = core.spawn_thread(Some("sample-novel".into()), true).await.unwrap();
+        let turn_id = new_id("turn");
+        let item_id = new_id("item");
+        core.emit_to_thread(
+            &tid,
+            EventMsg::ItemStarted {
+                thread_id: tid.clone(),
+                turn_id: turn_id.clone(),
+                item: TurnItem::AgentMessage {
+                    id: item_id.clone(),
+                    text: String::new(),
+                    status: ItemStatus::InProgress,
+                },
+            },
+        )
+        .await;
+        core.finish_studio_llm_turn_failure(
+            &tid,
+            &turn_id,
+            &item_id,
+            "请继续写下一章",
+            "llm http 503: overloaded",
+        )
+        .await
+        .unwrap();
+        let guard = core.threads.read().await;
+        let t = guard.get(&tid).unwrap();
+        let pending = t.pending_llm_turn_retry.as_ref().expect("pending_llm_turn_retry");
+        assert_eq!(pending.user_text, "请继续写下一章");
+        assert!(pending.error.contains("503"));
+        let gate = core.build_open_gate_dto(t, false).expect("open_gate");
+        assert_eq!(gate.get("kind").and_then(|v| v.as_str()), Some("llm_turn_retry"));
+        let opts = gate.get("options").and_then(|v| v.as_array()).unwrap();
+        assert!(opts.iter().any(|o| o.get("id").and_then(|x| x.as_str()) == Some("ltr_retry")));
+        assert!(opts.iter().any(|o| o.get("id").and_then(|x| x.as_str()) == Some("ltr_end")));
+        drop(guard);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

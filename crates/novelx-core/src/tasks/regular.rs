@@ -75,6 +75,9 @@ pub async fn run_regular_task(
     core.publish_session_phase(&thread_id).await;
 
     if let Err(err) = result {
+        // LLM-path SubAgent: never leave wait_agent hanging on turn failure.
+        core.maybe_finish_llm_subagent(&thread_id, &format!("failed: {err}"), false)
+            .await;
         core.emit_to_thread(
             &thread_id,
             EventMsg::TurnAborted {

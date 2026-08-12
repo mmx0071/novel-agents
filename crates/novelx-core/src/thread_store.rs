@@ -39,6 +39,8 @@ pub struct PersistedThread {
     #[serde(default)]
     pub pending_impact: Option<crate::PendingImpact>,
     #[serde(default)]
+    pub pending_llm_turn_retry: Option<crate::PendingLlmTurnRetry>,
+    #[serde(default)]
     pub council_retry_count: u32,
     #[serde(default)]
     pub council_last_p0_types: Vec<String>,
@@ -98,6 +100,7 @@ pub fn from_state(thread_id: &str, state: &ThreadState) -> PersistedThread {
         awaiting_studio_next: state.awaiting_studio_next.clone(),
         outline_rewrite_active: state.outline_rewrite_active,
         pending_impact: state.pending_impact.clone(),
+        pending_llm_turn_retry: state.pending_llm_turn_retry.clone(),
         council_retry_count: state.council_retry_count,
         council_last_p0_types: state.council_last_p0_types.clone(),
         council_same_type_streak: state.council_same_type_streak,
@@ -134,6 +137,7 @@ pub fn into_state(p: PersistedThread) -> (String, ThreadState) {
             awaiting_studio_next: p.awaiting_studio_next,
             outline_rewrite_active: p.outline_rewrite_active,
             pending_impact: p.pending_impact,
+            pending_llm_turn_retry: p.pending_llm_turn_retry,
             council_retry_count: p.council_retry_count,
             council_last_p0_types: p.council_last_p0_types,
             council_same_type_streak: p.council_same_type_streak,
@@ -144,6 +148,7 @@ pub fn into_state(p: PersistedThread) -> (String, ThreadState) {
             session_source: SessionSource::Root,
             lifecycle: AgentLifecycle::Running,
             subagent_job: None,
+            allowed_tools: None,
             last_composer_phase: None,
         },
     )

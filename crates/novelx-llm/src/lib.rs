@@ -20,6 +20,49 @@ pub enum LlmError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderEndpoint {
+    pub name: String,
+    pub base_url: String,
+    pub api_key_env: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailoverChainEntry {
+    pub provider: String,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailoverConfig {
+    #[serde(default = "default_failover_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub chain: Vec<FailoverChainEntry>,
+}
+
+fn default_failover_enabled() -> bool {
+    true
+}
+
+impl Default for FailoverConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            chain: Vec::new(),
+        }
+    }
+}
+
+/// One stream attempt target (after YAML resolve).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamAttempt {
+    pub label: String,
+    pub model: String,
+    pub base_url: String,
+    pub api_key_env: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
     pub default_model: String,
     pub base_url: String,
@@ -31,6 +74,17 @@ pub struct LlmConfig {
     /// task name → max_tokens (from llm.yaml)
     #[serde(default)]
     pub task_max_tokens: HashMap<String, u32>,
+    /// task name → same-provider fallback model
+    #[serde(default)]
+    pub task_fallback_models: HashMap<String, String>,
+    /// primary model id → fallback model (derived from tasks)
+    #[serde(default)]
+    pub model_fallback: HashMap<String, String>,
+    /// provider name → endpoint (for failover chain)
+    #[serde(default)]
+    pub providers: HashMap<String, ProviderEndpoint>,
+    #[serde(default)]
+    pub failover: FailoverConfig,
     #[serde(default = "default_max_tokens")]
     pub default_max_tokens: u32,
     /// Extra attempts after the first failure (0 = no retry).
@@ -67,12 +121,97 @@ impl Default for LlmConfig {
             tasks: HashMap::new(),
             agents: HashMap::new(),
             task_max_tokens: HashMap::new(),
+            task_fallback_models: HashMap::new(),
+            model_fallback: HashMap::new(),
+            providers: HashMap::new(),
+            failover: FailoverConfig::default(),
             default_max_tokens: default_max_tokens(),
             max_retries: default_max_retries(),
             retry_base_delay_ms: default_retry_base_delay_ms(),
             retry_max_delay_ms: default_retry_max_delay_ms(),
         }
     }
+}
+
+fn normalize_openai_compat_base(url: &str) -> String {
+    if url.contains("/v1") {
+        url.to_string()
+    } else {
+        format!("{}/v1", url.trim_end_matches('/'))
+    }
+}
+
+/// Build ordered stream attempts: primary → task fallback_model → failover chain.
+/// Skips chain entries without a usable API key. Dedupes identical (base, model, key_env).
+pub fn build_stream_attempts(
+    cfg: &LlmConfig,
+    primary_model: &str,
+    key_resolver: &dyn Fn(&str) -> bool,
+) -> Vec<StreamAttempt> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let push = |out: &mut Vec<StreamAttempt>,
+                seen: &mut std::collections::HashSet<String>,
+                label: String,
+                model: String,
+                base_url: String,
+                api_key_env: String| {
+        if model.trim().is_empty() || base_url.trim().is_empty() || api_key_env.trim().is_empty() {
+            return;
+        }
+        let dedupe = format!("{api_key_env}|{base_url}|{model}");
+        if !seen.insert(dedupe) {
+            return;
+        }
+        out.push(StreamAttempt {
+            label,
+            model,
+            base_url,
+            api_key_env,
+        });
+    };
+
+    push(
+        &mut out,
+        &mut seen,
+        "primary".into(),
+        primary_model.to_string(),
+        cfg.base_url.clone(),
+        cfg.api_key_env.clone(),
+    );
+
+    if let Some(fb) = cfg.model_fallback.get(primary_model) {
+        if fb != primary_model {
+            push(
+                &mut out,
+                &mut seen,
+                format!("fallback_model:{fb}"),
+                fb.clone(),
+                cfg.base_url.clone(),
+                cfg.api_key_env.clone(),
+            );
+        }
+    }
+
+    if cfg.failover.enabled {
+        for (idx, ent) in cfg.failover.chain.iter().enumerate() {
+            let Some(prov) = cfg.providers.get(&ent.provider) else {
+                continue;
+            };
+            if !key_resolver(&prov.api_key_env) {
+                continue;
+            }
+            push(
+                &mut out,
+                &mut seen,
+                format!("failover[{idx}]:{}:{}", ent.provider, ent.model),
+                ent.model.clone(),
+                prov.base_url.clone(),
+                prov.api_key_env.clone(),
+            );
+        }
+    }
+    out
 }
 
 pub fn load_llm_config(path: &Path) -> Result<LlmConfig> {
@@ -101,6 +240,28 @@ pub fn load_llm_config(path: &Path) -> Result<LlmConfig> {
         .and_then(|x| x.as_str())
         .unwrap_or("deepseek");
     if let Some(providers) = v.get("providers").and_then(|x| x.as_mapping()) {
+        for (k, prov) in providers {
+            let Some(name) = k.as_str() else { continue };
+            let Some(url) = prov.get("base_url").and_then(|x| x.as_str()) else {
+                continue;
+            };
+            if url.trim().is_empty() {
+                continue;
+            }
+            let env = prov
+                .get("api_key_env")
+                .and_then(|x| x.as_str())
+                .unwrap_or("DEEPSEEK_API_KEY")
+                .to_string();
+            cfg.providers.insert(
+                name.to_string(),
+                ProviderEndpoint {
+                    name: name.to_string(),
+                    base_url: normalize_openai_compat_base(url),
+                    api_key_env: env,
+                },
+            );
+        }
         let pick = providers
             .get(serde_yaml::Value::String(preferred.into()))
             .or_else(|| {
@@ -112,13 +273,7 @@ pub fn load_llm_config(path: &Path) -> Result<LlmConfig> {
             });
         if let Some(prov) = pick {
             if let Some(url) = prov.get("base_url").and_then(|x| x.as_str()) {
-                // DeepSeek OpenAI-compatible path is /v1/chat/completions
-                let url = if url.contains("/v1") {
-                    url.to_string()
-                } else {
-                    format!("{}/v1", url.trim_end_matches('/'))
-                };
-                cfg.base_url = url;
+                cfg.base_url = normalize_openai_compat_base(url);
             }
             if let Some(env) = prov.get("api_key_env").and_then(|x| x.as_str()) {
                 cfg.api_key_env = env.to_string();
@@ -150,6 +305,14 @@ pub fn load_llm_config(path: &Path) -> Result<LlmConfig> {
                 cfg.tasks.insert(ks.to_string(), vs.to_string());
             } else if let Some(m) = val.get("model").and_then(|x| x.as_str()) {
                 cfg.tasks.insert(ks.to_string(), m.to_string());
+                if let Some(fb) = val.get("fallback_model").and_then(|x| x.as_str()) {
+                    if !fb.trim().is_empty() && fb != m {
+                        cfg.task_fallback_models
+                            .insert(ks.to_string(), fb.to_string());
+                        cfg.model_fallback
+                            .insert(m.to_string(), fb.to_string());
+                    }
+                }
             }
             if let Some(n) = val.get("max_tokens").and_then(|x| x.as_u64()) {
                 cfg.task_max_tokens.insert(ks.to_string(), n as u32);
@@ -168,6 +331,30 @@ pub fn load_llm_config(path: &Path) -> Result<LlmConfig> {
                 .and_then(|x| x.as_str())
             {
                 cfg.agents.insert(ks.to_string(), m.to_string());
+            }
+        }
+    }
+
+    if let Some(fo) = v.get("failover") {
+        if let Some(b) = fo.get("enabled").and_then(|x| x.as_bool()) {
+            cfg.failover.enabled = b;
+        }
+        if let Some(chain) = fo.get("chain").and_then(|x| x.as_sequence()) {
+            cfg.failover.chain.clear();
+            for ent in chain {
+                let provider = ent
+                    .get("provider")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let model = ent
+                    .get("model")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !provider.is_empty() && !model.is_empty() {
+                    cfg.failover.chain.push(FailoverChainEntry { provider, model });
+                }
             }
         }
     }
@@ -193,6 +380,9 @@ pub fn load_llm_config(path: &Path) -> Result<LlmConfig> {
         for model in cfg.tasks.values_mut() {
             *model = force.clone();
         }
+        // Fallbacks to the same forced model are useless — clear for clean attempt plans.
+        cfg.task_fallback_models.clear();
+        cfg.model_fallback.clear();
         tracing::info!(%force, "LLM profile=dev: all tasks use cheapest/fastest model");
     } else {
         tracing::info!(%profile, model = %cfg.default_model, "LLM profile loaded");
@@ -1057,35 +1247,11 @@ impl LlmClient {
     {
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let snap = {
+        let (cfg_snap, primary_key) = {
             let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
-            (
-                guard.api_key.clone(),
-                guard.config.default_model.clone(),
-                guard
-                    .config
-                    .task_max_tokens
-                    .get("studio")
-                    .copied()
-                    .unwrap_or(2048),
-                guard.config.default_max_tokens,
-                guard.config.base_url.clone(),
-                guard.config.max_retries,
-                guard.config.retry_base_delay_ms,
-                guard.config.retry_max_delay_ms,
-            )
+            (guard.config.clone(), guard.api_key.clone())
         };
-        let (
-            key,
-            default_model,
-            studio_tokens,
-            default_max_tokens,
-            base_url,
-            max_retries,
-            retry_base,
-            retry_max,
-        ) = snap;
-        let Some(key) = key else {
+        let Some(_primary_key) = primary_key else {
             let content = placeholder_reply(&messages);
             on_delta(content.clone()).await;
             return Ok(CompletionResult {
@@ -1094,46 +1260,39 @@ impl LlmClient {
                 reasoning_content: None,
             });
         };
-        let model_owned = model.unwrap_or(&default_model).to_string();
-        let model = model_owned.as_str();
+        let primary_model = model
+            .unwrap_or(&cfg_snap.default_model)
+            .to_string();
         // Tool loops stay bounded; prose/creative uses yaml (default 8k).
+        let studio_tokens = cfg_snap
+            .task_max_tokens
+            .get("studio")
+            .copied()
+            .unwrap_or(2048);
         let tokens = max_tokens.unwrap_or(if tools.is_some() {
             studio_tokens
         } else {
-            default_max_tokens
+            cfg_snap.default_max_tokens
         });
         let messages = sanitize_chat_messages(messages);
-        let mut body = json!({
-            "model": model,
-            "messages": messages,
-            "stream": true,
-            "max_tokens": tokens,
-        });
-        // DeepSeek V4 defaults thinking=enabled; CoT (`reasoning_content`) and the final
-        // answer (`content`) share `max_tokens`. Non-tool calls with budget ≤64k keep
-        // thinking off so JSON/patches land in `content` quickly. Large creative/planning
-        // budgets (>64k) keep thinking for quality.
         let disable_thinking = tools.is_none() && tokens <= 65536;
-        if disable_thinking {
-            body["thinking"] = json!({"type": "disabled"});
-        }
-        if let Some(tools) = tools {
-            let tools_json: Vec<Value> = tools
-                .iter()
-                .map(|t| {
-                    json!({
-                        "type": "function",
-                        "function": {
-                            "name": t.name,
-                            "description": t.description,
-                            "parameters": t.parameters,
-                        }
+        let tools_json: Option<Value> = tools.map(|tools| {
+            Value::Array(
+                tools
+                    .iter()
+                    .map(|t| {
+                        json!({
+                            "type": "function",
+                            "function": {
+                                "name": t.name,
+                                "description": t.description,
+                                "parameters": t.parameters,
+                            }
+                        })
                     })
-                })
-                .collect();
-            body["tools"] = Value::Array(tools_json);
-        }
-        let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+                    .collect(),
+            )
+        });
         let deadline_secs = if tokens >= 65536 {
             300
         } else if tokens >= 4096 {
@@ -1141,153 +1300,221 @@ impl LlmClient {
         } else {
             90
         };
+        let max_retries = cfg_snap.max_retries;
+        let retry_base = cfg_snap.retry_base_delay_ms;
+        let retry_max = cfg_snap.retry_max_delay_ms;
+        let attempts = build_stream_attempts(&cfg_snap, &primary_model, &|env| {
+            env_has_api_key(env)
+        });
+        if attempts.is_empty() {
+            anyhow::bail!("llm: no stream attempts (missing model/base_url/key env)");
+        }
+
         let started = std::time::Instant::now();
-        tracing::info!(
-            %model,
-            max_tokens = tokens,
-            deadline_secs,
-            max_retries,
-            url = %url,
-            "llm stream start"
-        );
+        let mut last_err: Option<anyhow::Error> = None;
 
-        let mut attempt: u32 = 0;
-        let (content, tool_calls, delta_events, reasoning_content) = loop {
-            let emitted = AtomicBool::new(false);
-            // Hard deadline — reqwest timeout alone can miss stuck body streams.
-            let result = {
-                let on_delta_ref = &mut on_delta;
-                let on_reasoning_ref = &mut on_reasoning;
-                let emitted_ref = &emitted;
-                let mut delta_cb = |piece: String| {
-                    emitted_ref.store(true, Ordering::Relaxed);
-                    on_delta_ref(piece)
-                };
-                let mut reasoning_cb = |piece: String| {
-                    emitted_ref.store(true, Ordering::Relaxed);
-                    on_reasoning_ref(piece)
-                };
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(deadline_secs),
-                    self.drive_chat_stream(
-                        &key,
-                        &base_url,
-                        body.clone(),
-                        &mut delta_cb,
-                        &mut reasoning_cb,
-                    ),
-                )
-                .await
+        for (ep_idx, ep) in attempts.iter().enumerate() {
+            let key = match resolve_api_key_from_env(&ep.api_key_env) {
+                Some(k) => k,
+                None => {
+                    tracing::warn!(
+                        label = %ep.label,
+                        env = %ep.api_key_env,
+                        "llm failover skip: missing API key"
+                    );
+                    continue;
+                }
             };
-            let emitted_any = emitted.load(Ordering::Relaxed);
-            match result {
-                Ok(Ok(v)) => break v,
-                Ok(Err(e)) => {
-                    let msg = format!("{e:#}");
-                    // Mid-stream transport blips: full restart (not continue-from-partial).
-                    // Callers use on_restart to clear draft/UI accumulators first.
-                    let can_retry =
-                        should_retry_llm_stream(attempt, max_retries, emitted_any, &msg);
-                    if !can_retry {
-                        return Err(e);
+            if ep_idx > 0 {
+                on_delta(format!(
+                    "\n⚠ failover → {}（model={}）…\n",
+                    ep.label, ep.model
+                ))
+                .await;
+                on_restart().await;
+                tracing::warn!(
+                    label = %ep.label,
+                    model = %ep.model,
+                    base = %ep.base_url,
+                    "llm failover attempting next endpoint/model"
+                );
+            }
+
+            let mut body = json!({
+                "model": ep.model,
+                "messages": messages,
+                "stream": true,
+                "max_tokens": tokens,
+            });
+            if disable_thinking {
+                body["thinking"] = json!({"type": "disabled"});
+            }
+            if let Some(ref tj) = tools_json {
+                body["tools"] = tj.clone();
+            }
+            let url = format!("{}/chat/completions", ep.base_url.trim_end_matches('/'));
+            tracing::info!(
+                model = %ep.model,
+                label = %ep.label,
+                max_tokens = tokens,
+                deadline_secs,
+                max_retries,
+                url = %url,
+                "llm stream start"
+            );
+
+            let mut attempt: u32 = 0;
+            let stream_outcome = loop {
+                let emitted = AtomicBool::new(false);
+                let result = {
+                    let on_delta_ref = &mut on_delta;
+                    let on_reasoning_ref = &mut on_reasoning;
+                    let emitted_ref = &emitted;
+                    let mut delta_cb = |piece: String| {
+                        emitted_ref.store(true, Ordering::Relaxed);
+                        on_delta_ref(piece)
+                    };
+                    let mut reasoning_cb = |piece: String| {
+                        emitted_ref.store(true, Ordering::Relaxed);
+                        on_reasoning_ref(piece)
+                    };
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(deadline_secs),
+                        self.drive_chat_stream(
+                            &key,
+                            &ep.base_url,
+                            body.clone(),
+                            &mut delta_cb,
+                            &mut reasoning_cb,
+                        ),
+                    )
+                    .await
+                };
+                let emitted_any = emitted.load(Ordering::Relaxed);
+                match result {
+                    Ok(Ok(v)) => break Ok(v),
+                    Ok(Err(e)) => {
+                        let msg = format!("{e:#}");
+                        let can_retry =
+                            should_retry_llm_stream(attempt, max_retries, emitted_any, &msg);
+                        if !can_retry {
+                            break Err(e);
+                        }
+                        let delay = retry_delay_ms(attempt, retry_base, retry_max);
+                        if emitted_any {
+                            on_delta(format!(
+                                "\n⚠ 模型流中断，整段重试（{}/{}）…\n",
+                                attempt + 1,
+                                max_retries
+                            ))
+                            .await;
+                            on_restart().await;
+                            tracing::warn!(
+                                model = %ep.model,
+                                attempt = attempt + 1,
+                                max_retries,
+                                delay_ms = delay,
+                                error = %msg,
+                                "llm mid-stream transient error; full restart retry"
+                            );
+                        } else {
+                            tracing::warn!(
+                                model = %ep.model,
+                                attempt = attempt + 1,
+                                max_retries,
+                                delay_ms = delay,
+                                error = %msg,
+                                "llm transient error before first token; retrying"
+                            );
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                        attempt += 1;
                     }
-                    let delay = retry_delay_ms(attempt, retry_base, retry_max);
-                    if emitted_any {
-                        // Marker for UI; callers' on_restart clears draft/UI accumulators.
-                        on_delta(format!(
-                            "\n⚠ 模型流中断，整段重试（{}/{}）…\n",
-                            attempt + 1,
-                            max_retries
-                        ))
-                        .await;
-                        on_restart().await;
+                    Err(_) => {
+                        let msg = format!(
+                            "llm stream timeout after {deadline_secs}s (model={}, max_tokens={tokens})",
+                            ep.model
+                        );
+                        let can_retry = !emitted_any && attempt < max_retries;
+                        if !can_retry {
+                            tracing::error!(
+                                model = %ep.model,
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                deadline_secs,
+                                emitted_any,
+                                "llm stream deadline exceeded"
+                            );
+                            break Err(anyhow::anyhow!(msg));
+                        }
+                        let delay = retry_delay_ms(attempt, retry_base, retry_max);
                         tracing::warn!(
-                            %model,
+                            model = %ep.model,
                             attempt = attempt + 1,
                             max_retries,
                             delay_ms = delay,
-                            error = %msg,
-                            "llm mid-stream transient error; full restart retry"
+                            "llm stream deadline with no tokens; retrying"
                         );
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                        attempt += 1;
+                    }
+                }
+            };
+
+            match stream_outcome {
+                Ok((content, tool_calls, delta_events, reasoning_content)) => {
+                    let model = ep.model.as_str();
+                    let content = if content.trim().is_empty() {
+                        match &reasoning_content {
+                            Some(r) if !r.trim().is_empty() => {
+                                tracing::warn!(
+                                    %model,
+                                    reasoning_chars = r.chars().count(),
+                                    "llm content empty; falling back to reasoning_content"
+                                );
+                                r.clone()
+                            }
+                            _ => content,
+                        }
                     } else {
+                        content
+                    };
+                    tracing::info!(
+                        %model,
+                        label = %ep.label,
+                        max_tokens = tokens,
+                        thinking_disabled = disable_thinking,
+                        attempts = attempt + 1,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        content_chars = content.chars().count(),
+                        reasoning_chars =
+                            reasoning_content.as_ref().map(|s| s.chars().count()).unwrap_or(0),
+                        delta_events,
+                        tool_calls = tool_calls.len(),
+                        "llm stream done"
+                    );
+                    return Ok(CompletionResult {
+                        content,
+                        tool_calls,
+                        reasoning_content,
+                    });
+                }
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    if is_transient_llm_error(&msg) && ep_idx + 1 < attempts.len() {
                         tracing::warn!(
-                            %model,
-                            attempt = attempt + 1,
-                            max_retries,
-                            delay_ms = delay,
+                            label = %ep.label,
                             error = %msg,
-                            "llm transient error before first token; retrying"
+                            "llm endpoint exhausted retries; trying failover"
                         );
+                        last_err = Some(e);
+                        continue;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                    attempt += 1;
-                }
-                Err(_) => {
-                    let msg = format!(
-                        "llm stream timeout after {deadline_secs}s (model={model}, max_tokens={tokens})"
-                    );
-                    // Hard wall-clock budget already spent with partial tokens — do not
-                    // burn another full creative call; only retry when nothing arrived.
-                    let can_retry = !emitted_any && attempt < max_retries;
-                    if !can_retry {
-                        tracing::error!(
-                            %model,
-                            elapsed_ms = started.elapsed().as_millis() as u64,
-                            deadline_secs,
-                            emitted_any,
-                            "llm stream deadline exceeded"
-                        );
-                        anyhow::bail!(msg);
-                    }
-                    let delay = retry_delay_ms(attempt, retry_base, retry_max);
-                    tracing::warn!(
-                        %model,
-                        attempt = attempt + 1,
-                        max_retries,
-                        delay_ms = delay,
-                        "llm stream deadline with no tokens; retrying"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                    attempt += 1;
+                    return Err(e);
                 }
             }
-        };
+        }
 
-        // Safety net: if thinking mode still filled only reasoning, surface that text so
-        // JSON extractors (consistency auditor etc.) are not handed an empty string.
-        let content = if content.trim().is_empty() {
-            match &reasoning_content {
-                Some(r) if !r.trim().is_empty() => {
-                    tracing::warn!(
-                        %model,
-                        reasoning_chars = r.chars().count(),
-                        "llm content empty; falling back to reasoning_content"
-                    );
-                    r.clone()
-                }
-                _ => content,
-            }
-        } else {
-            content
-        };
-
-        tracing::info!(
-            %model,
-            max_tokens = tokens,
-            thinking_disabled = disable_thinking,
-            attempts = attempt + 1,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            content_chars = content.chars().count(),
-            reasoning_chars = reasoning_content.as_ref().map(|s| s.chars().count()).unwrap_or(0),
-            delta_events,
-            tool_calls = tool_calls.len(),
-            "llm stream done"
-        );
-        Ok(CompletionResult {
-            content,
-            tool_calls,
-            reasoning_content,
-        })
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("llm: all failover attempts failed")))
     }
 
     async fn drive_chat_stream<F, Fut, R, RFut>(
@@ -2111,5 +2338,120 @@ agents:
             assert!(i > 0);
             assert!(!tool_call_ids(&fixed[i - 1]).is_empty() || fixed[i - 1].role == "tool");
         }
+    }
+
+    #[test]
+    fn build_stream_attempts_includes_fallback_model() {
+        let mut cfg = LlmConfig::default();
+        cfg.base_url = "https://api.deepseek.com/v1".into();
+        cfg.api_key_env = "DEEPSEEK_API_KEY".into();
+        cfg.model_fallback
+            .insert("deepseek-v4-pro".into(), "deepseek-v4-flash".into());
+        cfg.failover.enabled = false;
+        let attempts = build_stream_attempts(&cfg, "deepseek-v4-pro", &|_| true);
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].model, "deepseek-v4-pro");
+        assert_eq!(attempts[1].model, "deepseek-v4-flash");
+        assert!(attempts[1].label.contains("fallback_model"));
+    }
+
+    #[test]
+    fn build_stream_attempts_skips_chain_without_key() {
+        let mut cfg = LlmConfig::default();
+        cfg.base_url = "https://api.deepseek.com/v1".into();
+        cfg.api_key_env = "DEEPSEEK_API_KEY".into();
+        cfg.failover.enabled = true;
+        cfg.failover.chain.push(FailoverChainEntry {
+            provider: "openai".into(),
+            model: "gpt-test".into(),
+        });
+        cfg.providers.insert(
+            "openai".into(),
+            ProviderEndpoint {
+                name: "openai".into(),
+                base_url: "https://api.openai.com/v1".into(),
+                api_key_env: "OPENAI_API_KEY".into(),
+            },
+        );
+        let attempts = build_stream_attempts(&cfg, "deepseek-v4-flash", &|env| {
+            env == "DEEPSEEK_API_KEY"
+        });
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].model, "deepseek-v4-flash");
+    }
+
+    #[test]
+    fn build_stream_attempts_dedupes_identical_targets() {
+        let mut cfg = LlmConfig::default();
+        cfg.base_url = "https://api.deepseek.com/v1".into();
+        cfg.api_key_env = "DEEPSEEK_API_KEY".into();
+        cfg.failover.enabled = true;
+        cfg.failover.chain.push(FailoverChainEntry {
+            provider: "deepseek".into(),
+            model: "deepseek-v4-flash".into(),
+        });
+        cfg.providers.insert(
+            "deepseek".into(),
+            ProviderEndpoint {
+                name: "deepseek".into(),
+                base_url: "https://api.deepseek.com/v1".into(),
+                api_key_env: "DEEPSEEK_API_KEY".into(),
+            },
+        );
+        let attempts = build_stream_attempts(&cfg, "deepseek-v4-flash", &|_| true);
+        assert_eq!(attempts.len(), 1);
+    }
+
+    #[test]
+    fn load_llm_config_parses_fallback_and_failover() {
+        let dir = std::env::temp_dir().join(format!(
+            "novelx-llm-fo-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_micros()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("llm.yaml");
+        std::fs::write(
+            &path,
+            r#"
+profile: prod
+default_provider: deepseek
+failover:
+  enabled: true
+  chain:
+    - provider: deepseek
+      model: deepseek-v4-flash
+providers:
+  deepseek:
+    api_key_env: DEEPSEEK_API_KEY
+    base_url: https://api.deepseek.com
+tasks:
+  creative:
+    model: deepseek-v4-pro
+    fallback_model: deepseek-v4-flash
+    max_tokens: 1000
+agents:
+  writer: creative
+"#,
+        )
+        .unwrap();
+        let cfg = load_llm_config(&path).unwrap();
+        assert_eq!(
+            cfg.model_fallback.get("deepseek-v4-pro").map(String::as_str),
+            Some("deepseek-v4-flash")
+        );
+        assert!(cfg.failover.enabled);
+        assert_eq!(cfg.failover.chain.len(), 1);
+        assert!(cfg.providers.contains_key("deepseek"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_transient_should_not_failover_signal() {
+        // Contract for outer loop: only transient errors continue the attempt chain.
+        assert!(!is_transient_llm_error("llm http 400: bad request"));
+        assert!(is_transient_llm_error("llm http 503: overloaded"));
     }
 }

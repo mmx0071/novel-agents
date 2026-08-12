@@ -110,6 +110,22 @@ gates:
         resolve: dismiss_gate
         aliases: [稍后, 暂不处理, 结束]
 
+  # Studio LLM call failed after provider retries + failover + one Studio auto-retry.
+  # 「再试一次」重放同一条用户原文（保留已成功 tool 结果）；「结束本轮」正常收尾。
+  llm_turn_retry:
+    prompt: "模型调用失败（已自动重试）。请选择：再试一次，或结束本轮。"
+    options:
+      - id: ltr_retry
+        label: 再试一次
+        tool: __retry_llm_turn
+        args: {}
+        aliases: [再试一次, 重试, 再试]
+      - id: ltr_end
+        label: 结束本轮
+        tool: __dismiss_llm_turn
+        args: {}
+        aliases: [结束本轮, 结束, 取消]
+
   # Skip-ahead chapter write blocked → offer the correct next chapter.
   chapter_order:
     options:
@@ -274,6 +290,7 @@ gates:
           chapter: "{{chapter}}"
           instructions: "按审批卡列出的硬规则违规逐条改句；只改违规句，勿整章重写。"
         aliases: [修正本章, 修正, 修改本章, 修订]
+      # 「卡点」= 硬门/本剧情卡边界停机，不是跨多卡冲 batch_max_chapters。
       - id: cn_batch
         label: 连写到卡点
         tool: continue_writing_batch

@@ -1,8 +1,32 @@
 //! Role → skill name; spawnability and full-chapter mode guards.
 
-/// Roles that may be spawned as SubAgents (excludes studio root; `orchestrator` kept denied for legacy ids).
-pub fn is_spawnable_role(role: &str) -> bool {
-    !matches!(role, "studio_agent" | "orchestrator" | "")
+use std::path::Path;
+
+/// Roles that may be spawned as SubAgents.
+/// Requires `allow_spawn: true` in `config/agents.yaml` (unknown → denied).
+pub fn is_spawnable_role(config_root: &Path, role: &str) -> bool {
+    novelx_harness::is_spawn_allowed(config_root, role)
+}
+
+/// Human-oriented denial when spawn is blocked by catalog / hard deny.
+pub fn spawn_denied_message(config_root: &Path, role: &str) -> String {
+    if matches!(role, "studio_agent" | "orchestrator" | "") {
+        return format!("role '{role}' is not spawnable");
+    }
+    if let Some(entry) = novelx_harness::lookup_agent(config_root, role) {
+        return format!(
+            "role '{}' (invocation={}) 不允许 spawn_agent。\
+整章续写/修订/审校请用 continue_writing / revise_chapter / audit_chapter（或 audit_chapters）；\
+领域操作请用对应 design_* / audit_* / research_materials 等工具。\
+可 spawn 旁路目录见 list_agents(filter=spawnable)。",
+            role,
+            entry.invocation.as_str()
+        );
+    }
+    format!(
+        "role '{role}' 未在 agents.yaml 注册或不允许 spawn。\
+可 spawn 旁路目录见 list_agents(filter=spawnable)。"
+    )
 }
 
 pub fn skill_name_for_role(role: &str) -> String {
@@ -29,6 +53,10 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    fn repo_config() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config")
+    }
+
     #[test]
     fn rejects_chapter_plus_pipeline_mode() {
         assert!(pipeline_mode_spawn_forbidden(Some(3), Some("continue")).is_some());
@@ -44,9 +72,25 @@ mod tests {
     }
 
     #[test]
+    fn spawn_whitelist_from_agents_yaml() {
+        let root = repo_config();
+        if !root.join("agents.yaml").is_file() {
+            return;
+        }
+        assert!(!is_spawnable_role(&root, "writer"));
+        assert!(!is_spawnable_role(&root, "decision_council"));
+        assert!(!is_spawnable_role(&root, "studio_agent"));
+        assert!(is_spawnable_role(&root, "literary_editor"));
+        assert!(is_spawnable_role(&root, "material_researcher"));
+        let msg = spawn_denied_message(&root, "writer");
+        assert!(msg.contains("continue_writing"), "{msg}");
+        assert!(msg.contains("list_agents"), "{msg}");
+    }
+
+    #[test]
     fn pipeline_roles_still_resolved_from_config() {
         use novelx_harness::PipelineConfig;
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config");
+        let root = repo_config();
         if !root.join("pipeline.yaml").is_file() {
             return;
         }

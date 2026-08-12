@@ -4,53 +4,79 @@
 # 按 config/pipeline.yaml 的 order 执行（无独立 Orchestrator LLM）。
 # 亦可用工具 activate_agents 显式激活扩展 Agent。
 #
-# 约定：
+# 调用面（三层，勿混用）：
+# - 领域 Tool：Studio 调 continue_writing / design_* / audit_* 等（invocation=domain_tool）
+# - pipeline 步骤：进程内 execute_pipeline 按 order 跑（invocation=pipeline）
+# - SubAgent 旁路：仅 allow_spawn=true 可用 spawn_agent（单步专精 / 长上下文隔离）
+#
+# 字段：
+# - invocation: orchestration | pipeline | domain_tool | in_process
+# - allow_spawn: 默认 false；未知角色拒绝 spawn
+# - tools: 可选；旁路角色工具白名单（省略=不额外收紧；Phase B）
+#
+# 其它约定：
 # - 执行顺序只认 pipeline.yaml 的 order（勿写 depends_on；运行时不读该字段）。
 # - tier: mvp 的角色由 pipeline.mvp 每章纳入；勿再挂 activation（会被忽略）。
 
 agents:
-  # ── MVP / Studio 注册（实际章节步骤见 pipeline.yaml mvp∪order） ──
+  # ── Orchestration ──
 
   studio_agent:
     name: NovelX Agent
     layer: orchestration
     tier: mvp
+    invocation: orchestration
+    allow_spawn: false
     description: NovelX 调度层 — REACT 解析用户意图，分配给功能 Agent
+
+  # ── Pipeline MVP（禁 spawn；整章走领域 Tool → 进程内流水线）──
 
   chapter_planner:
     name: 章纲规划
     layer: story
     tier: mvp
+    invocation: pipeline
+    allow_spawn: false
     description: 输出单章详细章纲
 
   writer:
     name: 正文写作
     layer: production
     tier: mvp
+    invocation: pipeline
+    allow_spawn: false
     description: 按章纲撰写正文初稿
 
   consistency_auditor:
     name: 一致性审计
     layer: qa
     tier: mvp
+    invocation: pipeline
+    allow_spawn: false
     description: 检查人物、时间线、设定一致性
 
   summarizer:
     name: 章节摘要
     layer: memory
     tier: mvp
+    invocation: pipeline
+    allow_spawn: false
     description: 生成章节摘要与新事实清单
 
   plot_acceptor:
     name: 剧情验收
     layer: story
     tier: mvp
+    invocation: pipeline
+    allow_spawn: false
     description: 对照进行中剧情卡收束条件验收本章；通过则自动 completed
 
   lore_librarian:
     name: 设定检索
     layer: world
     tier: mvp
+    invocation: in_process
+    allow_spawn: false
     description: >-
       Lore 确定性 query/assert（非 LLM）。章纲后切片注入 Writer；摘要后入库。
 
@@ -58,37 +84,18 @@ agents:
     name: 节奏审查
     layer: qa
     tier: mvp
+    invocation: pipeline
+    allow_spawn: false
     description: 检查节奏与信息密度（MVP 每章必跑；节奏 P0 不阻断发布）
 
-  # ── 扩展 Agent（按需激活） ──
-  world_architect:
-    name: 世界观架构
-    layer: world
-    tier: extended
-    description: 搭建世界观 Bible
-    activation:
-      - condition: no_bible
-        reason: 项目尚无世界观 Bible
-      - condition: bible_stale
-        reason: 设定变更超过 3 次未同步 Bible
-
-  volume_auditor:
-    name: 卷级复盘
-    layer: qa
-    tier: extended
-    description: >-
-      摘要层跨章复盘（audit_volume）；不进章流水线 order，由 Studio 工具调用
-    activation:
-      - condition: chapters_in_arc_gt
-        threshold: 20
-        reason: 本卷已写 20+ 章，建议 Studio 调用 audit_volume 做卷中复盘（与 mid_audit 门槛对齐）
-      - condition: volume_handoff
-        reason: 卷交接/待同步阶段，建议跑 audit_volume 再开下卷
+  # ── Pipeline 扩展（热路径靠 activation；默认禁 spawn）──
 
   nomenclature_curator:
     name: 名词管理
     layer: world
     tier: extended
+    invocation: pipeline
+    allow_spawn: false
     description: 为人物/物品/设定取名，名与能力语义绑定，规避语料高频名
     activation:
       - condition: no_nomenclature
@@ -96,34 +103,12 @@ agents:
       - condition: has_new_entity_hints
         reason: 本章出现未登记的新实体待命名
 
-  master_planner:
-    name: 总纲规划
-    layer: story
-    tier: extended
-    description: 制定总纲
-    activation:
-      - condition: no_master_outline
-        reason: 尚无总纲
-      - condition: chapter_count_gt
-        threshold: 30
-        reason: 超过 30 章需复盘总纲偏离度
-
-  arc_planner:
-    name: 卷纲规划
-    layer: story
-    tier: extended
-    description: 规划单卷/故事弧
-    activation:
-      - condition: no_arc_outline
-        reason: 当前卷尚无卷纲
-      - condition: chapters_in_arc_gt
-        threshold: 8
-        reason: 本卷已有 8+ 章但未规划卷纲
-
   dialogue_specialist:
     name: 对话专改
     layer: production
     tier: extended
+    invocation: pipeline
+    allow_spawn: false
     description: 专改对话声线与潜台词
     activation:
       - condition: dialogue_ratio_gt
@@ -137,6 +122,8 @@ agents:
     name: 场景专改
     layer: production
     tier: extended
+    invocation: pipeline
+    allow_spawn: false
     description: 专改场景与动作描写
     activation:
       - condition: has_scene_tags
@@ -147,6 +134,8 @@ agents:
     name: 伏笔追踪
     layer: qa
     tier: extended
+    invocation: pipeline
+    allow_spawn: false
     description: 追踪伏笔埋收（读 lore/foreshadow_index，禁止静默丢历史未收线）
     activation:
       - condition: active_foreshadows_gt
@@ -162,18 +151,82 @@ agents:
     name: 文学润色
     layer: qa
     tier: extended
-    description: 润色表达、去 AI 腔（非 MVP；activation 建议 + Studio activate_agents）
+    invocation: pipeline
+    allow_spawn: true
+    description: >-
+      润色表达、去 AI 腔（非 MVP）。热路径：activate_agents / revise_chapter；
+      点名单步可观测时可 spawn_agent（勿带整章 mode）。
+    tools: [read_chapter, query_lore, query_memory]
     activation:
       # 续写规划时 draft 多为空，勿用 word_count。用户点名润色由 Studio 持久激活。
       - condition: audit_fail_rate_gt
         threshold: 0.25
         reason: 近章审校失败率偏高，建议润色压重复与表述问题
 
-  # ── 介入式设定 Agent（不进章流水线，由 NovelX / hook 调用）──
+  # ── 领域 Tool（主路径专用工具；默认禁 spawn）──
+
+  world_architect:
+    name: 世界观架构
+    layer: world
+    tier: extended
+    invocation: domain_tool
+    allow_spawn: false
+    description: 搭建世界观 Bible
+    activation:
+      - condition: no_bible
+        reason: 项目尚无世界观 Bible
+      - condition: bible_stale
+        reason: 设定变更超过 3 次未同步 Bible
+
+  volume_auditor:
+    name: 卷级复盘
+    layer: qa
+    tier: extended
+    invocation: domain_tool
+    allow_spawn: false
+    description: >-
+      摘要层跨章复盘（audit_volume）；不进章流水线 order，由 Studio 工具调用
+    activation:
+      - condition: chapters_in_arc_gt
+        threshold: 20
+        reason: 本卷已写 20+ 章，建议 Studio 调用 audit_volume 做卷中复盘（与 mid_audit 门槛对齐）
+      - condition: volume_handoff
+        reason: 卷交接/待同步阶段，建议跑 audit_volume 再开下卷
+
+  master_planner:
+    name: 总纲规划
+    layer: story
+    tier: extended
+    invocation: domain_tool
+    allow_spawn: false
+    description: 制定总纲
+    activation:
+      - condition: no_master_outline
+        reason: 尚无总纲
+      - condition: chapter_count_gt
+        threshold: 30
+        reason: 超过 30 章需复盘总纲偏离度
+
+  arc_planner:
+    name: 卷纲规划
+    layer: story
+    tier: extended
+    invocation: domain_tool
+    allow_spawn: false
+    description: 规划单卷/故事弧
+    activation:
+      - condition: no_arc_outline
+        reason: 当前卷尚无卷纲
+      - condition: chapters_in_arc_gt
+        threshold: 8
+        reason: 本卷已有 8+ 章但未规划卷纲
+
   entity_designer:
     name: 设定卡设计
     layer: world
     tier: extended
+    invocation: domain_tool
+    allow_spawn: false
     description: 新增/补全人物·物品·地点设定卡，写入前过冲突审计
     activation:
       - condition: has_new_entity_hints
@@ -181,22 +234,12 @@ agents:
       - condition: no_nomenclature
         reason: 尚无实体体系，需要设计卡
 
-  setting_auditor:
-    name: 设定审计
-    layer: qa
-    tier: extended
-    description: 设定层冲突/遗漏/异常审计（含 stub 缺口与摘要漂移）；剧情收束后自动巡检
-    activation:
-      - condition: has_bible
-        reason: 已有 Bible，设定变更需冲突审计
-      - condition: entity_count_gt
-        threshold: 3
-        reason: 实体增多，需设定一致性审计
-
   plot_designer:
     name: 剧情卡设计
     layer: story
     tier: extended
+    invocation: domain_tool
+    allow_spawn: false
     description: 为大纲整卷或卷内局部设计剧情卡，写入前过冲突审计
     activation:
       - condition: no_master_outline
@@ -208,46 +251,89 @@ agents:
     name: 预期检阅
     layer: story
     tier: extended
+    invocation: domain_tool
+    allow_spawn: false
     description: 检阅预处理预期事件是否可纳入当前章/卷；不改正文，决策权在用户
     # 不进章流水线；由 Studio `review_expected_events` 按需调用
     activation: []
 
-  decision_council:
-    name: 评审团
+  # ── 领域 Tool + 可 spawn（长上下文隔离摘要）──
+
+  setting_auditor:
+    name: 设定审计
     layer: qa
     tier: extended
-    description: 决策冲突加审；确定性聚合票，共识可自动修订，死锁才人审
-    # 不进章流水线；in-process（不 spawn SubAgent）；见 decision_council.yaml
-    activation: []
+    invocation: domain_tool
+    allow_spawn: true
+    description: >-
+      设定层冲突/遗漏/异常审计（含 stub 缺口与摘要漂移）。主路径 audit_setting；
+      深挖隔离可用 spawn_agent。
+    tools:
+      [
+        audit_setting,
+        query_lore,
+        query_memory,
+        list_entities,
+        read_chapter,
+        get_project_status,
+      ]
+    activation:
+      - condition: has_bible
+        reason: 已有 Bible，设定变更需冲突审计
+      - condition: entity_count_gt
+        threshold: 3
+        reason: 实体增多，需设定一致性审计
 
   material_researcher:
     name: 素材研究
     layer: story
     tier: extended
+    invocation: domain_tool
+    allow_spawn: true
     description: >-
-      剧情枯竭/需灵感时按需产出参考素材卡（非 Canon）；默认不进章流水线。
-      由 Studio `research_materials` 或 activate_agents 显式调用。
+      剧情枯竭/需灵感时按需产出参考素材卡（非 Canon）。主路径 research_materials；
+      长检索隔离可用 spawn_agent。
+    tools: [query_lore, query_memory, list_entities, get_project_status, research_materials]
     activation:
       - condition: plot_drought
         reason: 剧情冲突/钩子耗尽，建议补充背景素材
       - condition: inspiration_needed
         reason: 支路难分或质感不足，建议补充题材相关灵感素材
 
-  # ── 短剧 / AI 漫剧（project_mode=short_drama）──
+  # ── in_process（禁止 spawn）──
+
+  decision_council:
+    name: 评审团
+    layer: qa
+    tier: extended
+    invocation: in_process
+    allow_spawn: false
+    description: 决策冲突加审；确定性聚合票，共识可自动修订，死锁才人审
+    # 不进章流水线；in-process（不 spawn SubAgent）；见 decision_council.yaml
+    activation: []
+
+  # ── 短剧 / AI 漫剧（pipeline；禁 spawn）──
+
   episode_planner:
     name: 集纲规划
     layer: story
     tier: mvp
+    invocation: pipeline
+    allow_spawn: false
     description: 短剧单集场次/beat 集纲（pipeline-script）
 
   script_writer:
     name: 剧本草稿
     layer: production
     tier: mvp
+    invocation: pipeline
+    allow_spawn: false
     description: 按集纲撰写漫剧剧本 script.md
 
   beat_acceptor:
     name: Beat 验收
     layer: story
     tier: mvp
+    invocation: pipeline
+    allow_spawn: false
     description: 对照 beat/剧情卡收束条件验收本集（短剧语义的 plot_acceptor）

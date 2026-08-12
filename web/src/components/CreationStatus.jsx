@@ -182,6 +182,50 @@ function StatusActions({
 /**
  * Left-rail status page: health + progress + version history (merged from former 偏好).
  */
+function loopLevel(loop) {
+  if (!loop?.hasJob) return 'ok'
+  if (loop.requiresHuman) return 'bad'
+  if (loop.resumable || loop.pendingWake) return 'warn'
+  if (loop.status === 'running') return 'warn'
+  return 'ok'
+}
+
+function LoopStatusCard({ loop, onArmWake }) {
+  if (!loop?.hasJob) return null
+  const level = loopLevel(loop)
+  const unit = loop.unit || '章'
+  const stop = loop.lastStop?.reason || ''
+  const soft = Array.isArray(loop.softGatesSkipped) && loop.softGatesSkipped.length
+    ? loop.softGatesSkipped.join(', ')
+    : ''
+  const verify = loop.loopEndVerify?.summary || ''
+  return (
+    <div className={`longform-health-card level-${level}`}>
+      <div className="longform-health-title">
+        <span>连写外环</span>
+        <span className={`longform-health-badge level-${level}`}>
+          {loop.statusLabel || '已停止'}
+        </span>
+      </div>
+      <div className="longform-health-body">
+        本批已发布 {loop.chaptersDone ?? 0} {unit}
+        {stop ? ` · 停于 ${stop}` : ''}
+      </div>
+      <div className="longform-health-sub">
+        {soft ? `软跳过：${soft}` : '硬门仍会停；软相位可按无人值守策略跳过'}
+        {verify ? ` · ${verify}` : ''}
+      </div>
+      {loop.requiresHuman && loop.resumable && typeof onArmWake === 'function' ? (
+        <div className="longform-health-actions" style={{ marginTop: 8 }}>
+          <button type="button" className="btn-ghost btn-inline" onClick={onArmWake}>
+            允许自动续写
+          </button>
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
 export function CreationStatusPage({
   project,
   isShortDrama,
@@ -204,6 +248,8 @@ export function CreationStatusPage({
   onOpenEngine,
   onAuditChapter,
   showHeading = true,
+  loopStatus = null,
+  onArmLoopWake,
 }) {
   const unitLabel = isShortDrama ? '集' : '章'
   const wordBand = wordTargetsForMode(isShortDrama ? 'short_drama' : 'longform')
@@ -244,6 +290,7 @@ export function CreationStatusPage({
               目标 {wordBand.min}–{wordBand.max} 字 · 发布至少 {wordBand.hardMin} 字
             </div>
           </div>
+          <LoopStatusCard loop={loopStatus} onArmWake={onArmLoopWake} />
         </div>
         <StatusActions
           publishedCount={publishedCount}
@@ -266,6 +313,7 @@ export function CreationStatusPage({
         </>
       ) : null}
       <div className="longform-health longform-health--side">
+        <LoopStatusCard loop={loopStatus} onArmWake={onArmLoopWake} />
         <div
           className={`longform-health-card longform-health-card--foreshadow level-${foreshadowLevel}${
             foreshadowDebtExpanded ? ' is-expanded' : ''
@@ -452,8 +500,18 @@ export function CreationStatusBar({
   progressLabel,
   nextEpisodeLabel,
   onOpenDetail,
+  loopStatus = null,
 }) {
   if (!visible) return null
+  const loopChip = loopStatus?.hasJob
+    ? (
+      <StatusKv
+        label="连写"
+        value={loopStatus.statusLabel || '已停止'}
+        level={loopLevel(loopStatus)}
+      />
+    )
+    : null
 
   const chips = isShortDrama
     ? (
@@ -463,6 +521,7 @@ export function CreationStatusBar({
         {nextEpisodeLabel ? (
           <StatusKv label="下一集" value={nextEpisodeLabel} />
         ) : null}
+        {loopChip}
       </>
     )
     : (() => {
@@ -486,6 +545,7 @@ export function CreationStatusBar({
           {progressLabel ? (
             <StatusKv label="进度" value={progressLabel} />
           ) : null}
+          {loopChip}
           <StatusKv label="未收伏笔" value={foreshadowValue} level={foreshadowLevel} />
           <StatusKv label="本卷" value={volumeValue} level={volumeLevel} />
           <StatusKv label="篇幅" value={lengthValue} level={lengthLevel} />
