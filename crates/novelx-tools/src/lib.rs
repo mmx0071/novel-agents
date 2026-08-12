@@ -24,9 +24,10 @@ pub fn emit_todos(ctx: &ToolContext, todos: Vec<novelx_protocol::TodoItem>) {
     }
 }
 pub use mutation::{
+    agent_auto_apply_enabled, agent_may_auto_apply, always_require_human_confirm,
     apply_without_mutation_id, confirm_skipped, is_routine_self_confirm, json_bool_arg,
     maybe_preview, mutation_confirm_enabled, preview_mutation, reject_apply_without_id,
-    wants_apply, will_write_without_preview, with_confirm_skip,
+    text_hunk_diffs, wants_apply, will_write_without_preview, with_confirm_skip, with_text_diff,
 };
 pub use mutation_policy::{cached_policy, MutationPolicy};
 pub use tool_ui::{agent_label_zh, tool_output_for_ui};
@@ -56,7 +57,7 @@ use novelx_pipeline::{
     load_volume_bounds, lock_brief, lore_query, mark_volume_sync_skipped,
     materialize_plot_card_markdown, maybe_advance_setup_after_outlines, maybe_cold_archive_volume,
     normalize_plot_card_best_effort, outline_budget_repair_hint,
-    parse_chapter_outline_text_budget, plot_design_blocked_reason,
+    parse_chapter_outline_text_budget, plan_full_revision_preview, plot_design_blocked_reason,
     read_arc_outline_excerpt, read_arc_outline_text, read_chapter_draft,
     read_chapter_draft_resolved,
     rebuild_plot_index, resolve_setup_next_step, resolve_setup_phase, confirm_volume_memory,
@@ -691,17 +692,23 @@ impl ToolHandler for ReplanVolume {
             },
         );
         let rel = format!("artifacts/arc_outlines/{vol:02}.replan.md");
+        let path = dir.join(&rel);
+        let existing_replan = std::fs::read_to_string(&path).unwrap_or_default();
         if let Some(prev) = mutation::maybe_preview(
             &ctx.config_root,
             &args,
             "replan_volume",
             &format!("将写入第{vol}卷软重规划草案 {rel}"),
-            json!({
-                "kind": "replan_volume",
-                "volume": vol,
-                "path": rel,
-                "markdown": draft.chars().take(2000).collect::<String>(),
-            }),
+            mutation::with_text_diff(
+                json!({
+                    "kind": "replan_volume",
+                    "volume": vol,
+                    "path": rel,
+                    "markdown": draft.chars().take(2000).collect::<String>(),
+                }),
+                &existing_replan,
+                &draft,
+            ),
             "replan_volume",
             json!({
                 "project": project,
@@ -711,7 +718,6 @@ impl ToolHandler for ReplanVolume {
         ) {
             return Ok(prev);
         }
-        let path = dir.join(&rel);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -807,8 +813,11 @@ impl ToolHandler for ReviseChapter {
 
         // Local path: plan diffs → show before/after (Cursor-style) → apply on confirm.
         // Even gate-sourced revise keeps this step when there are real patches to review.
+        // Agent auto-apply / confirm_skip：跳过出卡，直接走后续落盘路径。
         if prefer_local
             && mutation_confirm_enabled(&ctx.config_root)
+            && !mutation::agent_may_auto_apply(&ctx.config_root, "revise_chapter")
+            && !confirm_skipped(&args)
             && !wants_apply(&args)
         {
             let planned = novelx_pipeline::plan_local_revision_preview(
@@ -859,7 +868,7 @@ impl ToolHandler for ReviseChapter {
                     ));
                 }
                 Ok(_) => {
-                    // No local patches — fall through (full revise / intent confirm).
+                    // No local patches — fall through to full-revision LLM preview.
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "local revise preview failed; fall back to full revise");
@@ -867,7 +876,8 @@ impl ToolHandler for ReviseChapter {
             }
         }
 
-        if prefer_local && wants_apply(&args) {
+        // Confirm apply: write cached draft/patches (local or full) — never re-run LLM.
+        if wants_apply(&args) {
             if let Some(patches) = args.get("cached_patches").cloned() {
                 let applied = novelx_pipeline::apply_cached_local_patches(
                     &ctx.projects_root,
@@ -875,42 +885,99 @@ impl ToolHandler for ReviseChapter {
                     chapter,
                     &patches,
                 )?;
+                let label = if prefer_local { "局部修订" } else { "整章修订" };
                 return Ok(ToolResult {
-                    output: format!("已应用第{chapter}章局部修订（{} 处）。", applied),
+                    output: format!("已应用第{chapter}章{label}（{} 处）。", applied),
                     data: json!({
                         "project": project,
                         "chapter": chapter,
                         "applied_patches": applied,
                         "published": false,
+                        "revise_scope": if prefer_local { "local" } else { "full" },
                         "impact_source": impact_source_draft(chapter),
                     }),
                 });
             }
         }
 
-        if let Some(prev) = mutation::maybe_preview(
-            &ctx.config_root,
-            &args,
-            "revise_chapter",
-            &format!(
-                "将修订第{chapter}章：{}",
-                instructions.chars().take(100).collect::<String>()
-            ),
-            json!({
-                "kind": "revise_chapter",
-                "chapter": chapter,
-                "instructions": instructions,
-                "markdown": format!("确认后按指令修订第{chapter}章（可能全文重写）。"),
-            }),
-            "revise_chapter",
-            json!({
-                "project": project,
-                "chapter": chapter,
-                "instructions": instructions,
-                "audit_issues": audit_issues,
-            }),
-        ) {
-            return Ok(prev);
+        // Full rewrite: run Writer LLM first → real before/after → apply writes cache.
+        // Never paste revision instructions into the diff "after" side.
+        if mutation_confirm_enabled(&ctx.config_root)
+            && !mutation::agent_may_auto_apply(&ctx.config_root, "revise_chapter")
+            && !confirm_skipped(&args)
+            && !wants_apply(&args)
+        {
+            let (tx, forward) = spawn_pipeline_progress_forwarder(
+                ctx.progress.clone(),
+                ctx.todos.clone(),
+            );
+            if let Some(p) = &ctx.progress {
+                let _ = p.send(format!("\n▶ 整章修订预览（第{chapter}章）\n"));
+            }
+            let planned = plan_full_revision_preview(
+                &ctx.projects_root,
+                &ctx.config_root,
+                &project,
+                chapter,
+                rev.clone(),
+                ctx.llm.clone(),
+                Some(tx),
+            )
+            .await;
+            let _ = forward.await;
+            match planned {
+                Ok(preview) => {
+                    let after = preview
+                        .patches
+                        .iter()
+                        .find(|p| p.instruction == "__full_draft__")
+                        .map(|p| p.after.clone())
+                        .unwrap_or_default();
+                    let before = preview
+                        .patches
+                        .iter()
+                        .find(|p| p.instruction == "__full_draft__")
+                        .map(|p| p.before.clone())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| read_chapter_draft(&dir, chapter).unwrap_or_default());
+                    let diffs = mutation::text_hunk_diffs(&before, &after);
+                    return Ok(preview_mutation(
+                        "revise_chapter",
+                        &format!("第{chapter}章整章修订预览：请对照原文与修订后再应用"),
+                        json!({
+                            "kind": "revise_chapter",
+                            "project": project,
+                            "chapter": chapter,
+                            "before_full": before,
+                            "after_full": after,
+                            "diffs": diffs,
+                            "markdown": preview.summary_markdown,
+                        }),
+                        "revise_chapter",
+                        json!({
+                            "project": project,
+                            "chapter": chapter,
+                            "instructions": instructions,
+                            "audit_issues": audit_issues,
+                            "prefer_local_patch": false,
+                            "revise_scope": "full",
+                            "cached_patches": preview.patches,
+                        }),
+                    ));
+                }
+                Err(e) => {
+                    return Ok(ToolResult {
+                        output: format!("⛔ 整章修订预览失败：{e}"),
+                        data: json!({
+                            "blocked": true,
+                            "reason": "full_revise_preview_failed",
+                            "project": project,
+                            "chapter": chapter,
+                            "error": e.to_string(),
+                        }),
+                    });
+                }
+            }
         }
 
         let mut run = run_pipeline_streaming(ctx, &project, chapter, RunMode::Revise, rev).await?;
@@ -1013,6 +1080,19 @@ impl ToolHandler for SplitChapter {
             }
             obj.insert("force".into(), json!(force));
         }
+        let split_after = format!(
+            "（确认后拆成两章）\n\
+             第{chapter}章 ← 约前 {:.0}% 段落\n\
+             第{}章 ← 约后半段落{}\n\
+             原文约 {body_n} 字。",
+            cut_ratio * 100.0,
+            chapter + 1,
+            title_b
+                .as_ref()
+                .map(|t| format!("（标题：{t}）"))
+                .unwrap_or_default(),
+        );
+        let split_diffs = mutation::text_hunk_diffs(&draft, &split_after);
         if let Some(prev) = mutation::maybe_preview(
             &ctx.config_root,
             &args,
@@ -1032,6 +1112,7 @@ impl ToolHandler for SplitChapter {
                     "确认后按段落边界切开：前半保留为第{chapter}章，后半写入第{}章；并清除两章审校/摘要缓存。",
                     chapter + 1
                 ),
+                "diffs": split_diffs,
             }),
             "split_chapter",
             apply_args,
@@ -1229,6 +1310,9 @@ impl ToolHandler for ReviseOutline {
             return Ok(blocked);
         }
 
+        let before_md = parse_chapter_outline_text_budget(&existing)
+            .map(|o| display_chapter_outline(&o))
+            .unwrap_or_else(|_| existing.clone());
         if let Some(prev) = mutation::maybe_preview(
             &ctx.config_root,
             &args,
@@ -1237,13 +1321,17 @@ impl ToolHandler for ReviseOutline {
                 "将修订第{chapter}章章纲：{}",
                 instructions.chars().take(80).collect::<String>()
             ),
-            json!({
-                "kind": "revise_outline",
-                "chapter": chapter,
-                "path": dir.join(format!("chapters/{chapter:03}/outline.json")),
-                "markdown": preview_md,
-                "audit": mutation_gate::audit_preview_value(&audit),
-            }),
+            mutation::with_text_diff(
+                json!({
+                    "kind": "revise_outline",
+                    "chapter": chapter,
+                    "path": dir.join(format!("chapters/{chapter:03}/outline.json")).display().to_string(),
+                    "markdown": preview_md,
+                    "audit": mutation_gate::audit_preview_value(&audit),
+                }),
+                &before_md,
+                &preview_md,
+            ),
             "revise_outline",
             json!({
                 "project": project,
@@ -2406,15 +2494,19 @@ impl ToolHandler for DesignEntity {
             &args,
             "design_entity",
             &summary,
-            json!({
-                "kind": kind,
-                "name": write_name,
-                "path": path,
-                "markdown": generated,
-                "merged_from": if existing.is_some() || folded_child.is_some() { name } else { "" },
-                "folded_child": folded_child,
-                "audit": mutation_gate::audit_preview_value(&audit),
-            }),
+            mutation::with_text_diff(
+                json!({
+                    "kind": kind,
+                    "name": write_name,
+                    "path": path.display().to_string(),
+                    "markdown": generated,
+                    "merged_from": if existing.is_some() || folded_child.is_some() { name } else { "" },
+                    "folded_child": folded_child,
+                    "audit": mutation_gate::audit_preview_value(&audit),
+                }),
+                &before_body,
+                &generated,
+            ),
             "design_entity",
             json!({
                 "project": project,
@@ -2675,6 +2767,11 @@ impl ToolHandler for DesignPlot {
         } else {
             format!("；已自动修正格式：{}", shape_repairs.join("；"))
         };
+        let before_plot = if path.exists() {
+            std::fs::read_to_string(&path).unwrap_or_default()
+        } else {
+            String::new()
+        };
         if let Some(prev) = mutation::maybe_preview(
             &ctx.config_root,
             &args,
@@ -2683,13 +2780,18 @@ impl ToolHandler for DesignPlot {
                 "将新增剧情卡「{title}」{}{repair_note}",
                 if activate { "并激活" } else { "" }
             ),
-            json!({
-                "title": title,
-                "activate": activate,
-                "path": path,
-                "markdown": body,
-                "shape_repairs": shape_repairs,
-            }),
+            mutation::with_text_diff(
+                json!({
+                    "kind": "design_plot",
+                    "title": title,
+                    "activate": activate,
+                    "path": path.display().to_string(),
+                    "markdown": body,
+                    "shape_repairs": shape_repairs,
+                }),
+                &before_plot,
+                &body,
+            ),
             "design_plot",
             json!({
                 "project": project,
@@ -2996,28 +3098,50 @@ impl ToolHandler for UpsertSetting {
             }
         };
         let audit_candidate = section.as_deref().unwrap_or(merged.as_str());
-        let audit = tool_setting_audit(
-            ctx,
-            project,
-            &format!("拟更新 Bible·{topic}"),
-            audit_candidate,
-        )
-        .await?;
-        if let Some(blocked) = mutation_gate::require_audit_pass(&audit, force) {
-            return Ok(blocked);
-        }
+        // Confirmed apply already ran setting_auditor at preview — do not pay a second LLM round.
+        let audit_ok_at_preview = args
+            .get("audit_passed_at_preview")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let audit = if wants_apply(&args) && audit_ok_at_preview {
+            novelx_pipeline::SettingAuditResult {
+                blocker: false,
+                skipped: false,
+                summary: "预览阶段已通过设定审计".into(),
+                report: String::new(),
+                raw: json!({"reused_preview_audit": true}),
+            }
+        } else {
+            let audit = tool_setting_audit(
+                ctx,
+                project,
+                &format!("拟更新 Bible·{topic}"),
+                audit_candidate,
+            )
+            .await?;
+            if let Some(blocked) = mutation_gate::require_audit_pass(&audit, force) {
+                return Ok(blocked);
+            }
+            audit
+        };
         let preview_md = section.as_deref().unwrap_or(content);
+        let path_str = path.display().to_string();
         if let Some(prev) = mutation::maybe_preview(
             &ctx.config_root,
             &args,
             "upsert_setting",
             &format!("将更新 Bible 设定「{topic}」"),
-            json!({
-                "topic": topic,
-                "path": path,
-                "markdown": preview_md,
-                "audit": mutation_gate::audit_preview_value(&audit),
-            }),
+            mutation::with_text_diff(
+                json!({
+                    "kind": "upsert_setting",
+                    "topic": topic,
+                    "path": path_str,
+                    "markdown": preview_md,
+                    "audit": mutation_gate::audit_preview_value(&audit),
+                }),
+                &existing,
+                &merged,
+            ),
             "upsert_setting",
             json!({
                 "project": project,
@@ -3025,21 +3149,10 @@ impl ToolHandler for UpsertSetting {
                 "content": content,
                 "force": force,
                 "cached_body": merged,
+                "audit_passed_at_preview": true,
             }),
         ) {
             return Ok(prev);
-        }
-        if wants_apply(&args) {
-            let audit_apply = tool_setting_audit(
-                ctx,
-                project,
-                &format!("拟更新 Bible·{topic}"),
-                audit_candidate,
-            )
-            .await?;
-            if let Some(blocked) = mutation_gate::require_audit_pass(&audit_apply, force) {
-                return Ok(blocked);
-            }
         }
         std::fs::create_dir_all(&art)?;
         std::fs::write(&path, &merged)?;
@@ -3179,11 +3292,16 @@ impl ToolHandler for DesignMasterOutline {
             &args,
             "design_master_outline",
             "将生成/更新总纲 master_outline.md",
-            json!({
-                "path": path,
-                "markdown": text,
-                "audit": mutation_gate::audit_preview_value(&audit),
-            }),
+            mutation::with_text_diff(
+                json!({
+                    "kind": "design_master_outline",
+                    "path": path.display().to_string(),
+                    "markdown": text,
+                    "audit": mutation_gate::audit_preview_value(&audit),
+                }),
+                &existing,
+                &text,
+            ),
             "design_master_outline",
             json!({
                 "project": project,
@@ -3376,12 +3494,17 @@ impl ToolHandler for DesignArcOutline {
             &args,
             "design_arc_outline",
             &format!("将生成/更新第{arc}卷卷纲"),
-            json!({
-                "arc": arc,
-                "path": path,
-                "markdown": text,
-                "audit": mutation_gate::audit_preview_value(&audit),
-            }),
+            mutation::with_text_diff(
+                json!({
+                    "kind": "design_arc_outline",
+                    "arc": arc,
+                    "path": path.display().to_string(),
+                    "markdown": text,
+                    "audit": mutation_gate::audit_preview_value(&audit),
+                }),
+                &before_arc,
+                &text,
+            ),
             "design_arc_outline",
             json!({
                 "project": project,
@@ -4171,11 +4294,16 @@ async fn upsert_nomenclature_setting(
         args,
         "upsert_setting",
         "将更新名词表 nomenclature.md",
-        json!({
-            "topic": "名词表",
-            "path": md_path,
-            "markdown": body,
-        }),
+        mutation::with_text_diff(
+            json!({
+                "kind": "upsert_setting",
+                "topic": "名词表",
+                "path": md_path.display().to_string(),
+                "markdown": body,
+            }),
+            &existing_md,
+            &body,
+        ),
         "upsert_setting",
         json!({
             "project": project,
@@ -4942,9 +5070,10 @@ impl ToolHandler for OfferDecisions {
     }
     fn description(&self) -> &'static str {
         "向用户出示审批卡。kind=audit（默认）：审校未通过后给出修某条/修全部阻断/接受等（须 action）。\
-         kind=studio_next：情境下一步（设定落盘后、BLOCKER、剧情拦写等），\
+         kind=studio_next：情境下一步（设定落盘后、BLOCKER、剧情拦写等）；\
+         prompt 须含本轮小结与推荐处理（短 Markdown，UI 直接展示）；\
          每项须含 id、label，以及 tool+args 或 resolve=dismiss_gate|continue_studio|activate_plot_write|skip_volume；\
-         tool 白名单含 design_* / upsert_setting / audit_setting / list_* / continue_writing / design_plot 等。"
+         tool 白名单含 design_* / upsert_setting / confirm_setup / audit_setting / list_* / continue_writing / design_plot 等。"
     }
     fn parameters(&self) -> Value {
         json!({
@@ -4953,7 +5082,7 @@ impl ToolHandler for OfferDecisions {
                 "kind":{"type":"string","description":"audit（默认）| studio_next"},
                 "project":{"type":"string"},
                 "chapter":{"type":"integer","description":"audit 必填；studio_next 可选"},
-                "prompt":{"type":"string","description":"短提示，可选"},
+                "prompt":{"type":"string","description":"studio_next：含本轮小结+推荐的短 Markdown；audit：短提示"},
                 "options":{
                     "type":"array",
                     "items":{

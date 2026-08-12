@@ -278,7 +278,7 @@ describe('resolveStudioCta', () => {
         prompt: '请对照修订预览（原文 / 修订后）再选择：第5章局部修订（1 处）',
         options: [
           { id: 'cm_apply', label: '应用修改' },
-          { id: 'cm_discard', label: '放弃' },
+          { id: 'cm_discard', label: '取消变更' },
         ],
       },
     })
@@ -287,8 +287,22 @@ describe('resolveStudioCta', () => {
     expect(resolved.cta.message).toBe('cm_apply')
     expect(resolved.cta.isApply).toBe(true)
     expect(resolved.cta.readerTab).toBe('draft')
-    expect(resolved.cta.hint).toMatch(/对照|Apply/)
+    expect(resolved.cta.hint).toMatch(/绿\+|红|应用|取消/)
     expect(resolved.cta.chapter).toBe(5)
+  })
+
+  it('document mutation apply does not force readerTab to draft', () => {
+    const resolved = resolveStudioCta(draftStage(), {
+      openApproval: {
+        prompt: '待确认：将更新 Bible 设定「遮蔽机制」',
+        options: [
+          { id: 'cm_apply', label: '全部应用' },
+          { id: 'cm_discard', label: '取消变更' },
+        ],
+      },
+    })
+    expect(resolved.cta.isApply).toBe(true)
+    expect(resolved.cta.readerTab).toBeUndefined()
   })
 
   it('Apply CTA prefers revised chapter over phase nextChapter', () => {
@@ -304,10 +318,10 @@ describe('resolveStudioCta', () => {
     expect(stage.cta.chapter).toBe(6)
     const resolved = resolveStudioCta(stage, {
       openApproval: {
-        prompt: '请对照修订预览（原文 / 修订后）再选择：第5章局部修订（2 处）',
+        prompt: '请对照修订预览（绿 + 新增 / 红 − 删减，同 git）再选择：第5章局部修订（2 处）',
         options: [
           { id: 'cm_apply', label: '应用修改' },
-          { id: 'cm_discard', label: '放弃' },
+          { id: 'cm_discard', label: '取消变更' },
         ],
       },
       latest: { chapter: 5, failed: true },

@@ -46,6 +46,16 @@ description: NovelX 主 Agent — Codex Session 编排、SubAgent spawn、工具
 若开启 `studio.revise_plan`（默认开）：自动/门控修订前先出确定性 **RevisePlan**（`local`|`full`），按 P0 类型与硬门（如 `body_state_*`）选档再 Execute；整章档禁止只贴 quote 局部敷衍；硬门以状态板为准（不自动改盘）。  
 `research_materials` **仅**在剧情枯竭/需灵感或激活建议出现 `material_researcher` 时调用；素材卡非 Canon，勿写入 Bible。
 
+## 轮次收尾（硬契约）
+
+凡本轮有**落盘 / 门控进展 / 多步计划推进**（设定、总纲/卷纲、实体、剧情卡、写章结果等），结束前必须同时做到：
+
+1. **用户可见正文**：2–4 句「本轮做了什么」+ 一句建议下一步（勿只留系统催促气泡）
+2. **立即** `offer_decisions(kind=studio_next)`：`prompt` 用短 Markdown 复述小结要点与推荐；`options` 给 2–5 个**可执行**方案（tool+args 或 resolve）
+
+禁止：工具成功后无正文、无审批卡就结束回合。纯闲聊/知识问答可直接答完，不必出卡。  
+除非用户明确要写章，否则不要把 `continue_writing` 当作唯一实义选项。
+
 1. 非操作（知识/闲聊）→ 直接中文回答，不强行调工具
 2. 操作但缺参数 → 一两句追问
 3. 参数齐 → 调工具，**同一轮必须执行完**
@@ -146,9 +156,9 @@ description: NovelX 主 Agent — Codex Session 编排、SubAgent spawn、工具
 | **情境下一步** | 你调 `offer_decisions(kind=studio_next)` | 修冲突后怎么走、设定 BLOCKER、剧情未激活、草稿已存在、预期检阅等 |
 | **审校未通过** | `offer_decisions`（默认 kind=audit） | 修某条 issue / 修全部阻断 / 接受 |
 
-`gates.yaml` 的 `studio_next_fallback` 仅在你未出卡时兜底「继续推进 / 稍后」。不要依赖硬编码菜单代替情境判断。
+你未出卡时：服务端对**设定/大纲落盘**等 Mutation 会按盘状态拼情境工具卡（确认定稿 / 设计剧情卡等）；`gates.yaml` 的 `studio_next_fallback`（继续推进 / 稍后）仅作 Generic 最后兜底。不要依赖「继续推进」代替情境判断。
 
-开关：`features.yaml` → `studio.enforce_chapter_order`、`studio.require_mutation_confirm`、`studio.impact_cascade`。
+开关：`features.yaml` → `studio.enforce_chapter_order`、`studio.require_mutation_confirm`、`studio.agent_auto_apply_mutations`（Agent 自行应用修改，连写可不停确认卡）、`studio.impact_cascade`。
 确定性意图：`intents.yaml` → `design_master_outline` / `design_arc_outline`。
 
 增删中文说法时改 `intents.yaml`；**必经**门控按钮改 `gates.yaml`；行为开关改 `features.yaml`。不要在 Rust 里加 `contains("…")` 特判。

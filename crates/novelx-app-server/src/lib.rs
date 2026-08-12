@@ -150,6 +150,10 @@ pub async fn serve(repo_root: PathBuf, addr: SocketAddr) -> Result<()> {
             get(policies_get).put(policies_put),
         )
         .route("/api/config/llm", get(llm_get).put(llm_put))
+        .route(
+            "/api/config/studio_flags",
+            get(studio_flags_get).put(studio_flags_put),
+        )
         .route("/api/library", get(library))
         .route("/api/library/{name}", get(library_one).delete(library_delete))
         .route("/api/projects/{name}/preview", get(preview))
@@ -771,6 +775,176 @@ async fn llm_put(State(state): State<AppState>, Json(req): Json<LlmFormPut>) -> 
                 "ok": true,
                 "warning": format!("已保存并热重载，但回读表单失败：{e}"),
             })),
+        )
+            .into_response(),
+    }
+}
+
+/// Allowlisted Studio workflow toggles (subset of `config/features.yaml`).
+const STUDIO_FLAG_KEYS: &[&str] = &[
+    "studio.agent_auto_apply_mutations",
+    "studio.require_mutation_confirm",
+    "studio.unattended_soft_skip",
+];
+
+fn studio_flag_defaults(key: &str) -> bool {
+    match key {
+        "studio.agent_auto_apply_mutations" => false,
+        "studio.require_mutation_confirm" => true,
+        "studio.unattended_soft_skip" => true,
+        _ => false,
+    }
+}
+
+fn parse_bool_feature_line(line: &str, key: &str) -> Option<bool> {
+    let t = line.trim();
+    if t.starts_with('#') {
+        return None;
+    }
+    let prefix = format!("{key}:");
+    let rest = t.strip_prefix(&prefix)?.trim();
+    match rest.split('#').next().unwrap_or("").trim() {
+        "true" | "True" | "TRUE" | "yes" | "1" => Some(true),
+        "false" | "False" | "FALSE" | "no" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+fn read_studio_flags(config_root: &std::path::Path) -> serde_json::Map<String, serde_json::Value> {
+    let path = config_root.join("features.yaml");
+    let raw = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut out = serde_json::Map::new();
+    for key in STUDIO_FLAG_KEYS {
+        let val = raw
+            .lines()
+            .find_map(|line| parse_bool_feature_line(line, key))
+            .unwrap_or_else(|| studio_flag_defaults(key));
+        out.insert((*key).to_string(), serde_json::Value::Bool(val));
+    }
+    out
+}
+
+/// Patch allowlisted `studio.*: bool` lines in features.yaml (preserves comments).
+fn patch_studio_flags_yaml(existing: &str, patch: &serde_json::Map<String, serde_json::Value>) -> Result<String, String> {
+    let mut text = if existing.trim().is_empty() {
+        "version: 1\n\nfeatures:\n".to_string()
+    } else {
+        existing.to_string()
+    };
+    for key in STUDIO_FLAG_KEYS {
+        let Some(val) = patch.get(*key).and_then(|x| x.as_bool()) else {
+            continue;
+        };
+        let needle = format!("{key}:");
+        let replacement = format!("  {key}: {}", if val { "true" } else { "false" });
+        if let Some(idx) = text.find(&needle) {
+            // Replace the full line containing the key.
+            let line_start = text[..idx].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let line_end = text[idx..]
+                .find('\n')
+                .map(|i| idx + i)
+                .unwrap_or(text.len());
+            text.replace_range(line_start..line_end, &replacement);
+        } else if let Some(feat) = text.find("features:") {
+            let insert_at = text[feat..]
+                .find('\n')
+                .map(|i| feat + i + 1)
+                .unwrap_or(text.len());
+            text.insert_str(insert_at, &format!("{replacement}\n"));
+        } else {
+            text.push_str(&format!("\nfeatures:\n{replacement}\n"));
+        }
+    }
+    // Sanity: patched keys parse back.
+    for key in STUDIO_FLAG_KEYS {
+        if patch.get(*key).and_then(|x| x.as_bool()).is_some()
+            && text
+                .lines()
+                .find_map(|line| parse_bool_feature_line(line, key))
+                .is_none()
+        {
+            return Err(format!("补丁后未读到 {key}"));
+        }
+    }
+    Ok(text)
+}
+
+async fn studio_flags_get(State(state): State<AppState>) -> impl IntoResponse {
+    let flags = read_studio_flags(state.core.config_root());
+    Json(serde_json::json!({
+        "ok": true,
+        "flags": flags,
+        "labels": {
+            "studio.agent_auto_apply_mutations": "Agent 自行应用修改",
+            "studio.require_mutation_confirm": "改盘前需确认（应用修改）",
+            "studio.unattended_soft_skip": "连写跳过软门控",
+        },
+        "hints": {
+            "studio.agent_auto_apply_mutations": "开启后连写/自动修订可自行落盘，无需点「应用修改」。Web 手工编辑仍对照确认。删除设定卡/还原版本仍须确认。",
+            "studio.require_mutation_confirm": "总开关：关闭则所有 Agent 改盘都不出确认卡（更激进）。",
+            "studio.unattended_soft_skip": "连写时跳过卷中审/预期检阅/伏笔高压等软相位，遇硬门仍停。",
+        },
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct StudioFlagsPut {
+    #[serde(default)]
+    flags: serde_json::Map<String, serde_json::Value>,
+}
+
+async fn studio_flags_put(
+    State(state): State<AppState>,
+    Json(req): Json<StudioFlagsPut>,
+) -> impl IntoResponse {
+    let mut patch = serde_json::Map::new();
+    for key in STUDIO_FLAG_KEYS {
+        if let Some(v) = req.flags.get(*key) {
+            if let Some(b) = v.as_bool() {
+                patch.insert((*key).to_string(), serde_json::Value::Bool(b));
+            } else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": format!("标志 {key} 须为布尔值"),
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+    if patch.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": "未提供可更新的标志"})),
+        )
+            .into_response();
+    }
+    let existing =
+        read_config_text(state.core.config_root(), "features.yaml").unwrap_or_default();
+    match patch_studio_flags_yaml(&existing, &patch) {
+        Ok(yaml) => match write_config_text(state.core.config_root(), "features.yaml", &yaml) {
+            Ok(()) => {
+                let flags = read_studio_flags(state.core.config_root());
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "ok": true,
+                        "flags": flags,
+                    })),
+                )
+                    .into_response()
+            }
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok": false, "error": e})),
+            )
+                .into_response(),
+        },
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": e})),
         )
             .into_response(),
     }

@@ -278,8 +278,8 @@ export function pickPrimaryApprovalOption(options) {
     if (/^sc_/.test(id) || /^vs_/.test(id) || /^sbi_/.test(id) || /^vh_/.test(id)) {
       return false
     }
-    // Mutation confirm (应用修改 / 放弃)
-    if (id === 'cm_apply' || id === 'cm_discard' || /应用修改|放弃/.test(label)) return true
+    // Mutation confirm (应用修改 / 取消变更)
+    if (id === 'cm_apply' || id === 'cm_discard' || /全部应用|应用修改|取消变更|放弃/.test(label)) return true
     if (/修正|修订|接受|重审|按建议|继续创作|连写|扩写/.test(label)) return true
     if (/^(cn_|aq_|ai_|cm_)/.test(id) || /revise|steer|audit|accept|apply/.test(id)) return true
     return false
@@ -292,7 +292,7 @@ export function pickPrimaryApprovalOption(options) {
   const apply = deskOpts.find((o) => {
     const id = String(o.id || '')
     const label = String(o.label || '')
-    return id === 'cm_apply' || label === '应用修改'
+    return id === 'cm_apply' || label === '应用修改' || label === '全部应用'
   })
   if (apply) return apply
 
@@ -346,7 +346,7 @@ export function resolveStudioCta(stage, audit = {}) {
   if (primary) {
     const prompt = String(audit.openApproval?.prompt || '').trim()
     const id = String(primary.id || '')
-    const isApply = id === 'cm_apply' || primary.label === '应用修改'
+    const isApply = id === 'cm_apply' || primary.label === '应用修改' || primary.label === '全部应用'
     // Keep hard-rule violation bullets visible in the desk CTA (not just「因硬规则未发布」).
     const detail = prompt
       ? prompt.split('\n').filter(Boolean).slice(0, 4).join(' · ').slice(0, 220)
@@ -358,6 +358,13 @@ export function resolveStudioCta(stage, audit = {}) {
       latestChapter: audit.latest?.chapter,
       patchChapter: audit.patchChapter,
     })
+    // Only jump to 正文 when this confirm is a chapter-body revise (prompt/patch),
+    // not when stage merely has a nextChapter while applying Bible/大纲.
+    const bodyRevise = isApply && (
+      chapterFromApprovalPrompt(prompt) > 0
+      || Number(audit.patchChapter) > 0
+    )
+    const applyTab = isApply ? (bodyRevise ? 'draft' : undefined) : 'draft'
     return {
       ...stage,
       detail: isApply
@@ -369,10 +376,10 @@ export function resolveStudioCta(stage, audit = {}) {
         id: 'pending_choice',
         label: primary.label || primary.id,
         hint: isApply
-          ? '对照修订预览，确认无误后再应用'
+          ? '绿+新增 / 红−删减，确认后应用；取消则退回'
           : '与创作助手待选项一致',
         message: String(primary.id || primary.label || ''),
-        readerTab: 'draft',
+        readerTab: applyTab,
         chapter,
         fromApproval: true,
         isApply,

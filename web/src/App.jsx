@@ -25,7 +25,8 @@ import {
 import ChapterStrip from './components/ChapterStrip'
 import DangerConfirmModal from './components/DangerConfirmModal'
 import NewNovelModal from './components/NewNovelModal'
-import MarkdownView from './components/MarkdownView'
+import { LinedProseEditor, LinedProseView } from './components/LinedProse'
+import InlineDiffView from './components/InlineDiffView'
 import ConfigPanel from './components/ConfigPanel'
 import VolumeWorkspace from './components/VolumeWorkspace'
 import { normalizeSubAgent, upsertSubAgent } from './subAgents'
@@ -42,6 +43,8 @@ import {
   wordTargetsForMode,
 } from './chapterTargets'
 import { pickActivePlot, summarizePlotForDesk } from './plotSummary'
+import { textHunkDiffs } from './textHunkDiffs'
+import { applyParaPatches, resolveInlineDiffPair } from './lineDiff'
 
 const API = '/api'
 const initialCache = typeof window !== 'undefined' ? loadStudioCache() : migrateCache(null)
@@ -261,6 +264,10 @@ export default function App() {
   const [readerVolume, setReaderVolume] = useState(0)
   const [readerEditing, setReaderEditing] = useState(false)
   const [readerEditText, setReaderEditText] = useState('')
+  /** Baseline on-disk text when edit began (for git-style confirm). */
+  const [readerEditBaseline, setReaderEditBaseline] = useState('')
+  /** Pending save confirm: { before, after, diffs, saveTab, cardKey, chapter } */
+  const [readerSaveConfirm, setReaderSaveConfirm] = useState(null)
   const [readerSaving, setReaderSaving] = useState(false)
   const [readerEditError, setReaderEditError] = useState('')
   const [chatSetupGateOpen, setChatSetupGateOpen] = useState(false)
@@ -274,6 +281,11 @@ export default function App() {
   const [deskPatches, setDeskPatches] = useState([])
   const [deskPatchFocus, setDeskPatchFocus] = useState(null)
   const [deskPatchHidden, setDeskPatchHidden] = useState(false)
+  /** Selection from InlineDiffView: { selectedIds, partialAfter, fullAfter, selectedCount, totalCount } */
+  const [deskDiffSel, setDeskDiffSel] = useState(null)
+  const handleInlineDiffSelection = useCallback((sel) => {
+    setDeskDiffSel(sel || null)
+  }, [])
   const [auditState, setAuditState] = useState({
     todos: [],
     reports: [],
@@ -292,6 +304,22 @@ export default function App() {
   /** Writer 落盘刷新时默认贴底；用户上滑阅读则暂停跟滚。 */
   const followDraftBottomRef = useRef(true)
   const lastDraftLenRef = useRef(0)
+  /** Leave inline diff / Apply：禁止误贴底，并尽量恢复对照时的阅读位置。 */
+  const suppressDraftPinRef = useRef(false)
+  const readerScrollRestoreRef = useRef(null)
+
+  const captureReaderScrollForDiffExit = useCallback(() => {
+    const el = readerRef.current
+    if (!el) return
+    const max = Math.max(1, el.scrollHeight - el.clientHeight)
+    readerScrollRestoreRef.current = {
+      top: el.scrollTop,
+      ratio: max > 0 ? el.scrollTop / el.scrollHeight : 0,
+    }
+    suppressDraftPinRef.current = true
+    // Apply 后不应继续「写作跟滚」到文末。
+    followDraftBottomRef.current = false
+  }, [])
 
   const refreshLibrary = useCallback(async () => {
     const data = await api('/library')
@@ -470,48 +498,63 @@ export default function App() {
     setAuditState(state || { todos: [], reports: [], latest: null, openApproval: null })
   }, [])
 
+  const focusDeskPatch = useCallback((patch) => {
+    if (!patch) return
+    setDeskPatchFocus(patch)
+    setDeskPatchHidden(false)
+    const tab = String(patch.readerTab || '').trim()
+    const ch = Number(patch.chapter) || 0
+    if (tab === 'draft' || tab === 'outline') {
+      if (ch > 0) setSelectedChapter(ch)
+      setReaderTab(tab)
+      return
+    }
+    if (tab) {
+      setReaderTab(tab)
+      return
+    }
+    if (ch > 0) {
+      setSelectedChapter(ch)
+      setReaderTab('draft')
+    }
+  }, [])
+
   const handleDraftPatchesChange = useCallback((patches, opts = {}) => {
     const list = Array.isArray(patches) ? patches : []
-    const prevSig = deskPatchesRef.current
-      .map((p) => `${p.chapter}:${p.start_para}:${p.before}`)
-      .join('|')
-    const nextSig = list.map((p) => `${p.chapter}:${p.start_para}:${p.before}`).join('|')
+    const patchSig = (p) => (
+      `${p.type}:${p.chapter}:${p.readerTab || ''}:${p.path || ''}:`
+      + `${String(p.beforeFull || p.before || '').length}:`
+      + `${String(p.afterFull || p.after || '').length}:${p.start_para || ''}`
+    )
+    const prevSig = deskPatchesRef.current.map(patchSig).join('|')
+    const nextSig = list.map(patchSig).join('|')
     const arrived = list.length && prevSig !== nextSig
+    const leaving = deskPatchesRef.current.length > 0 && !list.length
+    if (leaving) captureReaderScrollForDiffExit()
     deskPatchesRef.current = list
     setDeskPatches(list)
     if (opts.focus || arrived) {
       setDeskPatchHidden(false)
     }
     if (opts.focus) {
-      setDeskPatchFocus(opts.focus)
-      const ch = Number(opts.focus.chapter) || 0
-      if (ch > 0) setSelectedChapter(ch)
-      setReaderTab('draft')
+      focusDeskPatch(opts.focus)
       return
     }
     if (!list.length) {
       setDeskPatchFocus(null)
       return
     }
-    // New revise diffs → jump writing desk to draft so before/after is visible.
+    // New diffs → jump writing desk so inline −/+ is visible on the right tab.
     if (arrived) {
-      const latest = list[list.length - 1]
-      const ch = Number(latest?.chapter) || 0
-      if (ch > 0) setSelectedChapter(ch)
-      setReaderTab('draft')
-      setDeskPatchFocus(latest)
+      focusDeskPatch(list[list.length - 1])
       return
     }
     setDeskPatchFocus((prev) => {
       if (!prev) return list[list.length - 1]
-      const still = list.find((p) => (
-        Number(p.chapter) === Number(prev.chapter)
-        && Number(p.start_para) === Number(prev.start_para)
-        && String(p.before || '') === String(prev.before || '')
-      ))
+      const still = list.find((p) => patchSig(p) === patchSig(prev))
       return still || list[list.length - 1]
     })
-  }, [])
+  }, [focusDeskPatch, captureReaderScrollForDiffExit])
 
   const sendChatMessage = useCallback((text, opts) => {
     if (!text || typeof chatSendRef.current !== 'function') return false
@@ -933,15 +976,20 @@ export default function App() {
   )
   const unitLabel = projectMode === 'short_drama' ? '集' : '章'
   const activePlotSummary = summarizePlotForDesk(pickActivePlot(plots))
-  const visibleDeskPatches = deskPatches.filter((p) => (
-    !selectedChapter || Number(p.chapter) === Number(selectedChapter)
-  ))
+  const visibleDeskPatches = deskPatches.filter((p) => {
+    if (p.type === 'inline_doc_diff' || p.type === 'doc_patch') return true
+    const ch = Number(p.chapter) || 0
+    if (ch <= 0) return true
+    return !selectedChapter || ch === Number(selectedChapter)
+  })
   const activeDeskPatch = (() => {
     if (!visibleDeskPatches.length) return null
     if (deskPatchFocus && visibleDeskPatches.some((p) => (
-      Number(p.chapter) === Number(deskPatchFocus.chapter)
+      p.type === deskPatchFocus.type
+      && Number(p.chapter) === Number(deskPatchFocus.chapter)
       && Number(p.start_para) === Number(deskPatchFocus.start_para)
-      && String(p.before || '') === String(deskPatchFocus.before || '')
+      && String(p.readerTab || '') === String(deskPatchFocus.readerTab || '')
+      && String(p.path || '') === String(deskPatchFocus.path || '')
     ))) {
       return deskPatchFocus
     }
@@ -1042,12 +1090,32 @@ export default function App() {
     followDraftBottomRef.current = dist < 180
   }
 
-  // Writer 间歇刷新正文时强制贴底（大段跳变时 nearBottom 会失效）。
+  // Writer 间歇刷新正文时强制贴底；Apply/离开对照时恢复原位置，禁止甩到文末。
   useLayoutEffect(() => {
     if (readerEditing) return
     const el = readerRef.current
     if (!el) return
     const len = (readerContent || '').length
+
+    if (suppressDraftPinRef.current) {
+      suppressDraftPinRef.current = false
+      lastDraftLenRef.current = len
+      const saved = readerScrollRestoreRef.current
+      readerScrollRestoreRef.current = null
+      if (saved) {
+        const applyRestore = () => {
+          const pane = readerRef.current
+          if (!pane) return
+          const byRatio = Math.round((saved.ratio || 0) * pane.scrollHeight)
+          const top = Number.isFinite(saved.top) ? saved.top : byRatio
+          pane.scrollTop = Math.max(0, Math.min(top, pane.scrollHeight))
+        }
+        applyRestore()
+        requestAnimationFrame(applyRestore)
+      }
+      return
+    }
+
     if (readerTab === 'draft') {
       const grew = len > lastDraftLenRef.current
       if (grew && followDraftBottomRef.current) {
@@ -1058,9 +1126,9 @@ export default function App() {
     }
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 160
     if (nearBottom) el.scrollTop = el.scrollHeight
-  }, [readerContent, readerEditing, readerTab])
+  }, [readerContent, readerEditing, readerTab, deskPatches.length])
 
-  // 切章 / 切到正文 tab：重新开启贴底跟随
+  // 切章 / 切到正文 tab：重新开启贴底跟随（写作跟滚；勿在 Apply 卸对照时触发）。
   useEffect(() => {
     if (readerTab !== 'draft') return
     followDraftBottomRef.current = true
@@ -1068,7 +1136,7 @@ export default function App() {
     const el = readerRef.current
     if (el) {
       requestAnimationFrame(() => {
-        if (followDraftBottomRef.current && readerRef.current) {
+        if (followDraftBottomRef.current && readerRef.current && !suppressDraftPinRef.current) {
           readerRef.current.scrollTop = readerRef.current.scrollHeight
         }
       })
@@ -1153,9 +1221,55 @@ export default function App() {
     const last = deskPatches[deskPatches.length - 1]
     return Number(last?.chapter) || 0
   })()
-  const deskPatchDockVisible = Boolean(
-    !deskPatchHidden && activeDeskPatch && readerTab === 'draft',
-  )
+  // Inline −/+ in reader body (not a top split dock). Active when patch targets current tab.
+  const activeInlineDiff = (() => {
+    if (readerSaveConfirm) {
+      return {
+        before: readerSaveConfirm.before || '',
+        after: readerSaveConfirm.after || '',
+        label: '保存前变更',
+        source: 'save',
+      }
+    }
+    if (deskPatchHidden || !activeDeskPatch) return null
+    const tab = String(activeDeskPatch.readerTab || '').trim()
+    const onTargetTab = !tab || readerTab === tab
+      || (tab === 'draft' && readerTab === 'draft')
+      || (tab === 'outline' && readerTab === 'outline')
+    if (!onTargetTab) return null
+
+    if (activeDeskPatch.type === 'inline_doc_diff' || activeDeskPatch.type === 'doc_patch') {
+      const disk = readerContent && !/^（尚无|暂无内容|加载/.test(readerContent)
+        ? readerContent
+        : ''
+      const { before, after } = resolveInlineDiffPair(activeDeskPatch, disk)
+      if (!before && !after) return null
+      return {
+        before,
+        after,
+        label: activeDeskPatch.label || '设定变更',
+        source: 'agent',
+        chapter: Number(activeDeskPatch.chapter) || selectedChapter || 0,
+        readerTab: activeDeskPatch.readerTab || readerTab,
+      }
+    }
+    if (activeDeskPatch.type === 'draft_patch' && readerTab === 'draft') {
+      const patches = visibleDeskPatches.filter((p) => p.type === 'draft_patch')
+      const base = readerContent && !/加载正文|尚无正文/.test(readerContent) ? readerContent : ''
+      if (!base && patches.length === 1) {
+        return {
+          before: patches[0].before || '',
+          after: patches[0].after || '',
+          label: patches[0].label || '正文修订',
+          source: 'agent',
+        }
+      }
+      const { before, after } = applyParaPatches(base, patches)
+      return { before, after, label: '正文修订', source: 'agent' }
+    }
+    return null
+  })()
+  const deskInlineDiffActive = Boolean(activeInlineDiff)
   const studioStage = resolveStudioCta(
     deriveStudioStage(preview, {
       nextChapter,
@@ -1192,11 +1306,24 @@ export default function App() {
   const runStudioCta = () => {
     const cta = studioStage.cta
     if (!cta || chatBusy) return
-    if (cta.readerTab) setReaderTab(cta.readerTab === 'plots' ? 'arcs' : cta.readerTab)
-    // Apply: stay on the chapter that has diffs (never jump to phase nextChapter).
-    let chapter = Number(cta.chapter) || 0
-    if (cta.isApply && deskPatchChapter > 0) chapter = deskPatchChapter
-    if (chapter > 0) setSelectedChapter(chapter)
+    // Apply：留在当前对照页（世界观/总纲/…）；仅正文修订才切 draft。
+    if (cta.isApply) {
+      const docTab = String(activeDeskPatch?.readerTab || '').trim()
+      const tab = docTab || cta.readerTab || readerTab
+      if (tab) setReaderTab(tab === 'plots' ? 'arcs' : tab)
+      let chapter = Number(cta.chapter) || 0
+      if (deskPatchChapter > 0) chapter = deskPatchChapter
+      if (chapter > 0 && (tab === 'draft' || tab === 'outline')) {
+        setSelectedChapter(chapter)
+      }
+    } else if (cta.readerTab) {
+      setReaderTab(cta.readerTab === 'plots' ? 'arcs' : cta.readerTab)
+      const chapter = Number(cta.chapter) || 0
+      if (chapter > 0) setSelectedChapter(chapter)
+    } else {
+      const chapter = Number(cta.chapter) || 0
+      if (chapter > 0) setSelectedChapter(chapter)
+    }
     // Desk CTAs must not interrupt/restart a running turn on double-click.
     if (cta.message) sendChatMessage(cta.message, { busy: 'ignore' })
   }
@@ -1221,6 +1348,7 @@ export default function App() {
 
   const beginReaderEdit = () => {
     setReaderEditError('')
+    setReaderSaveConfirm(null)
     // Entity/plot display may prepend status meta — edit the on-disk body only.
     let text = readerContent || ''
     if (readerTab.startsWith('ent:') && selectedReaderCard?.markdown) {
@@ -1228,6 +1356,7 @@ export default function App() {
     } else if (isArcNav && selectedReaderEntry?.kind === 'plot' && selectedReaderCard?.markdown) {
       text = selectedReaderCard.markdown
     }
+    setReaderEditBaseline(text)
     setReaderEditText(text)
     setReaderEditing(true)
   }
@@ -1235,51 +1364,269 @@ export default function App() {
   const cancelReaderEdit = () => {
     setReaderEditing(false)
     setReaderEditText('')
+    setReaderEditBaseline('')
+    setReaderSaveConfirm(null)
     setReaderEditError('')
   }
 
-  const saveReaderEdit = async () => {
+  const requestReaderSaveConfirm = () => {
     if (!project || !readerCanEdit) return
-    setReaderSaving(true)
     setReaderEditError('')
+    const after = String(readerEditText ?? '')
+    const before = String(readerEditBaseline ?? '')
+    if (after === before) {
+      cancelReaderEdit()
+      return
+    }
     const activeEntry = readerCardList.length
       ? (readerCardList.find((c) => c.key === readerCardKey) || readerCardList[0])
       : null
     const activeCardKey = activeEntry?.key || ''
-    // Nested plot under 卷纲 still saves via plots API.
     const saveTab = activeEntry?.kind === 'plot' ? 'plots' : readerTab
+    setReaderSaveConfirm({
+      before,
+      after,
+      diffs: textHunkDiffs(before, after),
+      saveTab,
+      cardKey: activeCardKey,
+      chapter: selectedChapter || 0,
+    })
+  }
+
+  const discardReaderSaveConfirm = () => {
+    // 取消变更：退回基线，不落盘
+    setReaderEditText(readerEditBaseline)
+    setReaderSaveConfirm(null)
+    setReaderEditError('')
+  }
+
+  const putReaderTabContent = useCallback(async (content, opts = {}) => {
+    if (!project) return { error: '无项目' }
+    const tab = opts.tab || readerTab
+    const activeEntry = readerCardList.length
+      ? (readerCardList.find((c) => c.key === readerCardKey) || readerCardList[0])
+      : null
+    const saveTab = activeEntry?.kind === 'plot' ? 'plots' : tab
+    const cardKey = opts.cardKey || activeEntry?.key || ''
+    const chapter = opts.chapter || selectedChapter || 0
     const res = await api(`/projects/${encodeURIComponent(project)}/content`, {
       method: 'PUT',
       body: JSON.stringify({
         tab: saveTab,
-        content: readerEditText,
-        chapter: selectedChapter || 0,
-        card_key: activeCardKey,
+        content,
+        chapter,
+        card_key: cardKey || '',
       }),
     })
-    setReaderSaving(false)
-    if (res?.error) {
-      setReaderEditError(typeof res.error === 'string' ? res.error : '保存失败')
-      return
-    }
-    if (res?.preview) {
-      setPreview(res.preview)
-    } else {
-      await fetchNovelPreview(project)
-    }
-    if (readerTab === 'draft' || readerTab === 'outline') {
+    if (res?.error) return res
+    if (res?.preview) setPreview(res.preview)
+    else await fetchNovelPreview(project)
+    if (saveTab === 'draft' || saveTab === 'outline') {
       setChapterCache((prev) => {
         const next = { ...prev }
         delete next[selectedChapter]
         return next
       })
     }
+    return res
+  }, [
+    project,
+    readerTab,
+    readerCardList,
+    readerCardKey,
+    selectedChapter,
+    fetchNovelPreview,
+  ])
+
+  const clearDeskDiff = useCallback(() => {
+    if (deskPatchesRef.current.length) captureReaderScrollForDiffExit()
+    setDeskPatches([])
+    setDeskPatchFocus(null)
+    setDeskPatchHidden(false)
+    setDeskDiffSel(null)
+    deskPatchesRef.current = []
+  }, [captureReaderScrollForDiffExit])
+
+  const applyReaderSaveConfirm = async () => {
+    if (!project || !readerSaveConfirm) return
+    setReaderSaving(true)
+    setReaderEditError('')
+    const { saveTab, after, cardKey, chapter } = readerSaveConfirm
+    const res = await putReaderTabContent(after, { tab: saveTab, cardKey, chapter })
+    setReaderSaving(false)
+    if (res?.error) {
+      setReaderEditError(typeof res.error === 'string' ? res.error : '保存失败')
+      return
+    }
     setReaderEditing(false)
     setReaderEditText('')
+    setReaderEditBaseline('')
+    setReaderSaveConfirm(null)
+  }
+
+  /**
+   * Desk already wrote (or accepted all hunks). Close mutation gate without
+   * claiming「放弃 / 磁盘未变更」— that was the multi-hunk Apply bug.
+   */
+  const closeMutationGateAfterDeskWrite = () => {
+    if (studioStage.cta?.isApply || studioStage.cta?.id === 'cm_apply') {
+      sendChatMessage('cm_desk_applied', { busy: 'ignore' })
+    }
+  }
+
+  /** True discard: user cancelled every hunk / 取消变更. */
+  const discardMutationGateIfOpen = () => {
+    if (studioStage.cta?.isApply || studioStage.cta?.id === 'cm_apply') {
+      sendChatMessage('cm_discard', { busy: 'ignore' })
+    }
+  }
+
+  /** 全部应用：有确认门控时走确定性 cm_apply；否则直接写盘，绝不裸发 cm_apply 进 LLM。 */
+  const applyDeskDiffAll = () => {
+    if (!activeInlineDiff) return
+    if (activeInlineDiff.source === 'save') {
+      // 保存预览若已 Cancel 部分块，写 remaining；否则写全文 after。
+      if (
+        deskDiffSel
+        && deskDiffSel.selectedCount > 0
+        && deskDiffSel.selectedCount < deskDiffSel.totalCount
+      ) {
+        applyDeskDiffSelected()
+        return
+      }
+      applyReaderSaveConfirm()
+      return
+    }
+    if (
+      studioStage.cta?.isApply
+      && (!deskDiffSel
+        || deskDiffSel.selectedCount === deskDiffSel.totalCount)
+    ) {
+      runStudioCta()
+      return
+    }
+    const body = deskDiffSel?.fullAfter || activeInlineDiff.after
+    if (!body) return
+    setReaderSaving(true)
+    putReaderTabContent(body, {
+      tab: activeInlineDiff.readerTab || readerTab,
+      chapter: activeInlineDiff.chapter || selectedChapter || 0,
+    }).then((res) => {
+      setReaderSaving(false)
+      if (res?.error) {
+        setReaderEditError(typeof res.error === 'string' ? res.error : '写入失败')
+        return
+      }
+      clearDeskDiff()
+      closeMutationGateAfterDeskWrite()
+    })
+  }
+
+  /** 应用勾选：只合并选中变更块；Agent 预览随后关闭门控（已手写落盘）。 */
+  const applyDeskDiffSelected = async () => {
+    if (!activeInlineDiff || !deskDiffSel) return
+    if (!deskDiffSel.selectedCount) {
+      setReaderEditError('请先选择要应用的变更块')
+      return
+    }
+    // 全选时与「全部应用」同路径（保留 mutation 审计/版本节点）。
+    if (
+      deskDiffSel.selectedCount === deskDiffSel.totalCount
+      && activeInlineDiff.source === 'agent'
+      && studioStage.cta?.isApply
+    ) {
+      runStudioCta()
+      return
+    }
+    const body = deskDiffSel.fullAfter ?? deskDiffSel.partialAfter
+    if (body == null) return
+    setReaderSaving(true)
+    setReaderEditError('')
+    if (activeInlineDiff.source === 'save') {
+      const { saveTab, cardKey, chapter } = readerSaveConfirm || {}
+      const res = await putReaderTabContent(body, { tab: saveTab, cardKey, chapter })
+      setReaderSaving(false)
+      if (res?.error) {
+        setReaderEditError(typeof res.error === 'string' ? res.error : '写入失败')
+        return
+      }
+      setReaderEditing(false)
+      setReaderEditText('')
+      setReaderEditBaseline('')
+      setReaderSaveConfirm(null)
+      return
+    }
+    const res = await putReaderTabContent(body, {
+      tab: activeInlineDiff.readerTab || readerTab,
+      chapter: activeInlineDiff.chapter || selectedChapter || 0,
+    })
+    setReaderSaving(false)
+    if (res?.error) {
+      setReaderEditError(typeof res.error === 'string' ? res.error : '写入失败')
+      return
+    }
+    clearDeskDiff()
+    closeMutationGateAfterDeskWrite()
+  }
+
+  /**
+   * 单块流程结束（InlineDiffView 仅在无剩余块时回调）：
+   * - 全部 Apply → cm_apply
+   * - 部分 Apply / Cancel 混合 → PUT 合并结果 + cm_desk_applied
+   */
+  const applyDeskDiffHunk = async (_hunkId, { after, remaining, allAccepted } = {}) => {
+    if (!activeInlineDiff || after == null) return
+    if (Array.isArray(remaining) && remaining.length > 0) return
+    if (
+      activeInlineDiff.source === 'agent'
+      && allAccepted
+      && studioStage.cta?.isApply
+    ) {
+      runStudioCta()
+      return
+    }
+    setReaderSaving(true)
+    setReaderEditError('')
+    if (activeInlineDiff.source === 'save') {
+      const { saveTab, cardKey, chapter } = readerSaveConfirm || {}
+      const res = await putReaderTabContent(after, { tab: saveTab, cardKey, chapter })
+      setReaderSaving(false)
+      if (res?.error) {
+        setReaderEditError(typeof res.error === 'string' ? res.error : '写入失败')
+        return
+      }
+      setReaderEditing(false)
+      setReaderEditText('')
+      setReaderEditBaseline('')
+      setReaderSaveConfirm(null)
+      return
+    }
+    const res = await putReaderTabContent(after, {
+      tab: activeInlineDiff.readerTab || readerTab,
+      chapter: activeInlineDiff.chapter || selectedChapter || 0,
+    })
+    setReaderSaving(false)
+    if (res?.error) {
+      setReaderEditError(typeof res.error === 'string' ? res.error : '写入失败')
+      return
+    }
+    clearDeskDiff()
+    closeMutationGateAfterDeskWrite()
+  }
+
+  /** 单块 Cancel：全部取消才丢弃预览；否则仅本地剔除该块。 */
+  const cancelDeskDiffHunk = (_hunkId, { allCancelled } = {}) => {
+    if (!allCancelled) return
+    if (activeInlineDiff?.source === 'save') {
+      discardReaderSaveConfirm()
+      return
+    }
+    clearDeskDiff()
+    discardMutationGateIfOpen()
   }
 
   const switchReaderTab = (id) => {
-    if (readerEditing && id !== readerTab) {
+    if ((readerEditing || readerSaveConfirm) && id !== readerTab) {
       if (!window.confirm('正在编辑，切换将丢弃未保存修改，继续？')) return
       cancelReaderEdit()
     }
@@ -1290,7 +1637,7 @@ export default function App() {
 
   const switchReaderVolume = (vol) => {
     if (vol === readerVolume) return
-    if (readerEditing) {
+    if (readerEditing || readerSaveConfirm) {
       if (!window.confirm('正在编辑，切换卷将丢弃未保存修改，继续？')) return
       cancelReaderEdit()
     }
@@ -1615,15 +1962,15 @@ export default function App() {
                         {`删除本${unitLabel}`}
                       </button>
                     )}
-                    {readerEditing && (
+                    {readerEditing && !readerSaveConfirm && (
                       <div className="reader-edit-actions">
                         <button
                           type="button"
                           className="btn-primary btn-inline"
                           disabled={readerSaving}
-                          onClick={saveReaderEdit}
+                          onClick={requestReaderSaveConfirm}
                         >
-                          {readerSaving ? '保存中…' : '保存'}
+                          保存
                         </button>
                         <button
                           type="button"
@@ -1631,7 +1978,29 @@ export default function App() {
                           disabled={readerSaving}
                           onClick={cancelReaderEdit}
                         >
-                          取消
+                          取消编辑
+                        </button>
+                      </div>
+                    )}
+                    {readerSaveConfirm && (
+                      <div className="reader-edit-actions">
+                        <button
+                          type="button"
+                          className="btn-primary btn-inline"
+                          disabled={readerSaving}
+                          onClick={applyReaderSaveConfirm}
+                          title="将对照中的变更写入磁盘"
+                        >
+                          {readerSaving ? '写入中…' : '应用修改'}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-ghost btn-inline"
+                          disabled={readerSaving}
+                          onClick={discardReaderSaveConfirm}
+                          title="丢弃本次预览，退回编辑前内容"
+                        >
+                          取消变更
                         </button>
                       </div>
                     )}
@@ -1653,6 +2022,45 @@ export default function App() {
               </div>
               {readerEditError ? (
                 <div className="reader-edit-error">{readerEditError}</div>
+              ) : null}
+              {deskInlineDiffActive ? (
+                <div className="desk-inline-diff-bar" role="region" aria-label="内联变更对照">
+                  <strong>
+                    内联对照 · {activeInlineDiff.label || '变更'}
+                    {deskDiffSel?.totalCount
+                      ? ` · ${deskDiffSel.selectedCount}/${deskDiffSel.totalCount} 块`
+                      : ''}
+                  </strong>
+                  <div className="desk-patch-dock-actions">
+                    <button
+                      type="button"
+                      className="btn-primary btn-inline"
+                      disabled={readerSaving || chatBusy || !deskDiffSel?.selectedCount}
+                      onClick={applyDeskDiffAll}
+                      title="应用全部剩余变更"
+                    >
+                      {readerSaving || chatBusy ? '进行中…' : '全部应用'}
+                    </button>
+                    {activeInlineDiff.source === 'save' ? (
+                      <button
+                        type="button"
+                        className="btn-ghost btn-inline"
+                        disabled={readerSaving}
+                        onClick={discardReaderSaveConfirm}
+                      >
+                        取消变更
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        className="btn-ghost btn-inline"
+                        onClick={() => setDeskPatchHidden(true)}
+                      >
+                        收起对照
+                      </button>
+                    )}
+                  </div>
+                </div>
               ) : null}
               {showSetupConfirmBar && (
                 <div className="setup-confirm-bar" role="region" aria-label="定稿确认">
@@ -1773,83 +2181,26 @@ export default function App() {
                   })}
                 </div>
               )}
-              {!deskPatchHidden && activeDeskPatch && readerTab === 'draft' ? (
-                <div className="desk-patch-dock" role="region" aria-label="修订对照">
-                  <div className="desk-patch-dock-head">
-                    <strong>
-                      修订对照 · 第{activeDeskPatch.chapter}章 · 第{activeDeskPatch.start_para}
-                      {activeDeskPatch.end_para !== activeDeskPatch.start_para
-                        ? `–${activeDeskPatch.end_para}`
-                        : ''}
-                      段
-                      {visibleDeskPatches.length > 1
-                        ? ` · ${visibleDeskPatches.length} 处`
-                        : ''}
-                    </strong>
-                    <div className="desk-patch-dock-actions">
-                      {visibleDeskPatches.length > 1 ? (
-                        <select
-                          className="desk-patch-select"
-                          value={String(Math.max(0, visibleDeskPatches.findIndex((p) => (
-                            Number(p.chapter) === Number(activeDeskPatch.chapter)
-                            && Number(p.start_para) === Number(activeDeskPatch.start_para)
-                            && String(p.before || '') === String(activeDeskPatch.before || '')
-                          ))))}
-                          onChange={(e) => {
-                            const idx = Number(e.target.value)
-                            if (visibleDeskPatches[idx]) setDeskPatchFocus(visibleDeskPatches[idx])
-                          }}
-                          aria-label="选择修订段"
-                        >
-                          {visibleDeskPatches.map((p, idx) => (
-                            <option key={`${p.chapter}-${p.start_para}-${idx}`} value={String(idx)}>
-                              第{p.start_para}
-                              {p.end_para !== p.start_para ? `–${p.end_para}` : ''}
-                              段
-                            </option>
-                          ))}
-                        </select>
-                      ) : null}
-                      {studioStage.cta?.isApply ? (
-                        <button
-                          type="button"
-                          className="btn-primary btn-inline"
-                          onClick={runStudioCta}
-                          disabled={chatBusy}
-                          title="将预览中的修订写入正文"
-                        >
-                          {chatBusy ? '进行中…' : '应用修改'}
-                        </button>
-                      ) : null}
-                      <button
-                        type="button"
-                        className="btn-ghost btn-inline"
-                        onClick={() => setDeskPatchHidden(true)}
-                      >
-                        收起对照
-                      </button>
-                    </div>
-                  </div>
-                  <div className="desk-patch-diff">
-                    <div className="desk-patch-before">
-                      <div className="desk-patch-label">原文</div>
-                      <pre>{activeDeskPatch.before || '（空）'}</pre>
-                    </div>
-                    <div className="desk-patch-after">
-                      <div className="desk-patch-label">修订后</div>
-                      <pre>{activeDeskPatch.after || '（空）'}</pre>
-                    </div>
-                  </div>
-                </div>
-              ) : null}
               <div
                 className={`reader-body${readerEditing ? ' reader-body-editing' : ''}${
-                  !deskPatchHidden && activeDeskPatch && readerTab === 'draft' ? ' with-patch' : ''
-                }${isVolumeWorkspace ? ' reader-body-workspace' : ''}`}
+                  deskInlineDiffActive ? ' with-inline-diff' : ''
+                }${isVolumeWorkspace && !deskInlineDiffActive ? ' reader-body-workspace' : ''}${
+                  readerTab === 'draft' ? ' is-draft-prose' : ''
+                }`}
                 ref={readerRef}
                 onScroll={onReaderScroll}
               >
-                {isVolumeWorkspace ? (
+                {deskInlineDiffActive ? (
+                  <InlineDiffView
+                    before={activeInlineDiff.before}
+                    after={activeInlineDiff.after}
+                    label={activeInlineDiff.label}
+                    busy={readerSaving || chatBusy}
+                    onSelectionChange={handleInlineDiffSelection}
+                    onHunkApply={applyDeskDiffHunk}
+                    onHunkCancel={cancelDeskDiffHunk}
+                  />
+                ) : isVolumeWorkspace ? (
                   <VolumeWorkspace
                     group={currentVolumeGroup}
                     nextChapter={nextChapter}
@@ -1881,17 +2232,15 @@ export default function App() {
                     }}
                   />
                 ) : readerEditing ? (
-                  <textarea
-                    className="reader-editor"
+                  <LinedProseEditor
                     value={readerEditText}
                     onChange={(e) => setReaderEditText(e.target.value)}
-                    spellCheck={false}
                     aria-label="编辑写作台内容"
                   />
                 ) : (
-                  <MarkdownView
-                    variant="reader"
-                    source={readerContent || '暂无内容'}
+                  <LinedProseView
+                    text={readerContent || '暂无内容'}
+                    className={readerTab === 'draft' ? 'is-draft' : ''}
                   />
                 )}
               </div>
@@ -1913,7 +2262,7 @@ export default function App() {
             onSubAgentsChange={handleSubAgentsChange}
             onOpenSubAgent={handleOpenSubAgent}
             openSubAgentId={openSubAgent?.threadId || ''}
-            compactDraftPatches={deskPatchDockVisible}
+            compactDraftPatches={deskInlineDiffActive}
             statusOpen={statusOpen}
             onOpenStatus={() => {
               setEngineOpen(false)

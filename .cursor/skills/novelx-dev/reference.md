@@ -31,6 +31,8 @@
 | 单步 spawn 子 Agent 后推进 `next_chapter` | 发布收尾只在完整章流水线末尾一次 |
 | 用 `spawn_agent(mode=continue\|revise\|audit_only)` 写章/审校 | 整章走 `continue_writing` / `revise_chapter` / `audit_*`（进程内流水线）；spawn 仅单步专精/只读旁路 |
 | 润色 Agent 每章必跑 | `literary_editor` 靠 activation 建议或 Studio `activate_agents`；即时润色优先 `revise_chapter` |
+| mutation 落盘后只弹「继续推进 / 稍后」 | 主 Agent 须小结+`offer_decisions(studio_next)`；未出卡时 Mutation fallback 按 `setup_next`/剧情门拼可执行工具卡 |
+| 连写被「应用修改」卡卡住 | 设置 → 工作流开启 `studio.agent_auto_apply_mutations`；删卡/还原版本仍须确认 |
 
 ### 格式与 Web
 

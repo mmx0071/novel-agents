@@ -30,6 +30,10 @@ features:
   # When true: only high-severity tools (config/mutation_policy.yaml) open confirm_mutation;
   # routine tools self-confirm. When false: all mutating tools require human confirm.
   studio.mutation_severity_policy: true
+  # When true: Studio Agent may apply content mutations without human「应用修改」cards
+  # (连写/评审团自动修订可自行推进). Web 写作台手工编辑仍走对照确认。
+  # Irreversible tools (delete_entity / restore_version_node) always require confirm.
+  studio.agent_auto_apply_mutations: false
   # Shadow git version nodes under projects/<name>/.novelx/versions.git (list + restore).
   studio.version_nodes: true
   # After mutating tools apply: scan dependent artifacts and offer cascade revise gate.

@@ -167,42 +167,154 @@ function normalizeServerGate(gate) {
   }
 }
 
-/** Attach open_gate.preview diffs/markdown onto the last turn's items (HTTP restore). */
+function previewItemHasDiffs(it) {
+  if (!it) return false
+  if (it.type === 'draft_patch') return !!(it.before || it.after)
+  if (it.type === 'mutation_preview') {
+    return Array.isArray(it.diffs) && it.diffs.some((d) => d?.before || d?.after)
+  }
+  return false
+}
+
+/** True when open_gate / turn.approval is a live mutation confirm (cm_apply / cm_discard). */
+function isMutationConfirmGate(gate) {
+  if (!gate || typeof gate !== 'object') return false
+  if (gate.kind === 'confirm_mutation') return true
+  if (gate.mutation_kind && gate.kind !== 'chapter_next') return true
+  return isLiveMutationApproval(gate)
+}
+
+function stripPreviewItems(items) {
+  return (items || []).filter((it) => (
+    it?.type !== 'mutation_preview' && it?.type !== 'draft_patch'
+  ))
+}
+
+/** Attach open_gate.preview diffs/markdown onto the last turn's items (HTTP restore / live gate). */
 function attachGatePreviewItems(turns, gate) {
   if (!Array.isArray(turns) || !turns.length || !gate?.preview) return turns
+  // Never mount「待确认修改」under chapter_next / audit / setup cards.
+  if (!isMutationConfirmGate(gate)) return turns
   const preview = gate.preview
   const items = []
   const diffs = Array.isArray(preview.diffs) ? preview.diffs : []
-  for (const d of diffs) {
-    items.push({
-      type: 'draft_patch',
-      status: 'completed',
-      project: preview.project || '',
-      chapter: preview.chapter || 0,
-      start_para: d.start_para || 1,
-      end_para: d.end_para || d.start_para || 1,
-      before: d.before || '',
-      after: d.after || '',
-    })
-  }
-  if (!items.length && (preview.markdown || preview.fields)) {
+  const chapter = Number(preview.chapter) || 0
+  const kind = String(gate.mutation_kind || preview.kind || '')
+  const bodyParaPatch = chapter > 0 && (
+    !kind
+    || kind === 'revise_chapter'
+    || kind === 'split_chapter'
+    || kind === 'apply_draft_patch'
+    || kind === 'draft_patch'
+  ) && !preview.before_full && !preview.after_full
+  if (diffs.length && bodyParaPatch) {
+    for (const d of diffs) {
+      items.push({
+        type: 'draft_patch',
+        status: 'completed',
+        project: preview.project || '',
+        chapter,
+        start_para: d.start_para || 1,
+        end_para: d.end_para || d.start_para || 1,
+        before: d.before || '',
+        after: d.after || '',
+      })
+    }
+  } else if (
+    diffs.length
+    || preview.before_full
+    || preview.after_full
+    || preview.markdown
+    || preview.fields
+  ) {
     items.push({
       type: 'mutation_preview',
       status: 'completed',
       kind: gate.mutation_kind || preview.kind || 'mutation',
+      topic: preview.topic || '',
+      path: typeof preview.path === 'string' ? preview.path : '',
+      title: preview.title || '',
+      name: preview.name || '',
       markdown: preview.markdown || '',
+      before_full: preview.before_full || '',
+      after_full: preview.after_full || '',
+      chapter: Number(preview.chapter) || 0,
       fields: preview.fields || null,
+      diffs: diffs.map((d) => ({
+        before: d.before || '',
+        after: d.after || '',
+      })),
     })
   }
   if (!items.length) return turns
   return turns.map((t, idx) => {
     if (idx !== turns.length - 1) return t
     const existing = Array.isArray(t.items) ? t.items : []
+    const rich = items.some(previewItemHasDiffs)
+    // Upgrade a weak card (markdown-only) when gate now carries hunks.
+    if (rich) {
+      const weakIdx = existing.findIndex((it) => (
+        (it?.type === 'mutation_preview' || it?.type === 'draft_patch')
+        && !previewItemHasDiffs(it)
+      ))
+      if (weakIdx >= 0) {
+        const cleaned = existing.filter((_, i) => i !== weakIdx)
+        return { ...t, items: [...cleaned, ...items] }
+      }
+    }
     const hasPreview = existing.some(
       (it) => it?.type === 'draft_patch' || it?.type === 'mutation_preview',
     )
     if (hasPreview) return t
     return { ...t, items: [...existing, ...items] }
+  })
+}
+
+/** Live WS gate has prompt/options only — hydrate mutation preview from open_gate (not history). */
+function mergeSnapshotPreviewIntoTurns(turns, snap) {
+  if (!Array.isArray(turns) || !turns.length || !snap || typeof snap !== 'object') return turns
+  const gate = normalizeServerGate(snap.open_gate)
+  const mutationLive = !!(snap.pending_mutation) || isMutationConfirmGate(gate)
+  // Wrong gate (chapter_next after audit, etc.): drop ghost「拟修改」cards.
+  if (!mutationLive) {
+    return turns.map((t, idx) => {
+      if (idx !== turns.length - 1) return t
+      const items = stripPreviewItems(t.items)
+      if (items.length === (t.items || []).length) return t
+      return { ...t, items }
+    })
+  }
+  let next = turns
+  if (gate?.preview) {
+    next = next.map((t, idx) => {
+      if (idx !== next.length - 1) return t
+      if (!t.approval) return { ...t, approval: gate }
+      return {
+        ...t,
+        approval: {
+          ...t.approval,
+          preview: gate.preview,
+          kind: gate.kind || t.approval.kind,
+          mutation_kind: gate.mutation_kind || t.approval.mutation_kind,
+        },
+      }
+    })
+    next = attachGatePreviewItems(next, gate)
+  }
+  // Only pull preview cards from the *last* server turn (current gate), never scrape history.
+  const lastServer = Array.isArray(snap.turns) && snap.turns.length
+    ? snap.turns[snap.turns.length - 1]
+    : null
+  const serverItems = (lastServer?.items || []).filter((it) => (
+    it?.type === 'mutation_preview' || it?.type === 'draft_patch'
+  ))
+  if (!serverItems.length) return next
+  return next.map((t, idx) => {
+    if (idx !== next.length - 1) return t
+    const existing = Array.isArray(t.items) ? t.items : []
+    if (existing.some(previewItemHasDiffs)) return t
+    const cleaned = stripPreviewItems(existing)
+    return { ...t, items: [...cleaned, ...serverItems] }
   })
 }
 
@@ -470,16 +582,123 @@ function saveAgentCollapsed(collapsed) {
   }
 }
 
+/** Map mutation preview → writing-desk reader tab (本卷/正文/章纲/总纲/卷纲/世界观…). */
+export function readerTabForDocPatch(item) {
+  const kind = String(item?.kind || '').toLowerCase()
+  const topic = String(item?.topic || '')
+  const path = String(item?.path || '').replace(/\\/g, '/')
+  const title = String(item?.title || item?.name || '')
+  if (kind.includes('revise_chapter') || kind.includes('split_chapter') || kind.includes('draft_patch')) {
+    return 'draft'
+  }
+  if (kind.includes('revise_outline') || /chapters\/\d+\/outline/.test(path)) {
+    return 'outline'
+  }
+  if (kind.includes('replan_volume')) {
+    return 'volume'
+  }
+  if (
+    kind.includes('upsert_setting')
+    || kind.includes('supplement_setting')
+    || /bible|世界观/.test(topic)
+    || /bible\.md|world_architect/.test(path)
+  ) {
+    return 'art:bible'
+  }
+  if (kind.includes('design_master') || /master_outline|series_outline/.test(path) || topic.includes('总纲')) {
+    return 'master'
+  }
+  if (kind.includes('design_arc') || /arc_outline/.test(path) || /卷纲/.test(topic)) {
+    return 'arcs'
+  }
+  if (kind.includes('design_plot') || /plots\//.test(path)) {
+    return 'arcs'
+  }
+  if (kind.includes('design_entity') || /entities\//.test(path)) {
+    const m = path.match(/entities\/([^/]+)\//)
+    if (m) return `ent:${m[1]}`
+    return 'entity_gaps'
+  }
+  if (title) return null
+  return null
+}
+
+function isLiveMutationApproval(approval) {
+  const opts = Array.isArray(approval?.options) ? approval.options : []
+  return opts.some((o) => {
+    const id = String(o?.id || '')
+    const label = String(o?.label || '')
+    return id === 'cm_apply'
+      || id === 'cm_discard'
+      || label === '全部应用'
+      || label === '应用修改'
+      || label === '取消变更'
+  })
+}
+
 function collectDraftPatches(turns) {
+  // Only surface desk diffs while a mutation confirm gate is still open.
+  // Historical mutation_preview cards must not keep Apply alive after discard.
+  if (!isLiveMutationApproval(approvalFromTurns(turns))) return []
+
   const list = []
-  for (const turn of turns || []) {
+  // Prefer the latest turn (where open_gate / preview are attached).
+  const last = Array.isArray(turns) && turns.length ? turns[turns.length - 1] : null
+  const scan = last ? [last] : []
+  for (const turn of scan) {
     for (const it of turn.items || []) {
       if (it?.type === 'draft_patch' && (it.before || it.after)) {
-        list.push(it)
+        list.push({
+          ...it,
+          type: 'draft_patch',
+          readerTab: it.readerTab || 'draft',
+          label: it.label || `第${it.chapter || '?'}章正文`,
+        })
+        continue
+      }
+      // Document mutations → one inline_doc_diff (full before/after at real positions).
+      if (it?.type === 'mutation_preview') {
+        const hunks = Array.isArray(it.diffs) ? it.diffs : []
+        const tab = readerTabForDocPatch(it)
+        const label = it.topic || it.title || it.name || mutationDocLabel(it.kind) || '设定变更'
+        const beforeFull = String(it.before_full || '')
+        const afterFull = String(it.after_full || '')
+        if (beforeFull || afterFull || hunks.length) {
+          list.push({
+            type: 'inline_doc_diff',
+            status: 'completed',
+            chapter: Number(it.chapter) || 0,
+            start_para: 1,
+            end_para: 1,
+            before: beforeFull,
+            after: afterFull || String(it.markdown || ''),
+            beforeFull,
+            afterFull: afterFull || String(it.markdown || ''),
+            diffs: hunks,
+            readerTab: tab,
+            label,
+            kind: it.kind || '',
+            topic: it.topic || '',
+            path: it.path || '',
+          })
+        }
       }
     }
   }
   return list
+}
+
+function mutationDocLabel(kind) {
+  const k = String(kind || '')
+  if (k.includes('upsert_setting') || k.includes('supplement')) return '世界观'
+  if (k.includes('design_master')) return '总纲'
+  if (k.includes('design_arc')) return '卷纲'
+  if (k.includes('design_entity')) return '设定卡'
+  if (k.includes('design_plot')) return '剧情卡'
+  if (k.includes('revise_outline')) return '章纲'
+  if (k.includes('replan_volume')) return '本卷'
+  if (k.includes('revise_chapter') || k.includes('split_chapter')) return '正文'
+  return ''
 }
 
 export default function NovelXChat({
@@ -1528,6 +1747,7 @@ export default function NovelXChat({
           // (never spawn an empty approval-only turn that makes the chat look wiped).
           setTurns((prev) => {
             const gate = { prompt: ev.prompt, options: opts }
+            const mutationGate = isMutationConfirmGate(gate)
             const hasMatch = prev.some((t) => t.id === ev.turn_id)
             const lastWithItems = [...prev].reverse().find((t) => (t.items || []).length > 0)
             const targetId = hasMatch
@@ -1548,7 +1768,9 @@ export default function NovelXChat({
             }
             return prev.map((t) => {
               const matched = t.id === targetId
-              const items = finishAuditTools(finishOpenItems(t.items || []))
+              let items = finishAuditTools(finishOpenItems(t.items || []))
+              // chapter_next / audit / setup: never keep stale「待确认修改」cards.
+              if (matched && !mutationGate) items = stripPreviewItems(items)
               // If matched turn is empty, keep a prompt line so dialogue does not vanish.
               const nextItems = matched && !items.length
                 ? [{
@@ -1571,6 +1793,17 @@ export default function NovelXChat({
           })
           // Gates often follow a write (plot/chapter); sync reader before user decides.
           syncPreview({ keepSelection: true })
+          // Live WS payload has no preview — hydrate open_gate.diffs so writing desk shows −/+.
+          const snapTid = ev.thread_id || threadId || ''
+          if (snapTid) {
+            fetch(`${API}/thread/${encodeURIComponent(snapTid)}/snapshot`)
+              .then((r) => r.json())
+              .then((snap) => {
+                if (!snap || snap.error) return
+                setTurns((prev) => mergeSnapshotPreviewIntoTurns(prev, snap))
+              })
+              .catch(() => {})
+          }
           break
         }
         case 'error':
@@ -1787,12 +2020,16 @@ export default function NovelXChat({
         const serverPhase = started.composer_phase
           || (turnActive ? 'working' : (hasHumanGate ? 'awaiting_human' : 'idle'))
         if (nextTurns?.length && restoredGate) {
+          const mutationGate = isMutationConfirmGate(restoredGate)
+            || !!started.pending_mutation
           nextTurns = nextTurns.map((t, idx) => {
             const last = idx === nextTurns.length - 1
+            let items = finishAuditTools(finishOpenItems(t.items))
+            if (last && !mutationGate) items = stripPreviewItems(items)
             return {
               ...t,
               status: last ? 'awaiting' : (t.status === 'running' ? 'awaiting' : t.status),
-              items: finishAuditTools(finishOpenItems(t.items)),
+              items,
               approval: last ? restoredGate : null,
             }
           })

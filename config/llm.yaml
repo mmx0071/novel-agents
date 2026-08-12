@@ -1,4 +1,4 @@
-profile: prod
+profile: dev
 retry:
   max_retries: 3
   base_delay_ms: 800

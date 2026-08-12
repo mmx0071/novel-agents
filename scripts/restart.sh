@@ -2,12 +2,13 @@
 # 一键重启 NovelX（Rust web 服务，默认托管 web/dist）
 #
 # 用法：
-#   ./scripts/restart.sh              # 编译 CLI + 构建前端，杀旧进程后启动
+#   ./scripts/restart.sh              # 编译 CLI + 构建前端，杀旧进程后后台启动（默认 daemon）
 #   ./scripts/restart.sh --quick      # 不编译，只杀进程重启（需已有二进制与 dist）
 #   ./scripts/restart.sh --no-web     # 编译 CLI，但不重新 npm build
 #   ./scripts/restart.sh --release    # 用 release 二进制
 #   ./scripts/restart.sh --bind 0.0.0.0:8765
-#   ./scripts/restart.sh --daemon     # 后台运行，日志写入 .novelx/web.log
+#   ./scripts/restart.sh --foreground # 前台运行（Ctrl+C 停止）
+#   ./scripts/restart.sh --daemon     # 显式后台（默认已是，可省略）
 #
 set -euo pipefail
 
@@ -19,7 +20,7 @@ PORT="${BIND##*:}"
 BUILD_CLI=1
 BUILD_WEB=1
 RELEASE=0
-DAEMON=0
+DAEMON=1
 QUICK=0
 
 usage() {
@@ -27,12 +28,13 @@ usage() {
 一键重启 NovelX（Rust web 服务，默认托管 web/dist）
 
 用法：
-  ./scripts/restart.sh              # 编译 CLI + 构建前端，杀旧进程后启动
+  ./scripts/restart.sh              # 编译 CLI + 构建前端，杀旧进程后后台启动（默认 daemon）
   ./scripts/restart.sh --quick      # 不编译，只杀进程重启（需已有二进制与 dist）
   ./scripts/restart.sh --no-web     # 编译 CLI，但不重新 npm build
   ./scripts/restart.sh --release    # 用 release 二进制
   ./scripts/restart.sh --bind 0.0.0.0:8765
-  ./scripts/restart.sh --daemon     # 后台运行，日志写入 .novelx/web.log
+  ./scripts/restart.sh --foreground # 前台运行（Ctrl+C 停止）
+  ./scripts/restart.sh --daemon     # 显式后台（默认已是，可省略）
 EOF
   exit 0
 }
@@ -45,6 +47,7 @@ while [[ $# -gt 0 ]]; do
     --no-build) BUILD_CLI=0; BUILD_WEB=0; shift ;;
     --release) RELEASE=1; shift ;;
     --daemon|-d) DAEMON=1; shift ;;
+    --foreground|-f) DAEMON=0; shift ;;
     --bind) BIND="$2"; PORT="${BIND##*:}"; shift 2 ;;
     --bind=*) BIND="${1#*=}"; PORT="${BIND##*:}"; shift ;;
     *)
