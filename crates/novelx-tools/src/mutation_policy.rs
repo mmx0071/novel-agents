@@ -88,6 +88,12 @@ impl Default for MutationPolicy {
             "supplement_setting",
             "replan_volume",
             "restore_version_node",
+            "design_entity",
+            "design_plot",
+            "revise_outline",
+            "update_plot",
+            "revise_chapter",
+            "split_chapter",
         ] {
             high.insert(t.into());
         }
@@ -95,12 +101,6 @@ impl Default for MutationPolicy {
         for t in [
             "continue_writing",
             "continue_writing_batch",
-            "revise_chapter",
-            "split_chapter",
-            "revise_outline",
-            "design_plot",
-            "update_plot",
-            "design_entity",
             "activate_agents",
             "enqueue_expected_event",
             "update_expected_event",
@@ -240,6 +240,9 @@ mod tests {
         let p = MutationPolicy::default();
         assert!(p.is_routine("continue_writing"));
         assert!(p.is_high("delete_entity"));
+        assert!(p.is_high("design_entity"));
+        assert!(p.is_high("revise_chapter"));
+        assert!(!p.is_routine("design_plot"));
         assert!(p.is_high("unknown_tool"));
     }
 

@@ -1,8 +1,12 @@
 //! Studio-next decision cards — model-offered options with server-side tool whitelist.
 
+use novelx_pipeline::{
+    check_plot_write_gate, resolve_setup_next_step, PlotWriteGate, SetupNextStep,
+};
 use novelx_protocol::UserInputOption;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::path::Path;
 
 /// Allowed tools for `offer_decisions(kind=studio_next)`.
 pub const ALLOWED_TOOLS: &[&str] = &[
@@ -239,15 +243,18 @@ pub fn validate_studio_next_options(
 
 pub fn studio_next_nudge(project: &str, reason: &str) -> String {
     format!(
-        "[系统] 项目「{project}」需要你给出下一步审批卡。原因：{reason}\n\
-         请立即调用 offer_decisions(kind=\"studio_next\", project=\"{project}\", prompt=短提示, options=[...])。\n\
+        "[系统] 项目「{project}」需要你收尾本轮。原因：{reason}\n\
+         1) 先写用户可见正文：本轮小结（2–4 句）+ 建议下一步；\n\
+         2) 立即调用 offer_decisions(kind=\"studio_next\", project=\"{project}\", \
+         prompt=含「本轮小结+推荐处理」的短 Markdown, options=[...])。\n\
          每项 options 须含 id、label，以及 tool+args 或 resolve（dismiss_gate|continue_studio）。\n\
-         根据对话未完成计划出 2–5 个可区分选项；禁止在正文伪造编号卡；\
+         根据未完成计划出 2–5 个可区分可执行选项（如确认定稿/补实体/设计剧情卡）；\
+         禁止在正文伪造编号卡；禁止把「继续推进」当作唯一实义项；\
          除非用户明确要写章，否则不要把 continue_writing 当作唯一选项。"
     )
 }
 
-fn opt_tool(id: &str, label: &str, tool: &str, args: Value) -> StudioNextOption {
+fn opt_tool(id: &str, label: impl Into<String>, tool: &str, args: Value) -> StudioNextOption {
     StudioNextOption {
         id: id.into(),
         label: label.into(),
@@ -257,7 +264,7 @@ fn opt_tool(id: &str, label: &str, tool: &str, args: Value) -> StudioNextOption 
     }
 }
 
-fn opt_resolve(id: &str, label: &str, resolve: &str) -> StudioNextOption {
+fn opt_resolve(id: &str, label: impl Into<String>, resolve: &str) -> StudioNextOption {
     StudioNextOption {
         id: id.into(),
         label: label.into(),
@@ -267,6 +274,162 @@ fn opt_resolve(id: &str, label: &str, resolve: &str) -> StudioNextOption {
     }
 }
 
+/// Disk-aware fallback after structure mutations when the model skips `offer_decisions`.
+pub fn mutation_fallback_options(
+    project: &str,
+    project_dir: &Path,
+    apply_tool: &str,
+) -> (String, Vec<StudioNextOption>) {
+    let tool = if apply_tool.is_empty() {
+        "设定/大纲"
+    } else {
+        apply_tool
+    };
+    let mut options: Vec<StudioNextOption> = Vec::new();
+    let step_hint = match resolve_setup_next_step(project_dir) {
+        Some(SetupNextStep::NeedBrief) => {
+            options.push(opt_tool(
+                "fb_status",
+                "查看项目状态",
+                "get_project_status",
+                json!({ "project": project }),
+            ));
+            "灵感尚未锁定，请先在对话中发送卖点/灵感（lock_brief）。".to_string()
+        }
+        Some(SetupNextStep::NeedMaster) => {
+            options.push(opt_tool(
+                "fb_master",
+                "生成总纲",
+                "design_master_outline",
+                json!({ "project": project }),
+            ));
+            "下一步请生成总纲。".to_string()
+        }
+        Some(SetupNextStep::NeedArc) => {
+            options.push(opt_tool(
+                "fb_arc",
+                "生成卷纲",
+                "design_arc_outline",
+                json!({ "project": project }),
+            ));
+            "下一步请生成卷纲。".to_string()
+        }
+        Some(SetupNextStep::NeedBible) => {
+            options.push(opt_tool(
+                "fb_bible",
+                "生成世界观",
+                "upsert_setting",
+                json!({
+                    "project": project,
+                    "topic": "完整世界观",
+                    "content": "根据 brief、总纲与卷纲生成完整世界观，须含 # 世界观 与 ## 0./1./2./7. 必填节。"
+                }),
+            ));
+            "下一步请补齐世界观 Bible（须含 ## 0./1./2./7.）。".to_string()
+        }
+        Some(SetupNextStep::Confirm) => {
+            options.push(opt_tool(
+                "fb_confirm",
+                "确认定稿",
+                "confirm_setup",
+                json!({ "project": project, "action": "approve" }),
+            ));
+            options.push(opt_tool(
+                "fb_revise_setup",
+                "修改再生成",
+                "confirm_setup",
+                json!({ "project": project, "action": "revise" }),
+            ));
+            "总纲/卷纲/世界观已就绪，建议确认定稿后再写章。".to_string()
+        }
+        None => {
+            // setup ready — plot / writing guidance
+            match check_plot_write_gate(project_dir) {
+                PlotWriteGate::Allow { .. } => {
+                    options.push(opt_tool(
+                        "fb_continue",
+                        "继续创作",
+                        "continue_writing",
+                        json!({ "project": project }),
+                    ));
+                    options.push(opt_tool(
+                        "fb_plots",
+                        "查看剧情进度",
+                        "list_plots",
+                        json!({ "project": project }),
+                    ));
+                    "定稿已完成且有进行中剧情卡，可继续创作或先查看进度。".to_string()
+                }
+                PlotWriteGate::Block {
+                    reason: "planned_inactive",
+                    plot_title,
+                    ..
+                } => {
+                    let title = plot_title.unwrap_or_else(|| "下一段".into());
+                    options.push(opt_tool(
+                        "fb_activate",
+                        format!("激活剧情卡「{title}」"),
+                        "update_plot",
+                        json!({
+                            "project": project,
+                            "title": title,
+                            "status": "in_progress",
+                            "set_active_main": true,
+                        }),
+                    ));
+                    options.push(opt_tool(
+                        "fb_plots",
+                        "查看剧情进度",
+                        "list_plots",
+                        json!({ "project": project }),
+                    ));
+                    format!("已有规划中剧情卡「{title}」，建议先激活再写章。")
+                }
+                PlotWriteGate::Block {
+                    reason: "need_design_plot",
+                    ..
+                }
+                | PlotWriteGate::Block { .. } => {
+                    options.push(opt_tool(
+                        "fb_design_plot",
+                        "设计并激活剧情卡",
+                        "design_plot",
+                        json!({
+                            "project": project,
+                            "title": "开卷第一段",
+                            "act": 1,
+                            "activate": true,
+                        }),
+                    ));
+                    options.push(opt_tool(
+                        "fb_plots",
+                        "查看剧情进度",
+                        "list_plots",
+                        json!({ "project": project }),
+                    ));
+                    "定稿已完成，建议先设计并激活剧情卡再写章。".to_string()
+                }
+            }
+        }
+    };
+
+    if !options
+        .iter()
+        .any(|o| o.tool.as_deref() == Some("get_project_status"))
+    {
+        options.push(opt_tool(
+            "fb_status",
+            "查看项目状态",
+            "get_project_status",
+            json!({ "project": project }),
+        ));
+    }
+    options.push(opt_resolve("fb_later", "稍后", "dismiss_gate"));
+
+    let prompt = format!("「{tool}」已落盘。{step_hint}\n\n## 本轮小结\n- 结构变更已写入项目盘\n- 推荐：按下方选项推进（模型未出情境卡，已按盘状态兜底）\n\n请选择：");
+    (prompt, options)
+}
+
 /// Soft fallback when Studio fails to offer a card — write-blocking contexts get
 /// actionable tools/resolves, not only「继续推进」.
 pub fn contextual_fallback_options(
@@ -274,6 +437,18 @@ pub fn contextual_fallback_options(
     context: &StudioNextContext,
 ) -> (String, Vec<StudioNextOption>) {
     match context {
+        StudioNextContext::Mutation { apply_tool } => {
+            // Prefer [`mutation_fallback_options`] when a project_dir is available
+            // (see maybe_offer_studio_next_fallback). Path-less call keeps a weak pair.
+            let _ = apply_tool;
+            (
+                "需要选择下一步（模型未出卡）：".into(),
+                vec![
+                    opt_resolve("snf_continue", "继续推进", "continue_studio"),
+                    opt_resolve("snf_later", "稍后", "dismiss_gate"),
+                ],
+            )
+        }
         StudioNextContext::PlotWrite {
             kind,
             title,
@@ -498,7 +673,7 @@ pub fn contextual_fallback_options(
                 opt_resolve("fb_accept", "接受并继续", "dismiss_gate"),
             ],
         ),
-        StudioNextContext::Mutation { .. } | StudioNextContext::Generic => (
+        StudioNextContext::Generic => (
             "需要选择下一步（模型未出卡）：".into(),
             vec![
                 opt_resolve("snf_continue", "继续推进", "continue_studio"),
@@ -511,6 +686,19 @@ pub fn contextual_fallback_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use novelx_pipeline::{init_project, lock_brief, maybe_advance_setup_after_outlines};
+    use std::fs;
+
+    fn tmp_root(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "novelx-studio-next-{}-{}",
+            name,
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
 
     #[test]
     fn accepts_whitelisted_tools() {
@@ -588,5 +776,108 @@ mod tests {
             "{opts:?}"
         );
         assert!(opts.iter().any(|o| o.tool.as_deref() == Some("continue_writing")));
+    }
+
+    #[test]
+    fn mutation_fallback_confirm_offers_confirm_setup() {
+        let root = tmp_root("mut-confirm");
+        let dir = init_project(&root, "sample-novel", "sample-genre", 100).unwrap();
+        lock_brief(&dir, "一位主角决心揭开旧案。").unwrap();
+        fs::create_dir_all(dir.join("artifacts")).unwrap();
+        fs::write(
+            dir.join("artifacts/master_outline.md"),
+            format!("# 总纲\n\n{}", "x".repeat(40)),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("artifacts/arc_outline.md"),
+            format!("# 卷纲\n\n{}", "y".repeat(40)),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("artifacts/bible.md"),
+            r#"# 世界观 Bible
+
+## 0. 一句话世界
+世界。
+
+## 1. 时代与叙事框架
+时代。
+
+## 2. 全局势力与阵营
+势力。
+
+## 7. 开放问题
+待揭。
+"#,
+        )
+        .unwrap();
+        let _ = maybe_advance_setup_after_outlines(&dir);
+
+        let (prompt, opts) =
+            mutation_fallback_options("sample-novel", &dir, "upsert_setting");
+        assert!(prompt.contains("本轮小结"), "{prompt}");
+        assert!(
+            opts.iter().any(|o| {
+                o.tool.as_deref() == Some("confirm_setup")
+                    && o.args
+                        .as_ref()
+                        .and_then(|a| a.get("action"))
+                        .and_then(|v| v.as_str())
+                        == Some("approve")
+            }),
+            "expected confirm_setup approve: {opts:?}"
+        );
+        assert!(
+            !opts
+                .iter()
+                .any(|o| o.resolve.as_deref() == Some("continue_studio") && opts.len() <= 2),
+            "must not be only continue/later: {opts:?}"
+        );
+        assert!(
+            opts.iter()
+                .any(|o| o.tool.as_deref() == Some("get_project_status")),
+            "{opts:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mutation_fallback_need_bible_offers_upsert() {
+        let root = tmp_root("mut-bible");
+        let dir = init_project(&root, "sample-novel", "sample-genre", 100).unwrap();
+        lock_brief(&dir, "一位主角决心揭开旧案。").unwrap();
+        fs::create_dir_all(dir.join("artifacts")).unwrap();
+        fs::write(
+            dir.join("artifacts/master_outline.md"),
+            format!("# 总纲\n\n{}", "x".repeat(40)),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("artifacts/arc_outline.md"),
+            format!("# 卷纲\n\n{}", "y".repeat(40)),
+        )
+        .unwrap();
+        fs::write(dir.join("artifacts/bible.md"), "# 世界观\n\n只有标题。\n").unwrap();
+        let _ = maybe_advance_setup_after_outlines(&dir);
+
+        let (_, opts) = mutation_fallback_options("sample-novel", &dir, "design_arc_outline");
+        assert!(
+            opts.iter().any(|o| o.tool.as_deref() == Some("upsert_setting")),
+            "{opts:?}"
+        );
+        assert!(
+            !opts.iter().any(|o| o.tool.as_deref() == Some("confirm_setup")),
+            "incomplete bible must not offer confirm: {opts:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn studio_next_nudge_requires_summary() {
+        let n = studio_next_nudge("sample-novel", "upsert_setting 已落盘");
+        assert!(n.contains("本轮小结"));
+        assert!(n.contains("offer_decisions"));
+        assert!(n.contains("继续推进"));
     }
 }

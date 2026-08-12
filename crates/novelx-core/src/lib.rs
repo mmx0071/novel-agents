@@ -32,7 +32,8 @@ use novelx_harness::{
 use ui_sync::{
     append_completion_ui_turn, append_ui_tool_output, attach_ui_approval,
     attach_ui_mutation_preview, finish_stale_ui_turns, keep_only_ui_turn, mark_ui_turn_complete,
-    sanitize_ui_turns_finish_audits, strip_ui_approvals, ui_turns_weaker_than,
+    sanitize_ui_turns_finish_audits, strip_ui_approvals, strip_ui_mutation_previews,
+    ui_turns_weaker_than,
     update_ui_turn_summary, upsert_ui_agent_message, upsert_ui_tool_call,
 };
 
@@ -1827,6 +1828,27 @@ impl NovelxCore {
                     .await;
                 }
                 "已放弃此次修改，磁盘未变更。".to_string()
+            } else if tool_name == "__desk_applied_mutation" {
+                // Writing desk already PUT the chosen hunks — just close the gate.
+                clear_pending = true;
+                if let Some(p) = pending_snap.as_ref() {
+                    self.journal_ops(
+                        p.apply_args.get("project").and_then(|v| v.as_str()),
+                        Some(&thread_id),
+                        Some(&turn_id),
+                        ops_journal::chapter_from_value(&p.apply_args),
+                        Some(p.mutation_id.as_str()),
+                        OpsJournalKind::MutationApplied,
+                        format!("mutation desk-applied: {}", p.summary),
+                        json!({
+                            "mutation_id": p.mutation_id,
+                            "apply_tool": p.apply_tool,
+                            "via": "desk",
+                        }),
+                    )
+                    .await;
+                }
+                "已在写作台应用所选变更，预览已关闭。".to_string()
             } else if let Some(pending) = pending_snap.clone() {
                 let mid = args
                     .get("mutation_id")
@@ -2226,6 +2248,86 @@ impl NovelxCore {
                     }
                 }
             }
+            let _ = self.persist_thread(&thread_id).await;
+            self.emit_to_thread(
+                &thread_id,
+                EventMsg::TurnComplete {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                },
+            )
+            .await;
+            return Ok(());
+        }
+
+        // Orphaned cm_apply / cm_discard / cm_desk_applied: never fall through to LLM.
+        let orphan_token = text.trim();
+        let orphan_desk = matches!(orphan_token, "cm_desk_applied" | "__desk_applied_mutation");
+        let orphan_gate = self.gates.resolve_mutation_confirm(orphan_token);
+        let orphan_mutation = orphan_desk
+            || matches!(
+                orphan_gate,
+                Some(GateResolve::ApplyMutation | GateResolve::DiscardMutation)
+            );
+        if orphan_mutation {
+            let summary = if matches!(orphan_gate, Some(GateResolve::ApplyMutation)) {
+                "当前没有待确认的修改可应用。请先重新生成预览后再点 Apply。".to_string()
+            } else {
+                "当前没有待确认的修改。".to_string()
+            };
+            tracing::info!("studio orphaned mutation confirm (no pending)");
+            let agent_item_id = new_id("item");
+            self.emit_to_thread(
+                &thread_id,
+                EventMsg::ItemStarted {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    item: TurnItem::AgentMessage {
+                        id: agent_item_id.clone(),
+                        text: String::new(),
+                        status: ItemStatus::InProgress,
+                    },
+                },
+            )
+            .await;
+            self.emit_to_thread(
+                &thread_id,
+                EventMsg::AgentMessageContentDelta {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    item_id: agent_item_id.clone(),
+                    delta: summary.clone(),
+                },
+            )
+            .await;
+            if let Some(t) = self.threads.write().await.get_mut(&thread_id) {
+                t.messages.push(ChatMessage {
+                    role: "assistant".into(),
+                    content: summary.clone(),
+                    tool_call_id: None,
+                    tool_calls: None,
+                    ..Default::default()
+                });
+                t.ui_turns = append_completion_ui_turn(
+                    std::mem::take(&mut t.ui_turns),
+                    &turn_id,
+                    &summary,
+                    false,
+                );
+            }
+            self.emit_to_thread(
+                &thread_id,
+                EventMsg::ItemCompleted {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    item: TurnItem::AgentMessage {
+                        id: agent_item_id,
+                        text: summary,
+                        status: ItemStatus::Completed,
+                    },
+                },
+            )
+            .await;
             let _ = self.persist_thread(&thread_id).await;
             self.emit_to_thread(
                 &thread_id,
@@ -4753,7 +4855,25 @@ impl NovelxCore {
                     .await?;
             }
             let closing = if asked_mutation {
-                "\n\n局部修订补丁已生成，请在审批卡选择「应用修改」或「放弃」。应用后再复审。"
+                let full_revise = args.get("prefer_local_patch").and_then(|v| v.as_bool())
+                    == Some(false)
+                    || args
+                        .get("revise_scope")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| s.eq_ignore_ascii_case("full"))
+                    || data
+                        .get("revise_scope")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| s.eq_ignore_ascii_case("full"))
+                    || data
+                        .get("mutation_kind")
+                        .and_then(|v| v.as_str())
+                        == Some("revise_chapter");
+                if full_revise {
+                    "\n\n整章修订预览已生成（已调用写作模型），请对照后选择「应用修改」或「取消变更」。应用后再复审。"
+                } else {
+                    "\n\n局部修订补丁已生成，请在审批卡选择「应用修改」或「取消变更」。应用后再复审。"
+                }
             } else if asked {
                 // Report is a separate bubble from emit_audit_report_before_gate —
                 // keep this intro short so update_ui_turn_summary cannot clobber it.
@@ -8728,6 +8848,10 @@ impl NovelxCore {
         };
 
         if let Some(t) = self.threads.write().await.get_mut(thread_id) {
+            // Non-mutation gates must not inherit historical preview cards from client POSTs.
+            if mutation_preview.is_none() {
+                t.ui_turns = strip_ui_mutation_previews(std::mem::take(&mut t.ui_turns));
+            }
             t.ui_turns = attach_ui_approval(
                 std::mem::take(&mut t.ui_turns),
                 &turn_id,
@@ -10469,6 +10593,11 @@ impl NovelxCore {
                 if !gate_open {
                     sanitized = strip_ui_approvals(sanitized);
                 }
+                // Preview cards are only meaningful while a mutation confirm is open.
+                // Client merge bugs used to dump historical diffs onto chapter_next turns.
+                if t.pending_mutation.is_none() {
+                    sanitized = strip_ui_mutation_previews(sanitized);
+                }
                 // Reject weaker client snapshots (empty running / old restored-*) that
                 // wipe a finished new-chapter turn after ChatHistoryReset.
                 let reject = self.features.reject_weak_ui_turns()
@@ -10878,6 +11007,8 @@ impl NovelxCore {
                 revise_scope,
                 gate_prompt: Some(prompt.clone()),
             });
+            // chapter_next is not a mutation confirm — never keep stale「待确认修改」cards.
+            t.ui_turns = strip_ui_mutation_previews(std::mem::take(&mut t.ui_turns));
             t.ui_turns = attach_ui_approval(
                 std::mem::take(&mut t.ui_turns),
                 turn_id,
@@ -10983,7 +11114,7 @@ impl NovelxCore {
         }
     }
 
-    /// Returns `Some(("__apply_mutation"|"__discard_mutation", args))` when confirm gate matches.
+    /// Returns `Some(("__apply_mutation"|"__discard_mutation"|"__desk_applied_mutation", args))`.
     async fn parse_mutation_confirm_op(
         &self,
         thread_id: &str,
@@ -10996,6 +11127,13 @@ impl NovelxCore {
             .await
             .get(thread_id)
             .and_then(|th| th.pending_mutation.clone())?;
+        // Desk already wrote selected hunks via PUT — close gate without「放弃」文案.
+        if t == "cm_desk_applied" || t == "__desk_applied_mutation" {
+            return Some((
+                "__desk_applied_mutation".into(),
+                json!({ "mutation_id": pending.mutation_id }),
+            ));
+        }
         match self.gates.resolve_mutation_confirm(t)? {
             GateResolve::ApplyMutation => Some((
                 "__apply_mutation".into(),
@@ -11076,9 +11214,12 @@ impl NovelxCore {
             .and_then(|v| v.as_array())
             .is_some_and(|a| !a.is_empty());
         let prompt = if has_diffs || apply_tool == "revise_chapter" {
-            format!("请对照修订预览（原文 / 修订后）再选择：{summary}")
+            format!(
+                "请对照修订预览（绿 + 新增 / 红 − 删减，同 git）再选择：{summary}\n\
+                 「应用修改」写入磁盘，「取消变更」丢弃本次预览。"
+            )
         } else {
-            format!("待确认：{summary}")
+            format!("待确认：{summary}\n「应用修改」落盘，「取消变更」退回。")
         };
         if let Some(t) = self.threads.write().await.get_mut(thread_id) {
             if matches!(

@@ -48,6 +48,7 @@ impl FeatureFlags {
         m.insert("studio.enforce_chapter_order".into(), true);
         m.insert("studio.require_mutation_confirm".into(), true);
         m.insert("studio.mutation_severity_policy".into(), true);
+        m.insert("studio.agent_auto_apply_mutations".into(), false);
         m.insert("studio.version_nodes".into(), true);
         m.insert("studio.impact_cascade".into(), true);
         m.insert("studio.impact_scan_all_drafts".into(), false);

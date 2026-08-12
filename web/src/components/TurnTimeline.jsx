@@ -1,4 +1,4 @@
-import { memo } from 'react'
+import { memo, useEffect, useRef } from 'react'
 import ToolCallCard from './ToolCallCard'
 import DraftPatchCard from './DraftPatchCard'
 import MutationPreviewCard from './MutationPreviewCard'
@@ -16,6 +16,71 @@ import { effectiveToolDisplayStatus } from '../auditQueueStatus.js'
 import { groupTurnItemsForWorked } from '../workedFor.js'
 import { pickTodoHostSegment, workItemsHostTodos } from '../flowLayout.js'
 import { resolveWorkTodos } from '../auditTodos.js'
+
+/** Streaming「思考」card — keep pinned to latest tokens inside the capped body. */
+const ReasoningCard = memo(function ReasoningCard({ text, live }) {
+  const outRef = useRef(null)
+  const followRef = useRef(true)
+  const pinRef = useRef(false)
+  const rafRef = useRef(0)
+  const preview = text.replace(/\s+/g, ' ').trim().slice(0, 42)
+
+  useEffect(() => {
+    if (live) followRef.current = true
+  }, [live])
+
+  useEffect(() => {
+    if (!live || !followRef.current) return undefined
+    if (rafRef.current) cancelAnimationFrame(rafRef.current)
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = 0
+      const el = outRef.current
+      if (!el || !followRef.current) return
+      pinRef.current = true
+      el.scrollTop = el.scrollHeight
+      requestAnimationFrame(() => {
+        const again = outRef.current
+        if (again && followRef.current) again.scrollTop = again.scrollHeight
+        pinRef.current = false
+      })
+    })
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current)
+    }
+  }, [live, text])
+
+  const onScroll = () => {
+    if (pinRef.current) return
+    const el = outRef.current
+    if (!el) return
+    const dist = el.scrollHeight - el.scrollTop - el.clientHeight
+    followRef.current = dist < 48
+  }
+
+  return (
+    <details className="nx-card nx-reasoning" {...(live ? { open: true } : {})}>
+      <summary className="nx-card-head">
+        <span className="nx-card-kind">思考</span>
+        {!live && preview ? (
+          <span className="nx-reasoning-preview">{preview}{text.length > 42 ? '…' : ''}</span>
+        ) : null}
+      </summary>
+      {live ? (
+        <pre
+          ref={outRef}
+          className="nx-card-output chat-streaming"
+          onScroll={onScroll}
+        >
+          {text}
+        </pre>
+      ) : (
+        <div ref={outRef} className="nx-card-output" onScroll={onScroll}>
+          <MarkdownView source={text} variant="chat" />
+        </div>
+      )}
+    </details>
+  )
+})
 
 export default function TurnTimeline({
   turns,
@@ -310,13 +375,24 @@ const TurnItemView = memo(function TurnItemView({
   hideAsPrefix,
 }) {
   switch (item.type) {
-    case 'user_message':
+    case 'user_message': {
+      const raw = String(item.text || '')
+      const gateLabel = ({
+        cm_apply: '全部应用',
+        cm_discard: '取消变更',
+        cm_desk_applied: '写作台已应用',
+      })[raw.trim()]
       return (
         <div className="nx-msg nx-msg-user">
           <div className="nx-msg-role">你</div>
-          <MarkdownView className="nx-msg-text" source={item.text} variant="chat" />
+          {gateLabel ? (
+            <div className="nx-msg-text nx-msg-gate-token">{gateLabel}</div>
+          ) : (
+            <MarkdownView className="nx-msg-text" source={raw} variant="chat" />
+          )}
         </div>
       )
+    }
     case 'agent_message': {
       if (hideAsPrefix) return null
       const raw = dedupeAgentTextAgainstTools(
@@ -351,18 +427,7 @@ const TurnItemView = memo(function TurnItemView({
       const text = stripToolMarkup(item.text)
       if (!text) return null
       const live = item.status === 'in_progress' && turnActive
-      const preview = text.replace(/\s+/g, ' ').trim().slice(0, 42)
-      return (
-        <details className="nx-card nx-reasoning" open={live}>
-          <summary className="nx-card-head">
-            <span className="nx-card-kind">思考</span>
-            {!live && preview ? (
-              <span className="nx-reasoning-preview">{preview}{text.length > 42 ? '…' : ''}</span>
-            ) : null}
-          </summary>
-          <MarkdownView className="nx-card-output" source={text} variant="chat" />
-        </details>
-      )
+      return <ReasoningCard text={text} live={live} />
     }
     case 'skill_load':
       return (

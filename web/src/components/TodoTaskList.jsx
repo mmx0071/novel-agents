@@ -6,8 +6,9 @@ import { todosCursorLabel } from '../todoWindow.js'
  * Todo fold:
  *   ▾ ✓ 待办 4/20 · 审校第5章
  *     ✓ …
- *     ● current (+ micro / decision)
- *     … N pending
+ *     ● current (+ micro)
+ *     ○ pending…
+ *     [选项卡]  ← after the full checklist so authors read then choose
  */
 export default function TodoTaskList({
   tasks = [],
@@ -18,6 +19,7 @@ export default function TodoTaskList({
 }) {
   const list = Array.isArray(tasks) ? tasks : []
   const currentRef = useRef(null)
+  const decisionRef = useRef(null)
   const [expandPending, setExpandPending] = useState(false)
   const allDone = list.length > 0 && list.every((t) => t.status === 'completed')
   const [open, setOpen] = useState(() => (allDone ? false : defaultOpen))
@@ -48,13 +50,15 @@ export default function TodoTaskList({
   }, [list])
 
   const currentKey = list.find((t) => t.status === 'in_progress')?.index
+  const hasDecision = !!decision
 
   useEffect(() => {
     if (!open) return
-    const el = currentRef.current
+    // Prefer the action card after the list when waiting on a choice.
+    const el = (hasDecision && awaiting ? decisionRef.current : null) || currentRef.current
     if (!el || typeof el.scrollIntoView !== 'function') return
     el.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
-  }, [currentKey, list.length, expandPending, !!decision, open])
+  }, [currentKey, list.length, expandPending, hasDecision, awaiting, open])
 
   if (!list.length) return null
 
@@ -75,59 +79,65 @@ export default function TodoTaskList({
         <span className="nx-todofold-title">{headLabel}</span>
       </button>
       {open ? (
-        <ul className="nx-todotasks" aria-label="待办">
-          {focus.map((task) => (
-            <TaskRow
-              key={`${task.index}:${task.todo?.content || ''}`}
-              task={task}
-              live={live}
-              awaiting={awaiting}
-              decision={task.status === 'in_progress' ? decision : null}
-              rowRef={task.status === 'in_progress' ? currentRef : null}
-            />
-          ))}
-          {showPendingRows
-            ? pending.map((task) => (
+        <>
+          <ul className="nx-todotasks" aria-label="待办">
+            {focus.map((task) => (
               <TaskRow
                 key={`${task.index}:${task.todo?.content || ''}`}
                 task={task}
-                live={false}
-                awaiting={false}
+                live={live}
+                awaiting={awaiting}
+                rowRef={task.status === 'in_progress' ? currentRef : null}
               />
-            ))
-            : (
+            ))}
+            {showPendingRows
+              ? pending.map((task) => (
+                <TaskRow
+                  key={`${task.index}:${task.todo?.content || ''}`}
+                  task={task}
+                  live={false}
+                  awaiting={false}
+                />
+              ))
+              : (
+                <li className="nx-todotask nx-todotask-more">
+                  <button
+                    type="button"
+                    className="nx-todotask-more-btn"
+                    onClick={() => setExpandPending(true)}
+                  >
+                    <span className="nx-todotask-mark" aria-hidden="true">…</span>
+                    <span className="nx-todotask-text">还有 {pendingCount} 项</span>
+                  </button>
+                </li>
+              )}
+            {expandPending && pendingCount > 2 ? (
               <li className="nx-todotask nx-todotask-more">
                 <button
                   type="button"
                   className="nx-todotask-more-btn"
-                  onClick={() => setExpandPending(true)}
+                  onClick={() => setExpandPending(false)}
                 >
-                  <span className="nx-todotask-mark" aria-hidden="true">…</span>
-                  <span className="nx-todotask-text">还有 {pendingCount} 项</span>
+                  <span className="nx-todotask-mark" aria-hidden="true">▴</span>
+                  <span className="nx-todotask-text">收起</span>
                 </button>
               </li>
-            )}
-          {expandPending && pendingCount > 2 ? (
-            <li className="nx-todotask nx-todotask-more">
-              <button
-                type="button"
-                className="nx-todotask-more-btn"
-                onClick={() => setExpandPending(false)}
-              >
-                <span className="nx-todotask-mark" aria-hidden="true">▴</span>
-                <span className="nx-todotask-text">收起</span>
-              </button>
-            </li>
+            ) : null}
+          </ul>
+          {decision ? (
+            <div className="nx-todofold-decision" ref={decisionRef}>
+              {decision}
+            </div>
           ) : null}
-        </ul>
+        </>
       ) : null}
     </div>
   )
 }
 
-function TaskRow({ task, live, awaiting, decision = null, rowRef }) {
+function TaskRow({ task, live, awaiting, rowRef }) {
   const active = task.status === 'in_progress'
-  const hasSteps = active && !decision && Array.isArray(task.steps) && task.steps.length > 0
+  const hasSteps = active && !awaiting && Array.isArray(task.steps) && task.steps.length > 0
   return (
     <li
       ref={rowRef}
@@ -142,11 +152,6 @@ function TaskRow({ task, live, awaiting, decision = null, rowRef }) {
       {hasSteps ? (
         <div className="nx-todotask-steps">
           <ToolProgressList entries={task.steps} live={live && active && !awaiting} />
-        </div>
-      ) : null}
-      {decision ? (
-        <div className="nx-todotask-decision">
-          {decision}
         </div>
       ) : null}
     </li>

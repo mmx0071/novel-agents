@@ -22,9 +22,16 @@ async function api(path, options = {}) {
 
 const TABS = [
   { id: 'llm', label: '模型' },
+  { id: 'workflow', label: '工作流' },
   { id: 'rules', label: '写作规则' },
   { id: 'naming', label: '禁用名' },
   { id: 'skills', label: '写作指南' },
+]
+
+const WORKFLOW_FLAG_ORDER = [
+  'studio.agent_auto_apply_mutations',
+  'studio.unattended_soft_skip',
+  'studio.require_mutation_confirm',
 ]
 
 const EMPTY_LLM = {
@@ -49,6 +56,9 @@ export default function ConfigPanel({ onClose, title = '设置' }) {
   const [llmRuntime, setLlmRuntime] = useState(null)
   const [apiKeyDraft, setApiKeyDraft] = useState('')
   const [showAdvanced, setShowAdvanced] = useState(false)
+  const [studioFlags, setStudioFlags] = useState({})
+  const [studioLabels, setStudioLabels] = useState({})
+  const [studioHints, setStudioHints] = useState({})
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
@@ -105,6 +115,40 @@ export default function ConfigPanel({ onClose, title = '设置' }) {
     setApiKeyDraft('')
   }, [])
 
+  const loadWorkflow = useCallback(async () => {
+    setLoading(true)
+    setError('')
+    setStatus('')
+    const data = await api('/config/studio_flags')
+    setLoading(false)
+    if (data.error) {
+      setError(data.error)
+      return
+    }
+    setStudioFlags(data.flags && typeof data.flags === 'object' ? data.flags : {})
+    setStudioLabels(data.labels && typeof data.labels === 'object' ? data.labels : {})
+    setStudioHints(data.hints && typeof data.hints === 'object' ? data.hints : {})
+  }, [])
+
+  async function toggleStudioFlag(key, next) {
+    setSaving(true)
+    setError('')
+    setStatus('')
+    const data = await api('/config/studio_flags', {
+      method: 'PUT',
+      body: JSON.stringify({ flags: { [key]: next } }),
+    })
+    setSaving(false)
+    if (data.error || data.ok === false) {
+      setError(data.error || '切换失败')
+      return
+    }
+    if (data.flags && typeof data.flags === 'object') {
+      setStudioFlags(data.flags)
+    }
+    setStatus(next ? '已开启（立即生效）' : '已关闭（立即生效）')
+  }
+
   const loadSkills = useCallback(async () => {
     setLoading(true)
     setError('')
@@ -147,10 +191,11 @@ export default function ConfigPanel({ onClose, title = '设置' }) {
 
   useEffect(() => {
     if (tab === 'llm') loadLlm()
+    else if (tab === 'workflow') loadWorkflow()
     else if (tab === 'rules') loadRules()
     else if (tab === 'naming') loadNaming()
     else loadSkills()
-  }, [tab, loadLlm, loadRules, loadNaming, loadSkills])
+  }, [tab, loadLlm, loadWorkflow, loadRules, loadNaming, loadSkills])
 
   useEffect(() => {
     if (tab === 'skills' && skillName) {
@@ -311,7 +356,7 @@ export default function ConfigPanel({ onClose, title = '设置' }) {
             </button>
           ) : null}
         </div>
-        <p className="side-hint">模型、写作规则、禁用名与写作指南。保存后立即生效，不会改掉你已写的正文。</p>
+        <p className="side-hint">模型、工作流、写作规则、禁用名与写作指南。保存后立即生效，不会改掉你已写的正文。</p>
       </div>
 
       <div className="panel-tabs" role="tablist">
@@ -500,6 +545,45 @@ export default function ConfigPanel({ onClose, title = '设置' }) {
               disabled={loading || saving}
             >
               {saving ? '保存中…' : '保存'}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {tab === 'workflow' && (
+        <div className="config-body">
+          <p className="config-muted">
+            连写多章时建议开启「Agent 自行应用修改」，避免每次修订都停在确认卡。
+            Web 写作台手工编辑仍会先对照再应用。
+          </p>
+          <ul className="config-rule-list">
+            {WORKFLOW_FLAG_ORDER.map((key) => {
+              const on = !!studioFlags[key]
+              return (
+                <li key={key}>
+                  <div className="config-rule-title">
+                    <span>{studioLabels[key] || key}</span>
+                    <span className="config-rule-flags">
+                      <button
+                        type="button"
+                        className={on ? 'flag-on' : 'flag-off'}
+                        disabled={loading || saving}
+                        onClick={() => toggleStudioFlag(key, !on)}
+                      >
+                        {on ? '已开启' : '已关闭'}
+                      </button>
+                    </span>
+                  </div>
+                  {studioHints[key] ? (
+                    <div className="config-muted">{studioHints[key]}</div>
+                  ) : null}
+                </li>
+              )
+            })}
+          </ul>
+          <div className="config-actions">
+            <button type="button" onClick={loadWorkflow} disabled={loading || saving}>
+              刷新
             </button>
           </div>
         </div>

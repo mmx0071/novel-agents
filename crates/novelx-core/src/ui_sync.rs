@@ -113,8 +113,9 @@ pub fn keep_only_ui_turn(turns: Value, turn_id: &str) -> Value {
 }
 
 pub fn strip_ui_approvals(turns: Value) -> Value {
-    let Value::Array(arr) = turns else {
-        return turns;
+    let stripped = strip_ui_mutation_previews(turns);
+    let Value::Array(arr) = stripped else {
+        return stripped;
     };
     let next: Vec<Value> = arr
         .into_iter()
@@ -125,6 +126,32 @@ pub fn strip_ui_approvals(turns: Value) -> Value {
             obj.insert("approval".into(), Value::Null);
             if obj.get("status").and_then(|v| v.as_str()) == Some("awaiting") {
                 obj.insert("status".into(), json!("complete"));
+            }
+            Value::Object(obj)
+        })
+        .collect();
+    Value::Array(next)
+}
+
+/// Drop draft/mutation preview cards. Live previews belong only while `pending_mutation`
+/// is open; otherwise they look like「待确认修改」under the wrong gate (e.g. chapter_next).
+pub fn strip_ui_mutation_previews(turns: Value) -> Value {
+    let Value::Array(arr) = turns else {
+        return turns;
+    };
+    let next: Vec<Value> = arr
+        .into_iter()
+        .map(|turn| {
+            let Value::Object(mut obj) = turn else {
+                return turn;
+            };
+            if let Some(Value::Array(items)) = obj.get_mut("items") {
+                items.retain(|it| {
+                    !matches!(
+                        it.get("type").and_then(|v| v.as_str()),
+                        Some("mutation_preview" | "draft_patch")
+                    )
+                });
             }
             Value::Object(obj)
         })
@@ -486,22 +513,80 @@ pub fn attach_ui_mutation_preview(
         _ => Vec::new(),
     };
     let mut items: Vec<Value> = Vec::new();
+    let chapter = preview
+        .get("chapter")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let kind = preview
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    // Paragraph body patches only. Document / outline mutations keep full text for
+    // writing-desk inline −/+ (even when `chapter` is set, e.g. revise_outline).
+    let body_para_patch = chapter > 0
+        && matches!(
+            kind,
+            "revise_chapter" | "split_chapter" | "apply_draft_patch" | "draft_patch" | ""
+        )
+        && !preview.get("before_full").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
+        && !preview.get("after_full").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty());
     if let Some(darr) = diffs.as_array() {
-        for d in darr {
-            let start = d.get("start_para").and_then(|v| v.as_u64()).unwrap_or(1);
-            let end = d
-                .get("end_para")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(start);
+        if body_para_patch {
+            for d in darr {
+                let start = d.get("start_para").and_then(|v| v.as_u64()).unwrap_or(1);
+                let end = d
+                    .get("end_para")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(start);
+                items.push(json!({
+                    "type": "draft_patch",
+                    "status": "completed",
+                    "project": preview.get("project").and_then(|v| v.as_str()).unwrap_or(""),
+                    "chapter": chapter,
+                    "start_para": start,
+                    "end_para": end,
+                    "before": d.get("before").and_then(|v| v.as_str()).unwrap_or(""),
+                    "after": d.get("after").and_then(|v| v.as_str()).unwrap_or(""),
+                    "readerTab": "draft",
+                }));
+            }
+        } else if !darr.is_empty()
+            || preview
+                .get("before_full")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty())
+            || preview
+                .get("after_full")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty())
+        {
+            let hunks: Vec<Value> = darr
+                .iter()
+                .map(|d| {
+                    json!({
+                        "before": d.get("before").and_then(|v| v.as_str()).unwrap_or(""),
+                        "after": d.get("after").and_then(|v| v.as_str()).unwrap_or(""),
+                    })
+                })
+                .collect();
             items.push(json!({
-                "type": "draft_patch",
+                "type": "mutation_preview",
                 "status": "completed",
-                "project": preview.get("project").and_then(|v| v.as_str()).unwrap_or(""),
-                "chapter": preview.get("chapter").and_then(|v| v.as_u64()).unwrap_or(0),
-                "start_para": start,
-                "end_para": end,
-                "before": d.get("before").and_then(|v| v.as_str()).unwrap_or(""),
-                "after": d.get("after").and_then(|v| v.as_str()).unwrap_or(""),
+                "kind": kind,
+                "topic": preview.get("topic").and_then(|v| v.as_str()).unwrap_or(""),
+                "path": preview
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                "title": preview.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+                "name": preview.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                "markdown": preview.get("markdown").and_then(|v| v.as_str()).unwrap_or(""),
+                "before_full": preview.get("before_full").and_then(|v| v.as_str()).unwrap_or(""),
+                "after_full": preview.get("after_full").and_then(|v| v.as_str()).unwrap_or(""),
+                "chapter": chapter,
+                "fields": preview.get("fields").cloned().unwrap_or(Value::Null),
+                "diffs": hunks,
             }));
         }
     }
@@ -511,12 +596,30 @@ pub fn attach_ui_mutation_preview(
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let fields = preview.get("fields").cloned().unwrap_or(Value::Null);
-        if !markdown.is_empty() || !fields.is_null() {
+        let before_full = preview
+            .get("before_full")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let after_full = preview
+            .get("after_full")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !markdown.is_empty() || !fields.is_null() || !before_full.is_empty() || !after_full.is_empty()
+        {
             items.push(json!({
                 "type": "mutation_preview",
                 "status": "completed",
-                "kind": preview.get("kind").and_then(|v| v.as_str()).unwrap_or(""),
+                "kind": kind,
+                "topic": preview.get("topic").and_then(|v| v.as_str()).unwrap_or(""),
+                "path": preview
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 "markdown": markdown,
+                "before_full": before_full,
+                "after_full": after_full,
+                "chapter": chapter,
                 "fields": fields,
             }));
         }
@@ -835,6 +938,27 @@ mod tests {
     }
 
     #[test]
+    fn strip_ui_mutation_previews_removes_preview_cards() {
+        let turns = json!([{
+            "id": "turn_1",
+            "status": "awaiting",
+            "approval": {"prompt": "next", "options": [{"id": "cn_continue", "label": "继续创作"}]},
+            "items": [
+                {"type": "agent_message", "text": "ok"},
+                {"type": "mutation_preview", "kind": "upsert_setting", "markdown": "x"},
+                {"type": "draft_patch", "before": "a", "after": "b"},
+                {"type": "tool_call", "name": "audit_chapter"}
+            ]
+        }]);
+        let next = strip_ui_mutation_previews(turns);
+        let items = next[0]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["type"], "agent_message");
+        assert_eq!(items[1]["type"], "tool_call");
+        assert!(!next[0]["approval"].is_null());
+    }
+
+    #[test]
     fn mutation_preview_attach_is_idempotent() {
         let turns = json!([{
             "id": "turn_1",
@@ -851,5 +975,80 @@ mod tests {
         let items = twice[0]["items"].as_array().unwrap();
         assert_eq!(items.len(), 1, "preview must not duplicate");
         assert_eq!(items[0]["type"], "mutation_preview");
+    }
+
+    #[test]
+    fn document_mutation_diffs_become_mutation_preview_hunks() {
+        let turns = json!([{
+            "id": "turn_1",
+            "status": "awaiting",
+            "items": []
+        }]);
+        let preview = json!({
+            "kind": "upsert_setting",
+            "topic": "完整世界观",
+            "path": "artifacts/bible.md",
+            "markdown": "节选",
+            "before_full": "历史事件。\n",
+            "after_full": "历史事件，如曼德拉去世。\n"
+        });
+        let diffs = json!([{
+            "before": "历史事件。",
+            "after": "历史事件，如曼德拉去世。"
+        }]);
+        let next = attach_ui_mutation_preview(turns, "turn_1", &preview, diffs);
+        let items = next[0]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "mutation_preview");
+        assert_eq!(items[0]["diffs"][0]["after"], "历史事件，如曼德拉去世。");
+        assert_eq!(items[0]["before_full"], "历史事件。\n");
+        assert_eq!(items[0]["after_full"], "历史事件，如曼德拉去世。\n");
+        assert!(items[0].get("chapter").is_none() || items[0]["chapter"] == 0);
+    }
+
+    #[test]
+    fn revise_outline_keeps_mutation_preview_even_with_chapter() {
+        let turns = json!([{
+            "id": "turn_1",
+            "status": "awaiting",
+            "items": []
+        }]);
+        let preview = json!({
+            "kind": "revise_outline",
+            "chapter": 2,
+            "before_full": "旧纲",
+            "after_full": "新纲",
+            "path": "chapters/002/outline.json"
+        });
+        let diffs = json!([{ "before": "旧纲", "after": "新纲" }]);
+        let next = attach_ui_mutation_preview(turns, "turn_1", &preview, diffs);
+        let items = next[0]["items"].as_array().unwrap();
+        assert_eq!(items[0]["type"], "mutation_preview");
+        assert_eq!(items[0]["after_full"], "新纲");
+    }
+
+    #[test]
+    fn chapter_diffs_still_attach_as_draft_patch() {
+        let turns = json!([{
+            "id": "turn_1",
+            "status": "awaiting",
+            "items": []
+        }]);
+        let preview = json!({
+            "kind": "revise_chapter",
+            "chapter": 3,
+            "project": "sample-novel"
+        });
+        let diffs = json!([{
+            "before": "旧句",
+            "after": "新句",
+            "start_para": 2,
+            "end_para": 2
+        }]);
+        let next = attach_ui_mutation_preview(turns, "turn_1", &preview, diffs);
+        let items = next[0]["items"].as_array().unwrap();
+        assert_eq!(items[0]["type"], "draft_patch");
+        assert_eq!(items[0]["chapter"], 3);
+        assert_eq!(items[0]["before"], "旧句");
     }
 }

@@ -5,6 +5,7 @@ version: 1
 mode: severity
 
 # Tools that always open confirm_mutation (Canon / structure / irreversible).
+# Text content writes use git-style −/+ preview before apply.
 high_tools:
   - delete_entity
   - design_master_outline
@@ -13,17 +14,18 @@ high_tools:
   - supplement_setting
   - replan_volume
   - restore_version_node
+  - design_entity
+  - design_plot
+  - revise_outline
+  - update_plot
+  - revise_chapter
+  - split_chapter
 
 # Tools that self-confirm (no human card) when severity policy is on.
+# Keep pure progress / enqueue ops here — not document body rewrites.
 routine_tools:
   - continue_writing
   - continue_writing_batch
-  - revise_chapter
-  - split_chapter
-  - revise_outline
-  - design_plot
-  - update_plot
-  - design_entity
   - activate_agents
   - enqueue_expected_event
   - update_expected_event

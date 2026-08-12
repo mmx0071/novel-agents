@@ -103,7 +103,9 @@ pub fn build_system_prompt(parts: SystemPromptParts<'_>) -> (String, SkillRender
              队列未结束时禁止对用户说「继续创作/审完了」。\n\
              单章审校用 audit_chapter。通过（含仅有 P1/P2）→ 勿称未通过、勿伪造审批卡；用户要改则 revise_chapter。\
              未通过 → 立即 offer_decisions（按 issue_id 给出修某条/修全部阻断/接受等），不要只给「按审校局部修订」。\
-             禁止在正文里自拟编号审批卡；决策卡只经 offer_decisions / 服务端 open_gate。",
+             禁止在正文里自拟编号审批卡；决策卡只经 offer_decisions / 服务端 open_gate。\n\
+             操作轮收尾：有落盘/门控进展时，须先写用户可见小结与建议，再 offer_decisions(kind=studio_next)；\
+             禁止工具成功后无正文无卡结束；prompt 须含本轮小结与推荐处理。",
         );
 
         let mut activated = String::new();
