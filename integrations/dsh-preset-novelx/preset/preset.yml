@@ -1,0 +1,3 @@
+name: NovelX
+description: dsh 原生写作。子 agent 直接读写 projects/，不经过 Host。门控与 schema 仅为提示约定。
+order: 20

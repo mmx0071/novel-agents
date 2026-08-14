@@ -1,80 +1,10 @@
-# Studio feature flags (Codex-style toggles — prefer config over code branches).
+# novelx_check 读取的相位开关。缺省视为 true。
 version: 1
 
 features:
-  # Match config/intents.yaml before the LLM tool loop.
-  studio.deterministic_intents: true
-  # After a clean published write/revise: pause immediately (true) or allow one
-  # narration follow-up round then pause for chapter_next (false = more agentic).
-  studio.pause_after_clean_write: false
-  # Stream model reasoning_content into the UI as a「思考」card.
-  studio.stream_reasoning: true
-  # Clear prior chat when continue_writing actually starts (plot gate Allow; keep current turn).
-  studio.clear_history_on_new_chapter: true
-  # After steer_run revise, auto re-audit (queue continue or audit_chapter).
-  # Human steer revise: do not force re-audit (avoids revise→audit→revise thrash).
-  # Decision Council path still re-audits after its own auto-steer.
-  studio.auto_reaudit_after_steer: false
-  # Reject weak client ui_turns snapshots that wipe a richer server timeline.
-  studio.reject_weak_ui_turns: true
-  # After design_arc_outline leaves setup awaiting_confirm, auto-offer RequestUserInput;
-  # also hard-block continue_writing when setup_phase != ready.
+  # setup_phase != ready 时拦写新章
   studio.enforce_setup_gate: true
-  # Persist volume_phase, rebuild sync gate from disk, and hard-block continue_writing /
-  # design_plot outside drafting_volume (and ignore design_plot force during handoff).
+  # 非 drafting_volume 时拦写新章
   studio.enforce_volume_phase: true
-  # Refuse continue_writing when chapter > next_chapter or earlier chapters are missing.
+  # 跳章或前章缺口时拦写新章
   studio.enforce_chapter_order: true
-  # Mutating tools preview first; user must confirm via ApprovalOptions before disk write.
-  studio.require_mutation_confirm: true
-  # When true: only high-severity tools (config/mutation_policy.yaml) open confirm_mutation;
-  # routine tools self-confirm. When false: all mutating tools require human confirm.
-  studio.mutation_severity_policy: true
-  # When true: Studio Agent may apply content mutations without human「应用修改」cards
-  # (连写/评审团自动修订可自行推进). Web 写作台手工编辑仍走对照确认。
-  # Irreversible tools (delete_entity / restore_version_node) always require confirm.
-  studio.agent_auto_apply_mutations: false
-  # Shadow git version nodes under projects/<name>/.novelx/versions.git (list + restore).
-  studio.version_nodes: true
-  # After mutating tools apply: scan dependent artifacts and offer cascade revise gate.
-  studio.impact_cascade: true
-  # After a plot card completes: run setting_auditor巡检；无 BLOCKER 时轻量 sync（不改 volume_phase）。
-  # 若同时命中卷末，则跳过轻量 sync，留给 sync_volume 门控。
-  studio.plot_setting_pass: true
-  # After each published chapter while the plot card stays open: light entity
-  # status/holdings sync so the next chapter reads up-to-date setting cards.
-  # Skipped when plot just completed (plot_setting_pass covers it) or volume end.
-  studio.chapter_setting_pass: true
-  # When false (default): non-setting impact draft scans limited to active volume.
-  studio.impact_scan_all_drafts: false
-  # When true: Entity/Bible mutations scan ALL published drafts (expensive at 800–1000 ch).
-  # Default false — prefer config/longform.yaml impact_scan_mode: indexed|volume|all.
-  studio.impact_scan_all_on_setting: false
-  # Longform lean pipeline: foreshadow / specialist filtering (refined by longform.quality_tier).
-  pipeline.longform_lean: true
-  # When chapter body exceeds word_hard_max: auto split into N + N+1 (no human card).
-  # Failures fall back to chapter_next「拆成两章」. Batch uses the same path.
-  pipeline.auto_split_hard_long: true
-  # Soft-block continue_writing when active volume chapter count ≥ mid_audit_chapter_threshold
-  # (config/volume.yaml, default 20) and no audit_volume report yet.
-  studio.require_volume_audit_mid: true
-  # Block sync_volume until this volume has an audit_volume report (or confirm_skip).
-  studio.require_volume_audit_handoff: true
-  # Unattended paths (batch / council auto-continue) default-skip soft gates in
-  # config/unattended.yaml (mid volume audit + expected-events review). Hard gates unchanged.
-  # Set false or pass respect_soft_gates=true to keep soft gates on those paths.
-  studio.unattended_soft_skip: true
-  # When true, completed-volume drafts may be gzip-archived off the hot path.
-  studio.cold_archive_drafts: true
-  # Append-only decision/execution audit trail at projects/<name>/.novelx/ops_journal.jsonl
-  # (tools, gates, mutations, pipeline/publish). Survives chat history reset.
-  studio.ops_journal: true
-  # Decision Council: auto-resolve content-audit FAIL via multi-ballot scoring;
-  # escalate only on deadlock / infra / max retries.
-  studio.decision_council: true
-  # Before steer_run revise: deterministic RevisePlan (local|full) from P0 types + hard gates.
-  # Off → legacy issue_ids-only local revise. See decision_council.yaml → revise_plan.
-  studio.revise_plan: true
-  # After a chapter passes (clean publish): seal Studio chat so N+1 does not carry
-  # chapter-N creation-process messages. Complements clear_history_on_new_chapter.
-  studio.seal_on_chapter_pass: true

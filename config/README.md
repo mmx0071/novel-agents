@@ -1,70 +1,25 @@
 # 配置目录说明
 
-本目录存放 **框架级** 配置与 Skills。Web「配置」页可在线编辑其中一部分；保存后热重载，无需重启服务。
+本目录是 **框架级** 旋钮。写作在 dsh NovelX 预设里完成；`novelx_check` 读这里的检查规则。接入见 [dsh 预设](../integrations/dsh-preset-novelx/README.md)。
 
-## 可编辑配置 vs Rust 引擎
+具体小说只在 `projects/<name>/`，由预设 Agent 落盘。本目录保持作品中立 + 题材中立。
 
-| 文件 / 路径 | 谁改 | 引擎职责 |
-|-------------|------|----------|
-| `content_rules.yaml` | Web「硬规则」或手工编辑 | Rust 只做通用扫描；`enabled=false` 跳过扫描；`blocking=false` 仅警告不挡发布；词表 / 阈值 / 文案在 YAML |
-| `naming_rules.yaml` | Web「禁名」 | 禁名匹配与取名原则注入 prompt |
-| `policies.yaml` | HTTP API / 手工（Web ConfigPanel 无 Tab） | Studio 意图短语、扩写判定等；PUT 后内存热重载 |
-| `skills/**` | Web「Skills」（仅框架 skill） | Agent 提示正文；PUT 后 `reload_skills` |
-| `llm.yaml` | Web「模型」结构化表单或手工编辑 | Provider / 任务模型 / profile / 重试；PUT 后热重载 |
-| `gates.yaml` / `features.yaml` / `intents.yaml` | 磁盘编辑（本期无表单） | 门控、特性开关（含 `pipeline.auto_split_hard_long`）、意图路由 |
-| `mutation_policy.yaml` | 磁盘编辑 | 改盘严重度：routine 自确认 / high 人审；低风险 impact 自动级联；配合 `studio.mutation_severity_policy` |
-| `decision_council.yaml` | 磁盘编辑 | 评审团自动决策（`max_auto_retries` / `same_type_streak_limit` 防同章空转）、`revise_plan`（Plan→Execute 选局部/整章）、章边界密封、按需素材 Agent；配合 `studio.decision_council` / `studio.revise_plan` / `studio.seal_on_chapter_pass` / `studio.auto_reaudit_after_steer`；`chapter_next_clean` 干净发布自动续写 |
-| `unattended.yaml` | 磁盘编辑 | 无人值守软相位跳过（批写 / council：`volume_qa mid_due`、预期检阅、伏笔 `pressure_high`）；总开关 `studio.unattended_soft_skip`；硬门不变 |
-| `chapter.yaml` | 磁盘编辑 | 章长目标 / 软硬上下限（`word_hard_max`→HardLong 可拆章）/ 连续偏短升格 |
-| `longform.yaml`；短剧另见 `script.yaml` / `pipeline-script.yaml`（`project_mode=short_drama`） | 磁盘编辑 | 超长篇：`quality_tier` / `audit_tier` / `impact_scan_mode` / `batch_max_chapters`（成功发布上限）/ `foreshadow_debt`（近债分级：宽限与远期不挡批写）；`audit_tier: layered` 常规章用轻量一致性上下文（高潮/奇数章/复审仍 full），省 token，偶发漏检风险略高于 `full` |
-| `continuity.yaml` / `volume.yaml` | 磁盘编辑 | CanonContext 预算、薄卷阈值 |
+## 仍会读的文件
 
-API Key 只写入仓库根 `.env`（gitignore），**不进** `llm.yaml`。`GET /api/config/llm` 只返回 `has_api_key` 与末 4 位 suffix，永不回传明文 Key；PUT 时 `api_key` 留空表示不修改。
+| 文件 | 谁读 | 作用 |
+|------|------|------|
+| `naming_rules.yaml` | `novelx_check` + 预设 Skill | 系统禁名 |
+| `chapter.yaml` | `novelx_check` | 长篇章长目标与字数硬门 |
+| `script.yaml` | 阅读台字数条（短剧） | 短剧篇幅默认，与 `chapterTargets.js` 对齐 |
+| `content_rules.yaml` | `novelx_check` | 正文硬规则；`enabled=false` 跳过；`blocking=false` 仅警告 |
+| `features.yaml` | `novelx_check` | setup / 卷相位 / 跳章开关 |
+| `pipeline.yaml` | 文档 + `novelx_write` | 章步骤顺序 |
+| `skills/content-formats.md` | 人读契约 | 落盘/展示格式；生成锚定以预设 `content-formats` 为准 |
+| `skills/content-formats-script.md` | 人读契约 | 短剧剧本格式 |
+| `schemas/README.md` | 人读摘要 | 各页签路径与字段 |
 
-## API（摘要）
+模型与 API Key 由 **dsh** 自己管，不进本目录。
 
-- `GET/PUT /api/config/content_rules` · `PUT /api/config/content_rules/flags`（切换单条 enabled/blocking）
-- `GET/PUT /api/config/naming_rules`
-- `GET/PUT /api/config/policies`（HTTP/手工；Web ConfigPanel 无 Tab）
-- `GET/PUT /api/config/llm`（结构化 JSON；Key 只写不读）
-- `GET /api/skills/list` · `GET/PUT /api/skills/{name}`（PUT 拒绝 `projects/` 下的 project-skill）
+## 与作品的边界
 
-路径均限制在 `config/` 下，防止目录穿越。
-
-### CLI / API-only（Web 未接 UI）
-
-下列路由保留给脚本与 HTTP 客户端，**不删实现**；当前 Web 前端不调用：
-
-| 路由 | 说明 |
-|------|------|
-| `GET/PUT /api/config/policies` | 改 `policies.yaml`；Web 配置页无 policies Tab |
-| `GET /api/projects/{name}/ops_journal` | 操作审计查询；主入口为 CLI `novel ops-log` |
-| `GET /api/projects/{name}/version_nodes` | shadow git 版本节点列表；CLI `novel versions list` |
-| `POST /api/projects/{name}/version_nodes/{sha}/restore` | 回退工作树；CLI `novel versions restore <sha>`（高位，须确认） |
-| `POST /api/thread/resume` | HTTP 恢复线程；Web 走 `POST /api/thread/start` |
-| `POST /api/turn/steer` | HTTP mid-turn steer；Web 走 WS + 工具 `steer_run` |
-
-## 与作品数据的边界
-
-具体小说内容只在 `projects/<name>/`。本目录保持题材中立，不写死某一本书的角色或地名。
-
-## 操作审计 vs 内容审校
-
-| 概念 | 路径 / 开关 | 用途 |
-|------|-------------|------|
-| **ops journal**（决策/执行审计） | `projects/<name>/.novelx/ops_journal.jsonl`；`studio.ops_journal` | 回放工具、门控、mutation、发布等「发生了什么」；append-only，清聊天不删。`audit_report` kind ≠ `publish_result` |
-| **version nodes**（内容回退） | `projects/<name>/.novelx/versions.git` + `version_nodes.jsonl`；`studio.version_nodes` | Cursor/Claude 式本地 shadow git；改盘前 / 章通过 / 剧情完结 / 卷 sync 前打点；可 list + restore |
-| **consistency audit**（内容审校） | `chapters/NNN/audit.json`、`audit_queue`；`audit_tier` | 正文一致性检查结果，不是系统操作日志 |
-
-查询：`novel ops-log <project>` 或 `GET /api/projects/{name}/ops_journal`。  
-版本：`novel versions <project> list` / `novel versions <project> restore <sha>`。
-
-### 自确认（1C）
-
-- `studio.require_mutation_confirm` + `studio.mutation_severity_policy`：仅 `mutation_policy.yaml` 中 **high_tools** 弹人审；routine 工具系统自签发落盘。
-- 仍人审：真 P0 审校、Setup 定稿、卷交接、设定 BLOCKER、删实体 / 总纲卷纲 / Bible upsert、高风险 impact。
-- 低风险 impact：命中数 ≤ `impact.auto_max_hits` 且无 draft 目标、源非 bible/master_outline → 自动级联。
-- `decision_council.chapter_next_clean`：干净发布后自动续写（`config/decision_council.yaml` 现为 `enabled: true`；缺省文件时 Rust defaults 仍为 false）。
-- `studio.unattended_soft_skip` + `unattended.yaml`：批写与 council 默认跳过卷 QA `mid_due`、预期检阅、伏笔 `pressure_high`；`respect_soft_gates=true` 或关总开关可保留。硬门（setup/volume 交接/章序/一致性 P0/字数 hard 等）仍停。
-- `volume_qa_phase` / `foreshadow_phase`：量化阈值收成状态机（`state.meta` + resolve）；见 `get_project_status` / preview API；Web 创作状态与桌面 CTA 会消费这两个字段。
-- `studio.revise_plan`（features）是总闸：关则不建 Plan；开时仍受 `decision_council.yaml` → `revise_plan.enabled` 约束。`studio.decision_council` 磁盘默认为 true，无配置文件时 Rust `FeatureFlags::defaults()` 仍为 false（测试/裸跑更安全）。
+不要手改 `projects/<书>/` 来修某本书。能力缺口改预设 Skill 或 `web/src/deskCheck.js` / `deskMigrate.js`。

@@ -1,7 +1,0 @@
-# Volume lifecycle knobs (thin-volume longform defaults).
-# Prefer ~20–40 chapters per volume so volume_pack / mid-audit stay informative.
-# mid_audit_chapter_threshold: soft-block continue_writing when this many chapters
-# exist in the active volume and no audit_volume report yet.
-mid_audit_chapter_threshold: 20
-# Soft warning threshold for "thick volume" (pack sampling kicks in above this).
-thick_volume_chapter_threshold: 40

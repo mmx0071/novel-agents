@@ -10,7 +10,7 @@ description: >-
 
 # 内容格式契约（生成锚定）
 
-题材中立。机器硬校验以 `novelx_pipeline::schemas` 为准；人读摘要见 `config/schemas/README.md`。
+题材中立。机器硬校验以 `web/src/deskCheck.js`（`novelx_check`）为准；人读摘要见 `config/schemas/README.md`。
 
 ## 双层原则
 
@@ -114,7 +114,7 @@ Web 展示结构（由系统生成，勿手写第二份）：
 
 ## 5. 剧情卡 `plots/*.md`
 
-**FM：** `title, scope=local, plot_type, status, needs_bridge`（可选 `holdings` 无关）
+**FM：** `title, scope=local, plot_type, status, needs_bridge`（可选 `next_plot` 仅短标题 ≤20 字，禁止梗概）
 
 **正文 H2：** `概览` · `剧情走向` · `冲突与赌注` · `出场人物` · `收束条件`
 

@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "desk": "node desk-server.mjs",
     "test": "vitest run",
     "test:watch": "vitest"
   },

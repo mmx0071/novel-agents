@@ -1,0 +1,306 @@
+# NovelX preset: dsh-native writing. Agents read/write projects/ themselves.
+# Reading desk (8765) is visualization only — not Host continue_writing.
+
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    text: >-
+      You are the NovelX writing router (model {{model}}). Working directory is {{cwd}}.
+      Do not write story files yourself. Do not call Host tools
+      or continue_writing.
+      When the user names a projects/ directory or asks to write, call
+      novelx_open_desk first (project + chapter) so the reading desk follows.
+      After a chapter or setting lands, call novelx_check
+      (project + chapter) then novelx_open_desk again to refresh.
+      If novelx_check reports blockers, do not advance next_chapter.
+      Ask progress → novelx_progress. Design setting/plot/bible → novelx_canon.
+      Write or continue a chapter → novelx_write.
+      Rename / archive / copy a project folder → bash yourself
+      (mv, mkdir, cp -R under projects/ only; never config/, web/;
+      never rm -rf without the user confirming). Do not ask the user to
+      rename folders by hand. User names a projects/ directory;
+      never invent a book title. Load skill content-formats when unsure about paths.
+      Never paste chapter bodies into chat.
+
+- id: tool-bash
+  name: '@deepseek-ai/dsh-tool-bash'
+  disabled: !!js process.platform === 'win32'
+
+- id: tool-pwsh
+  name: '@deepseek-ai/dsh-tool-pwsh'
+  disabled: !!js process.platform !== 'win32'
+
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+
+- id: tool-fs-search
+  name: '@deepseek-ai/dsh-tool-fs-search'
+  config:
+    sampleOverCapGlobResults: false
+
+- id: skill-filesystem
+  name: '@deepseek-ai/dsh-skill-filesystem'
+  config:
+    customSkillDirs:
+      - ./skills
+
+- id: tool-skill
+  name: '@deepseek-ai/dsh-tool-skill'
+
+- id: tool-ask-user
+  name: '@deepseek-ai/dsh-tool-ask-user'
+
+- id: novelx-desk
+  name: ./desk.ts
+
+- id: novelx-check
+  name: ./check.ts
+
+- id: tool-novelx-progress
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: novelx_progress
+    enableRunInBackground: false
+    backgroundMode: one-shot
+    maxDepth: 1
+    persona: >-
+      Progress reporter. Load skill novelx-desk. Read-only under projects/.
+      Do not write or edit files. Do not paste full chapters. Genre-neutral.
+      User wants the reading desk → novelx_open_desk.
+    toolFilter:
+      allow:
+        - read
+        - glob
+        - grep
+        - skill
+        - ask_user_question
+        - novelx_open_desk
+
+- id: tool-novelx-canon
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: novelx_canon
+    enableRunInBackground: false
+    backgroundMode: one-shot
+    maxDepth: 1
+    persona: >-
+      Setting editor. Load skills novelx-canon, content-formats, and naming-rules.
+      Write setting files under projects/<dir>/. May bash mv/mkdir/cp
+      under projects/ to rename or archive a project folder. After writes,
+      call novelx_check (scope=setting) then novelx_open_desk.
+      If blockers, fix files before telling the user it is done.
+      No chapter drafts. No Host continue_writing. Never rm -rf without user confirm.
+    toolFilter:
+      allow:
+        - read
+        - write
+        - edit
+        - bash
+        - novelx_open_desk
+        - novelx_check
+        - novelx_migrate
+        - glob
+        - grep
+        - skill
+        - ask_user_question
+
+- id: tool-novelx-write
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: novelx_write
+    enableRunInBackground: false
+    backgroundMode: one-shot
+    maxDepth: 3
+    persona: >-
+      Chapter orchestrator. Load skill novelx-write. Delegate pipeline tools
+      in order, foreground only. Do not write drafts yourself. Stop between
+      steps if the user aborts. After the chapter lands, call novelx_check
+      (project + chapter, scope=chapter) then novelx_open_desk
+      (tab=draft). Blockers: do not advance next_chapter. No Host continue_writing.
+    toolFilter:
+      allow:
+        - chapter_planner
+        - lore_librarian
+        - writer
+        - nomenclature_curator
+        - dialogue_specialist
+        - scene_specialist
+        - literary_editor
+        - pacing_reviewer
+        - consistency_auditor
+        - foreshadow_tracker
+        - summarizer
+        - plot_acceptor
+        - novelx_open_desk
+        - novelx_check
+        - skill
+        - ask_user_question
+        - read
+        - glob
+        - grep
+
+- id: tool-chapter-planner
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: chapter_planner
+    enableRunInBackground: false
+    backgroundMode: one-shot
+    maxDepth: 3
+    persona: >-
+      Chapter planner. Load skills chapter-planner, content-formats, and naming-rules.
+      Write chapters/NNN/outline.json only. Then novelx_check scope=outline.
+      No draft. No Host.
+    toolFilter:
+      allow: [read, write, edit, glob, grep, skill, ask_user_question, novelx_check]
+
+- id: tool-lore-librarian
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: lore_librarian
+    enableRunInBackground: false
+    backgroundMode: one-shot
+    maxDepth: 3
+    persona: >-
+      Setting notes for this chapter. Load skill lore-librarian.
+      Write chapters/NNN/lore_notes.md. Do not invent a lore engine.
+    toolFilter:
+      allow: [read, write, edit, glob, grep, skill, ask_user_question]
+
+- id: tool-writer
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: writer
+    enableRunInBackground: false
+    backgroundMode: one-shot
+    maxDepth: 3
+    persona: >-
+      Chapter writer. Load skills writer, content-formats, and naming-rules.
+      Write chapters/NNN/draft.md. First line must be # 第N章.
+      Then novelx_check scope=draft. No Host.
+    toolFilter:
+      allow: [read, write, edit, glob, grep, skill, ask_user_question, novelx_check]
+
+- id: tool-nomenclature
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: nomenclature_curator
+    enableRunInBackground: false
+    backgroundMode: one-shot
+    maxDepth: 3
+    persona: >-
+      Namer. Load skills nomenclature-curator and naming-rules. Update the project name list only.
+    toolFilter:
+      allow: [read, write, edit, glob, grep, skill, ask_user_question]
+
+- id: tool-dialogue
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: dialogue_specialist
+    enableRunInBackground: false
+    backgroundMode: one-shot
+    maxDepth: 3
+    persona: >-
+      Dialogue pass. Load skill dialogue-specialist. Overwrite draft.md only.
+    toolFilter:
+      allow: [read, write, edit, glob, grep, skill, ask_user_question]
+
+- id: tool-scene
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: scene_specialist
+    enableRunInBackground: false
+    backgroundMode: one-shot
+    maxDepth: 3
+    persona: >-
+      Scene pass. Load skill scene-specialist. Overwrite draft.md only.
+    toolFilter:
+      allow: [read, write, edit, glob, grep, skill, ask_user_question]
+
+- id: tool-literary
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: literary_editor
+    enableRunInBackground: false
+    backgroundMode: one-shot
+    maxDepth: 3
+    persona: >-
+      Line edit. Load skill literary-editor. Overwrite draft.md. No plot changes.
+    toolFilter:
+      allow: [read, write, edit, glob, grep, skill, ask_user_question]
+
+- id: tool-pacing
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: pacing_reviewer
+    enableRunInBackground: false
+    backgroundMode: one-shot
+    maxDepth: 3
+    persona: >-
+      Pacing review. Load skill pacing-reviewer. Write pacing.json. Do not edit draft.
+    toolFilter:
+      allow: [read, write, edit, glob, grep, skill, ask_user_question]
+
+- id: tool-consistency
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: consistency_auditor
+    enableRunInBackground: false
+    backgroundMode: one-shot
+    maxDepth: 3
+    persona: >-
+      Consistency audit. Load skills consistency-auditor and naming-rules.
+      Call novelx_check scope=draft first. Write audit.json. Do not edit draft.
+    toolFilter:
+      allow: [read, write, edit, glob, grep, skill, ask_user_question, novelx_check]
+
+- id: tool-foreshadow
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: foreshadow_tracker
+    enableRunInBackground: false
+    backgroundMode: one-shot
+    maxDepth: 3
+    persona: >-
+      Foreshadow tracker. Load skill foreshadow-tracker. Update foreshadow list only.
+    toolFilter:
+      allow: [read, write, edit, glob, grep, skill, ask_user_question]
+
+- id: tool-summarizer
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: summarizer
+    enableRunInBackground: false
+    backgroundMode: one-shot
+    maxDepth: 3
+    persona: >-
+      Summarizer. Load skill summarizer. Write summary.json only.
+    toolFilter:
+      allow: [read, write, edit, glob, grep, skill, ask_user_question]
+
+- id: tool-plot-acceptor
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: plot_acceptor
+    enableRunInBackground: false
+    backgroundMode: one-shot
+    maxDepth: 3
+    persona: >-
+      Plot acceptor. Load skill plot-acceptor. Write plot_accept.json.
+      On pass only, set that plot card status to completed.
+    toolFilter:
+      allow: [read, write, edit, glob, grep, skill, ask_user_question]

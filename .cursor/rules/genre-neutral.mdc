@@ -1,11 +1,23 @@
 ---
-description: NovelX 框架代码须题材/作品中立，禁止硬编码特定小说
+description: >-
+  NovelX 须作品中立且题材中立：框架不写死某一本书，也不预设玄幻/修仙；
+  小说内容只经 dsh NovelX 预设落盘，开发时禁止手改 projects/<书>/。
 alwaysApply: true
 ---
 
-# 作品中立
+# 作品中立 · 题材中立 · 框架不代改小说
 
-- 不得在 `crates/**`、`web/**`、`config/**` 中写死某一本小说的书名、角色、势力、地名或专属梗概。
-- 样例内容只放在 `projects/<name>/`；测试用 `sample-novel` / `主角` 等中性占位。
-- 行为改动优先 `config/features.yaml` / `gates.yaml` / `intents.yaml` / schemas，勿硬编码中文特判。
-- 完整开发规范见 `.cursor/skills/novelx-dev/SKILL.md`（细节 [reference.md](.cursor/skills/novelx-dev/reference.md)）。
+两条中立，不要混成一条：
+
+- **作品中立**：`web/**`、`config/**`、预设源不写死某一本书的书名、角色、势力、地名、卷名或专属梗概。
+- **题材中立**：Prompt / Skill 不预设玄幻、修仙、爽文模板；世界观由该项目的 brief + Bible 决定。
+
+再加上职责边界：
+
+- 写作在 **dsh NovelX 预设**；本仓库补预设、阅读台、schema。框架不代写某一本。
+- 样例只在 `projects/<name>/`；**禁止**用手改这些文件代替 dsh 预设落盘。
+- 测试用 `sample-novel`、`主角`、`甲`、`信物`、`样例小区`；勿从 `projects/` 现成书抄专名、章题、剧情卡或段落。
+- 某书的同步/折叠事故要抽成通用规则，禁止把书名或角色写进前端 / 检查工具特判。
+- 行为改动优先 `config/features.yaml` / `content_rules.yaml` / `naming_rules.yaml` / 预设 Skill。
+
+完整条文见 `.cursor/skills/novelx-dev/SKILL.md`（细节 [reference.md](.cursor/skills/novelx-dev/reference.md)）。

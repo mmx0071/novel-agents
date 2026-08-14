@@ -1,7 +1,5 @@
-# 正文硬规则（确定性扫描）— 发布门控
-# Rust 只保留通用引擎；开关 / 词表 / 阈值 / 文案模板在此编辑。
-# Web「配置 → 硬规则」可点选启用/阻断；保存后下次写章/审校即生效。
-# enabled=false → 不扫描；blocking=false → 仅警告，不阻断发布。
+# 正文硬规则。novelx_check 通用扫描。
+# enabled=false → 不扫描；blocking=false → 仅警告。
 
 rules:
   banned_name:

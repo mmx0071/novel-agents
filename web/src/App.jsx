@@ -9,6 +9,8 @@ import {
   workspaceKey,
 } from './studioCache'
 import NovelXChat from './components/NovelXChat'
+import { applyHostDeskEvent } from './hostDesk'
+import { deskQueryFromSearch, deskSearch } from './deskQuery'
 import SubAgentPage from './components/SubAgentPage'
 import {
   foreshadowHealthLevel,
@@ -29,6 +31,14 @@ import { LinedProseEditor, LinedProseView } from './components/LinedProse'
 import InlineDiffView from './components/InlineDiffView'
 import ConfigPanel from './components/ConfigPanel'
 import VolumeWorkspace from './components/VolumeWorkspace'
+import ChapterOutlineDesk from './components/desks/ChapterOutlineDesk'
+import MasterOutlineDesk from './components/desks/MasterOutlineDesk'
+import ArcOutlineDesk from './components/desks/ArcOutlineDesk'
+import CharacterDesk from './components/desks/CharacterDesk'
+import ItemDesk from './components/desks/ItemDesk'
+import LocationDesk from './components/desks/LocationDesk'
+import EntityGapsDesk from './components/desks/EntityGapsDesk'
+import BibleDesk from './components/desks/BibleDesk'
 import { normalizeSubAgent, upsertSubAgent } from './subAgents'
 import { buildVolumePlotGroups, sortPlotsByProgress } from './plotSort'
 import {
@@ -48,7 +58,10 @@ import { applyParaPatches, resolveInlineDiffPair } from './lineDiff'
 
 const API = '/api'
 const initialCache = typeof window !== 'undefined' ? loadStudioCache() : migrateCache(null)
-const initialProject = initialCache.activeProject || ''
+const bootQuery = typeof window !== 'undefined'
+  ? deskQueryFromSearch(window.location.search)
+  : { project: '', chapter: 0, tab: '' }
+const initialProject = bootQuery.project || initialCache.activeProject || ''
 const initialWorkspace = initialCache.projectSessions[
   workspaceKey(initialProject)
 ] || emptyWorkspace(initialProject)
@@ -257,8 +270,12 @@ export default function App() {
   /** On-demand chapter body (preview lists omit full drafts for longform). */
   const [chapterCache, setChapterCache] = useState({})
   const [chapterLoading, setChapterLoading] = useState(false)
-  const [selectedChapter, setSelectedChapter] = useState(() => initialWorkspace.selectedChapter || 1)
-  const [readerTab, setReaderTab] = useState('draft')
+  const [selectedChapter, setSelectedChapter] = useState(() => (
+    bootQuery.chapter || initialWorkspace.selectedChapter || 1
+  ))
+  const [readerTab, setReaderTab] = useState(() => (
+    bootQuery.tab === 'plots' ? 'arcs' : (bootQuery.tab || 'draft')
+  ))
   const [readerCardKey, setReaderCardKey] = useState('')
   /** Selected volume when browsing 卷纲 (two-level nav). */
   const [readerVolume, setReaderVolume] = useState(0)
@@ -279,6 +296,7 @@ export default function App() {
   const [newNovelMode, setNewNovelMode] = useState('longform')
   const [newNovelBusy, setNewNovelBusy] = useState(false)
   const [deskPatches, setDeskPatches] = useState([])
+  const [dshAssistant, setDshAssistant] = useState(true)
   const [deskPatchFocus, setDeskPatchFocus] = useState(null)
   const [deskPatchHidden, setDeskPatchHidden] = useState(false)
   /** Selection from InlineDiffView: { selectedIds, partialAfter, fullAfter, selectedCount, totalCount } */
@@ -557,9 +575,87 @@ export default function App() {
   }, [focusDeskPatch, captureReaderScrollForDiffExit])
 
   const sendChatMessage = useCallback((text, opts) => {
+    if (dshAssistant) return false
     if (!text || typeof chatSendRef.current !== 'function') return false
     return chatSendRef.current(text, opts) !== false
+  }, [dshAssistant])
+
+  useEffect(() => {
+    let cancelled = false
+    api('/config/studio_flags').then((data) => {
+      if (cancelled || data.error) return
+      const flags = data.flags && typeof data.flags === 'object' ? data.flags : {}
+      if (typeof flags['studio.assistant_runtime_dsh'] === 'boolean') {
+        setDshAssistant(flags['studio.assistant_runtime_dsh'])
+      }
+    })
+    return () => { cancelled = true }
   }, [])
+
+  useEffect(() => {
+    if (!dshAssistant) return undefined
+    // No project filter: dsh may focus another works folder while this tab is open.
+    const src = new EventSource('/api/host/v1/events')
+    src.onmessage = (msg) => {
+      let ev = null
+      try {
+        ev = JSON.parse(msg.data)
+      } catch {
+        return
+      }
+      const name = String(ev.project || '').trim()
+      applyHostDeskEvent(ev, {
+        onFocus: (patch) => focusDeskPatch(patch),
+        onClearPatches: () => handleDraftPatchesChange([]),
+        onRefresh: (hint) => {
+          const target = String(hint || name || currentProjectRef.current || '').trim()
+          if (!target) return
+          const ch = Number(ev.chapter) || 0
+          const tab = ev.readerTab || undefined
+          if (target !== currentProjectRef.current) {
+            selectProject(target, tab).then(() => {
+              refreshPreview(target, {
+                keepSelection: !ch,
+                chapter: ch || undefined,
+                readerTab: tab,
+              })
+            })
+            return
+          }
+          refreshPreview(target, {
+            keepSelection: !ch,
+            chapter: ch || undefined,
+            readerTab: tab,
+          })
+        },
+      })
+    }
+    return () => src.close()
+  }, [dshAssistant, focusDeskPatch, handleDraftPatchesChange, refreshPreview, selectProject])
+
+  useEffect(() => {
+    if (!dshAssistant || !project) return undefined
+    const id = window.setInterval(() => {
+      const ch = selectedChapter > 0 ? selectedChapter : 0
+      refreshPreview(project, {
+        keepSelection: true,
+        chapter: ch || undefined,
+      })
+    }, 4000)
+    return () => window.clearInterval(id)
+  }, [dshAssistant, project, selectedChapter, refreshPreview])
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !project) return
+    const next = deskSearch({
+      project,
+      chapter: selectedChapter,
+      tab: readerTab,
+    })
+    if (window.location.search !== next) {
+      window.history.replaceState(null, '', next || '/')
+    }
+  }, [project, selectedChapter, readerTab])
 
   const handleSubAgentsChange = useCallback((list) => {
     const next = Array.isArray(list) ? list : []
@@ -682,6 +778,13 @@ export default function App() {
     restoredRef.current = true
     if (initialProject) {
       selectProject(initialProject).then(() => {
+        if (bootQuery.tab) {
+          setReaderTab(bootQuery.tab === 'plots' ? 'arcs' : bootQuery.tab)
+        }
+        if (bootQuery.chapter) {
+          setSelectedChapter(bootQuery.chapter)
+          return
+        }
         const ws = workspacesRef.current[workspaceKey(initialProject)]
         if (ws?.selectedChapter) setSelectedChapter(ws.selectedChapter)
       })
@@ -1185,7 +1288,8 @@ export default function App() {
   ].filter((t) => t.show)
 
   const readerCanEdit = Boolean(
-    project
+    !dshAssistant
+    && project
     && readerTab
     && readerTab !== 'entity_gaps'
     && readerTab !== 'expected'
@@ -1285,7 +1389,8 @@ export default function App() {
     },
   )
   const showNextCta = Boolean(
-    studioStage.cta
+    !dshAssistant
+    && studioStage.cta
     && !showSetupConfirmBar
     // Volume workspace already has a primary write button for the same action.
     && !(readerTab === 'volume' && studioStage.cta.id === 'write_next'),
@@ -1733,10 +1838,15 @@ export default function App() {
   }, [dangerConfirm, dangerBusy, performDeleteNovel, performDeleteChapter])
 
   return (
-    <div className="studio">
+    <div className={`studio${dshAssistant ? ' is-dsh-assistant' : ''}`}>
       <header className="studio-header">
         <div className="studio-header-left">
           <h1>NovelX</h1>
+          {dshAssistant ? (
+            <span className="dsh-assistant-hint" title="对话在 DeepSeek Harness">
+              助手在 dsh :3080
+            </span>
+          ) : null}
           <div className="header-novel" role="group" aria-label="作品">
             <select
               className="header-novel-select"
@@ -1804,7 +1914,9 @@ export default function App() {
         </div>
         {project && preview ? (
           <nav className="stage-strip" aria-label="下一步推荐">
-            {studioStage.detail ? (
+            {dshAssistant ? (
+              <span className="stage-detail">写作台只读展示；对话与写章在 dsh :3080</span>
+            ) : studioStage.detail ? (
               <span className="stage-detail" title={studioStage.detail}>
                 {studioStage.detail}
               </span>
@@ -1852,7 +1964,7 @@ export default function App() {
 
       <div className="studio-grid">
         <div className="work-area">
-          {openSubAgent ? (
+          {openSubAgent && !dshAssistant ? (
             <SubAgentPage
               agent={openSubAgent}
               agents={subAgents}
@@ -2185,7 +2297,19 @@ export default function App() {
               <div
                 className={`reader-body${readerEditing ? ' reader-body-editing' : ''}${
                   deskInlineDiffActive ? ' with-inline-diff' : ''
-                }${isVolumeWorkspace && !deskInlineDiffActive ? ' reader-body-workspace' : ''}${
+                }${(() => {
+                  if (deskInlineDiffActive || readerEditing) return ''
+                  if (isVolumeWorkspace) return ' reader-body-workspace'
+                  if (readerTab === 'outline' || readerTab === 'master'
+                    || readerTab === 'entity_gaps' || readerTab === 'art:bible'
+                    || readerTab.startsWith('ent:')) {
+                    return ' reader-body-workspace'
+                  }
+                  if (isArcNav && selectedReaderEntry?.kind !== 'plot') {
+                    return ' reader-body-workspace'
+                  }
+                  return ''
+                })()}${
                   readerTab === 'draft' ? ' is-draft-prose' : ''
                 }`}
                 ref={readerRef}
@@ -2221,7 +2345,7 @@ export default function App() {
                       if (key) setReaderCardKey(key)
                     }}
                     writeBusy={chatBusy}
-                    onWriteNext={() => {
+                    onWriteNext={dshAssistant ? undefined : () => {
                       if (chatBusy) return
                       if (!sendChatMessage(`写第${nextChapter}章`, { busy: 'ignore' })) return
                       setReaderTab('draft')
@@ -2238,6 +2362,47 @@ export default function App() {
                     onChange={(e) => setReaderEditText(e.target.value)}
                     aria-label="编辑写作台内容"
                   />
+                ) : readerTab === 'outline' ? (
+                  <ChapterOutlineDesk
+                    text={readerContent}
+                    unitLabel={isShortDrama ? '集纲' : '章纲'}
+                  />
+                ) : readerTab === 'master' ? (
+                  <MasterOutlineDesk text={readerContent} />
+                ) : readerTab === 'entity_gaps' ? (
+                  <EntityGapsDesk
+                    gaps={entityGaps}
+                    onJump={({ tab, name }) => {
+                      if (!tab) return
+                      setReaderTab(tab)
+                      const group = tab.startsWith('ent:') ? tab.slice(4) : ''
+                      const list = entities[group] || []
+                      const hit = list.find((e) => {
+                        const n = String(e.name || '')
+                        return n === name || n.includes(name) || name.includes(n)
+                      })
+                      const key = entityCardKey(hit)
+                      if (key) setReaderCardKey(key)
+                    }}
+                  />
+                ) : readerTab === 'art:bible' ? (
+                  <BibleDesk text={readerContent} />
+                ) : isArcNav && selectedReaderEntry?.kind !== 'plot' ? (
+                  <ArcOutlineDesk
+                    text={readerContent}
+                    volumeTitle={activeVolumeGroup?.title || ''}
+                  />
+                ) : readerTab === 'ent:characters' ? (
+                  <CharacterDesk entity={selectedReaderCard} />
+                ) : readerTab === 'ent:items' ? (
+                  <ItemDesk entity={selectedReaderCard} />
+                ) : readerTab === 'ent:locations' ? (
+                  <LocationDesk
+                    locations={entities.locations || []}
+                    selected={selectedReaderCard}
+                    selectedKey={readerCardKey || entityCardKey(selectedReaderCard)}
+                    onSelect={(key) => switchReaderCard(key)}
+                  />
                 ) : (
                   <LinedProseView
                     text={readerContent || '暂无内容'}
@@ -2249,6 +2414,7 @@ export default function App() {
           )}
         </section>
 
+        {dshAssistant ? null : (
         <div className={`agent-chat-host${openSubAgent ? ' is-parked' : ''}`}>
           <NovelXChat
             project={project}
@@ -2276,6 +2442,7 @@ export default function App() {
             }}
           />
         </div>
+        )}
         </div>
       </div>
 

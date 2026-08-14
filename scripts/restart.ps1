@@ -1,14 +1,9 @@
-# 一键重启 NovelX（Rust web 服务，默认托管 web/dist）— Windows PowerShell
+# 一键：挂载 NovelX 预设、重启阅读台、启动 dsh Web
 #
-# 用法：
-#   .\scripts\restart.ps1                 # 编译 CLI + 构建前端，杀旧进程后启动
-#   .\scripts\restart.ps1 -Quick          # 不编译，只杀进程重启（需已有二进制与 dist）
-#   .\scripts\restart.ps1 -NoWeb          # 编译 CLI，但不重新 npm build
-#   .\scripts\restart.ps1 -Release        # 用 release 二进制
+#   .\scripts\restart.ps1
+#   .\scripts\restart.ps1 -Quick
 #   .\scripts\restart.ps1 -Bind 0.0.0.0:8765
-#   .\scripts\restart.ps1 -Daemon         # 后台运行，日志写入 .novelx\web.log
-#
-# 若执行策略拦截：Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+#   .\scripts\restart.ps1 -Daemon
 
 [CmdletBinding()]
 param(
@@ -19,103 +14,105 @@ param(
     [Alias("d")]
     [switch]$Daemon,
     [string]$Bind = $(if ($env:NOVELX_BIND) { $env:NOVELX_BIND } else { "127.0.0.1:8765" }),
+    [string]$DshBind = $(if ($env:DSH_BIND) { $env:DSH_BIND } else { "127.0.0.1:3080" }),
     [switch]$Help
 )
 
 $ErrorActionPreference = "Stop"
-
 if ($Help) {
     @"
-一键重启 NovelX（Rust web 服务，默认托管 web/dist）
-
-用法：
-  .\scripts\restart.ps1                 # 编译 CLI + 构建前端，杀旧进程后启动
-  .\scripts\restart.ps1 -Quick          # 不编译，只杀进程重启（需已有二进制与 dist）
-  .\scripts\restart.ps1 -NoWeb          # 编译 CLI，但不重新 npm build
-  .\scripts\restart.ps1 -Release        # 用 release 二进制
+一键挂载 NovelX、重启阅读台、启动 dsh
+  .\scripts\restart.ps1
+  .\scripts\restart.ps1 -Quick
   .\scripts\restart.ps1 -Bind 0.0.0.0:8765
-  .\scripts\restart.ps1 -Daemon         # 后台运行，日志写入 .novelx\web.log
+  .\scripts\restart.ps1 -Daemon
 "@
     exit 0
 }
 
-$Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
+$PortNum = [int]($Bind.Split(':')[-1])
+$DshPort = [int]($DshBind.Split(':')[-1])
+$DshHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE ".dsh" }
+$BuildWeb = -not ($Quick -or $NoWeb -or $NoBuild)
+if (-not $PSBoundParameters.ContainsKey('Daemon')) { $Daemon = $true }
 
-$BuildCli = -not ($Quick -or $NoBuild)
-$BuildWeb = -not ($Quick -or $NoBuild -or $NoWeb)
-
-if ($Bind -notmatch ":(\d+)$") {
-    Write-Error "无效 -Bind：$Bind（期望 host:port，例如 127.0.0.1:8765）"
+function Test-PortUp([int]$PortNum) {
+    return [bool]@(Get-NetTCPConnection -LocalPort $PortNum -State Listen -ErrorAction SilentlyContinue)
 }
-$Port = [int]$Matches[1]
 
-$BinDir = if ($Release) {
-    Join-Path $Root "target\release"
-} else {
-    Join-Path $Root "target\debug"
+function Wait-PortUp([int]$PortNum, [int]$Tries = 80) {
+    for ($i = 0; $i -lt $Tries; $i++) {
+        if (Test-PortUp -PortNum $PortNum) { return $true }
+        Start-Sleep -Milliseconds 250
+    }
+    return $false
 }
-$ProfileFlag = @()
-if ($Release) { $ProfileFlag = @("--release") }
-$NovelBin = Join-Path $BinDir "novel.exe"
 
-function Stop-PortListeners {
-    param([int]$PortNum)
+function Write-Urls {
+    Write-Host ""
+    Write-Host "打开："
+    Write-Host "  阅读台  http://${Bind}/"
+    if (Test-PortUp -PortNum $DshPort) {
+        Write-Host "  dsh     http://${DshBind}/   （新开会话，预设 NovelX）"
+    } else {
+        Write-Host "  dsh     http://${DshBind}/   （未起来，见 .novelx/dsh.log）"
+    }
+}
+
+function Stop-PortListeners([int]$PortNum) {
     $conns = @(Get-NetTCPConnection -LocalPort $PortNum -State Listen -ErrorAction SilentlyContinue)
     if (-not $conns.Count) {
-        # Fallback when Get-NetTCPConnection unavailable / needs admin
-        $lines = @(netstat -ano | Select-String -Pattern ":$PortNum\s+.*LISTENING")
-        $pids = @(
-            $lines | ForEach-Object {
-                if ($_ -match "\s+(\d+)\s*$") { [int]$Matches[1] }
-            } | Select-Object -Unique
-        )
-        if (-not $pids.Count) {
-            Write-Host "→ :$PortNum 无监听进程"
-            return
-        }
-        Write-Host "→ 停止占用 :$PortNum 的进程: $($pids -join ' ')"
-        foreach ($procId in $pids) {
-            Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
-        }
-        Start-Sleep -Milliseconds 400
+        Write-Host "→ :$PortNum 无监听进程"
         return
     }
-
     $pids = @($conns | Select-Object -ExpandProperty OwningProcess -Unique)
     Write-Host "→ 停止占用 :$PortNum 的进程: $($pids -join ' ')"
     foreach ($procId in $pids) {
         Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
     }
     Start-Sleep -Milliseconds 400
+}
 
-    $left = @(Get-NetTCPConnection -LocalPort $PortNum -State Listen -ErrorAction SilentlyContinue)
-    if ($left.Count) {
-        $pids = @($left | Select-Object -ExpandProperty OwningProcess -Unique)
-        foreach ($procId in $pids) {
-            Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
-        }
-        Start-Sleep -Milliseconds 200
+function Install-NovelxPreset {
+    $src = Join-Path $Root "integrations\dsh-preset-novelx\preset"
+    $dest = Join-Path $DshHome ".agent-presets\novelx"
+    if (-not (Test-Path (Join-Path $src "preset.yml"))) {
+        throw "找不到预设 $src\preset.yml"
     }
+    New-Item -ItemType Directory -Force -Path $dest | Out-Null
+    Write-Host "→ 挂载 NovelX 预设 → $dest"
+    Copy-Item -Path (Join-Path $src "*") -Destination $dest -Recurse -Force
+}
+
+function Ensure-DefaultPreset {
+    $file = Join-Path $DshHome "settings.yaml"
+    New-Item -ItemType Directory -Force -Path $DshHome | Out-Null
+    $text = if (Test-Path $file) { Get-Content -LiteralPath $file -Raw } else { "" }
+    if ($text -match '(?m)^agent-presets:\r?\n(?:[ \t].*\r?\n)*[ \t]+default:\s*novelx\s*$') {
+        Write-Host "→ dsh 默认预设: novelx"
+        return
+    }
+    if ($text -notmatch '(?m)^agent-presets:') {
+        if ($text -and -not $text.EndsWith("`n")) { $text += "`n" }
+        $text += "`nagent-presets:`n  default: novelx`n"
+    } elseif ($text -match '(?m)^[ \t]+default:') {
+        $text = [regex]::Replace($text, '(?m)^([ \t]+)default:.*$', '${1}default: novelx', 1)
+    } else {
+        $text = $text -replace '(?m)^agent-presets:', "agent-presets:`n  default: novelx"
+    }
+    Set-Content -LiteralPath $file -Value $text -Encoding utf8
+    Write-Host "→ dsh 默认预设: novelx"
 }
 
 Write-Host "== NovelX 重启 =="
-Write-Host "  root: $Root"
-Write-Host "  bind: $Bind"
+Write-Host "  root:   $Root"
+Write-Host "  阅读台: $Bind"
+Write-Host "  dsh:    $DshBind"
 
-Stop-PortListeners -PortNum $Port
-
-if ($BuildCli) {
-    Write-Host "→ cargo build -p novelx-cli $($ProfileFlag -join ' ')"
-    & cargo build -p novelx-cli @ProfileFlag
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-} else {
-    Write-Host "→ 跳过 CLI 编译"
-}
-
-if (-not (Test-Path -LiteralPath $NovelBin)) {
-    Write-Error "找不到可执行文件 $NovelBin`n请先运行: cargo build -p novelx-cli $($ProfileFlag -join ' ')"
-}
+Install-NovelxPreset
+Ensure-DefaultPreset
 
 if ($BuildWeb) {
     Write-Host "→ npm run build (web/)"
@@ -135,41 +132,59 @@ if ($BuildWeb) {
     Write-Host "→ 跳过前端构建"
 }
 
+$script = Join-Path $Root "web\desk-server.mjs"
+if (-not (Test-Path -LiteralPath $script)) {
+    Write-Error "找不到 $script"
+}
+
 $NovelxDir = Join-Path $Root ".novelx"
 New-Item -ItemType Directory -Force -Path $NovelxDir | Out-Null
 $Log = Join-Path $NovelxDir "web.log"
 $PidFile = Join-Path $NovelxDir "web.pid"
+$DshLog = Join-Path $NovelxDir "dsh.log"
+$DshPidFile = Join-Path $NovelxDir "dsh.pid"
+$env:NOVELX_ROOT = $Root
+$env:NOVELX_BIND = $Bind
 
-Write-Host "→ 启动: $NovelBin web --bind $Bind"
+Write-Host "→ 切换阅读台 :$PortNum"
+Stop-PortListeners -PortNum $PortNum
+Write-Host "→ 启动: node web/desk-server.mjs --bind $Bind"
+$deskErr = Join-Path $NovelxDir "web.err.log"
+$desk = Start-Process -FilePath "node" `
+    -ArgumentList @($script, "--bind", $Bind) `
+    -WorkingDirectory $Root `
+    -RedirectStandardOutput $Log `
+    -RedirectStandardError $deskErr `
+    -WindowStyle Hidden `
+    -PassThru
+Set-Content -LiteralPath $PidFile -Value $desk.Id -Encoding ascii
+if (-not (Wait-PortUp -PortNum $PortNum -Tries 20)) {
+    Write-Error "阅读台启动失败，见日志: $Log"
+}
+Write-Host "✓ 阅读台 pid=$($desk.Id)"
+
+Write-Host "→ 切换 dsh :$DshPort"
+Stop-PortListeners -PortNum $DshPort
+Write-Host "→ 启动: dsh web --port $DshPort  （cwd=$Root，预设 novelx）"
+$dshArgs = @("@deepseek-ai/dsh", "web", "--port", "$DshPort")
 if ($Daemon) {
-    # Start-Process cannot attach stdout+stderr to the same path; merge err into log via tee-less pair.
-    $ErrLog = Join-Path $NovelxDir "web.err.log"
-    foreach ($f in @($Log, $ErrLog)) {
-        if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
-    }
-    $proc = Start-Process -FilePath $NovelBin `
-        -ArgumentList @("web", "--bind", $Bind) `
+    $dshErr = Join-Path $NovelxDir "dsh.err.log"
+    $dsh = Start-Process -FilePath "npx" `
+        -ArgumentList $dshArgs `
         -WorkingDirectory $Root `
-        -RedirectStandardOutput $Log `
-        -RedirectStandardError $ErrLog `
+        -RedirectStandardOutput $DshLog `
+        -RedirectStandardError $dshErr `
         -WindowStyle Hidden `
         -PassThru
-    Set-Content -LiteralPath $PidFile -Value $proc.Id -Encoding ascii
-    Start-Sleep -Milliseconds 500
-    if ($proc.HasExited) {
-        Write-Host "启动失败，见日志: $Log / $ErrLog" -ForegroundColor Red
-        foreach ($f in @($Log, $ErrLog)) {
-            if (Test-Path -LiteralPath $f) {
-                Get-Content -LiteralPath $f -Tail 40 | Write-Host
-            }
-        }
-        exit 1
+    Set-Content -LiteralPath $DshPidFile -Value $dsh.Id -Encoding ascii
+    if (-not (Wait-PortUp -PortNum $DshPort -Tries 120)) {
+        Write-Error "dsh 启动失败，见日志: $DshLog"
     }
-    Write-Host "✓ 已后台运行 pid=$($proc.Id)"
-    Write-Host "  日志: $Log"
-    Write-Host "  打开: http://${Bind}/"
+    Write-Host "✓ dsh pid=$($dsh.Id)"
+    Write-Urls
 } else {
-    Write-Host "✓ 前台运行（Ctrl+C 停止）→ http://${Bind}/"
-    & $NovelBin web --bind $Bind
+    Write-Urls
+    Write-Host "✓ dsh 前台运行（Ctrl+C 停止）"
+    & npx --yes @deepseek-ai/dsh web --port $DshPort
     exit $LASTEXITCODE
 }
