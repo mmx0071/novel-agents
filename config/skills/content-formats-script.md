@@ -80,6 +80,6 @@ VO：旁白（可选）
 
 ## 与长篇差异（勿混用）
 
-- 不用 `chapters/`、`volume_phase`、`sync_volume`、`split_chapter`；连写用 `continue_writing_batch`（写 `episodes/`）
+- 不用 `chapters/`、`volume_phase`；正文写 `episodes/NNN/script.md`
 - 定稿不要求卷纲；总纲用系列大纲即可
 - Web 阅读区展示 `script.md`，不是长篇散文 draft

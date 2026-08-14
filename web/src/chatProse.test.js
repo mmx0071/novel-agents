@@ -73,18 +73,18 @@ describe('chatProse', () => {
 
   it('cleans a realistic status report bubble', () => {
     const raw = [
-      '用户要求"审视不周山再临"——按规则第5条：调用 list_plots。可以并行。## 《不周山再临》审视',
+      '用户要求"审视样例"——按规则第5条：调用 list_plots。可以并行。## 《样例》审视',
       '',
       '项目状态',
       '',
-      '题材：末世 · 旧土 · 神话',
+      '题材：未定 · 当代',
       '进度：已发布 20 章，下一章第 21 章',
       '',
       '当前主线卡',
       '',
-      '第 1 卷「帛书咬合」（进行中）',
+      '第 1 卷「开卷台阶」（进行中）',
       '收束条件：模型通过实测验证',
-      '收束后下一卡：天虞山征召',
+      '收束后下一卡：关卡验证',
       '',
       '可选下一步',
       '',
@@ -92,7 +92,7 @@ describe('chatProse', () => {
     ].join('\n')
     const out = prepareChatAgentProse(raw)
     expect(out).not.toMatch(/按规则第/)
-    expect(out).toContain('## 《不周山再临》审视')
+    expect(out).toContain('## 《样例》审视')
     expect(out).toContain('### 项目状态')
     expect(out).toContain('### 当前主线卡')
     expect(out).toContain('| 题材 |')

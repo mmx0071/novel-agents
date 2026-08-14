@@ -6,5 +6,5 @@ word_max: 6000
 word_hard_min: 4500
 word_hard_max: 11000
 # 连续 SoftShort 达到此次数时，本次 SoftShort 升格为阻断（迫使扩写）。
-# 0 = 关闭升格（仅警告）。也可由 longform.yaml 同名字段覆盖。
+# 0 = 关闭升格（仅警告）。
 soft_short_auto_revise_after: 3
